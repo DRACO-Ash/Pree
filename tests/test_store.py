@@ -417,3 +417,72 @@ def test_the_cap_never_drops_the_protected_key_even_if_it_is_the_oldest(
     # The three kept are the protected one plus the two newest, and the order list agrees.
     assert set(trimmed) == {"a:0", "a:4", "a:5"}
     assert kept == ["a:0", "a:4", "a:5"]
+
+
+def test_a_partial_write_order_still_trims_to_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cap's bound holds only while the order covers every stored key exactly once.
+
+    Pruning names that no longer exist enforced one half. Without the other half, a snapshot
+    whose order omitted keys retained far more than the cap, and every later write then evicted
+    the PREVIOUS write rather than the oldest record, so the store kept stale mass and lost the
+    recent watch picture.
+    """
+    monkeypatch.setattr(store_module, "MAX_ASSESSMENTS", 5)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    untracked = {f"a:{i}": {"score": float(i)} for i in range(40)}
+    (data_dir / "assessments.json").write_text(
+        json.dumps({"schema_version": 1, "assessments": untracked, "write_order": []}),
+        encoding="utf-8",
+    )
+    store = JsonStore(data_dir)
+    snapshot = store.upsert("a:new", {"score": 99.0})
+    assert len(snapshot["assessments"]) == 5, len(snapshot["assessments"])
+    assert "a:new" in snapshot["assessments"]
+    assert len(snapshot["write_order"]) == 5
+
+
+def test_a_duplicated_write_order_entry_does_not_under_trim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing one duplicate from the order frees nothing from the collection."""
+    monkeypatch.setattr(store_module, "MAX_ASSESSMENTS", 3)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "assessments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "assessments": {f"a:{i}": {} for i in range(6)},
+                "write_order": ["a:0"] * 6,
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = JsonStore(data_dir).upsert("a:new", {"score": 1.0})
+    assert len(snapshot["assessments"]) == 3
+    assert "a:new" in snapshot["assessments"]
+
+
+def test_the_write_order_always_covers_every_stored_key_exactly_once(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "assessments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "assessments": {"a:1": {}, "a:2": {}, "a:3": {}},
+                "write_order": ["a:2", "a:2", "gone:9"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = JsonStore(data_dir).read()
+    order = snapshot["write_order"]
+    assert sorted(order) == ["a:1", "a:2", "a:3"]
+    assert len(order) == len(set(order))
+    assert order[0] == "a:2", "a tracked key keeps its position ahead of untracked ones"

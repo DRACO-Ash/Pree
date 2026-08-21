@@ -7,6 +7,7 @@ from __future__ import annotations
 import errno
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 
 import pytest
@@ -143,69 +144,6 @@ def test_concurrent_callers_cost_one_write(tmp_path: Path, monkeypatch: pytest.M
     assert calls["n"] == 1, f"expected one write for ten callers, got {calls['n']}"
 
 
-def test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A slot held by a healthy in-flight probe says nothing about the volume either way.
-
-    A busy verdict now requires positive evidence that storage works, so this test records a
-    real success first. Without that evidence the honest answer is unready, which is what
-    stops an unauthenticated flood from holding every slot and reporting ready regardless.
-    """
-    pool = StorageProber(max_workers=1, cache_seconds=0.0, success_grace_seconds=30.0)
-    assert pool.probe(tmp_path / "data").writable is True
-
-    running = threading.Event()
-
-    def slow(_: Path) -> None:
-        running.set()
-        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS * 0.5)
-
-    monkeypatch.setattr(health, "_write_probe", slow)
-    worker = threading.Thread(target=pool.probe, args=(tmp_path / "data",))
-    worker.start()
-    try:
-        assert running.wait(2.0)
-        busy = pool.probe(tmp_path / "data")
-    finally:
-        worker.join()
-        pool.shutdown()
-    assert busy.errno_name == "EBUSY"
-    assert busy.indeterminate is True
-    assert busy.status == "unknown"
-
-
-def test_a_busy_pool_with_no_recent_success_reports_unready(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The attacker-triggerable fail-open, closed.
-
-    An unauthenticated flood of this unmetered path kept every slot occupied with freshly
-    started probes, so a mount whose writes overran the probe budget never had all slots
-    overrun at once and the pool reported merely busy. The container's three-strike check
-    therefore never fired and a pod that could not complete a write stayed in service.
-    """
-    running = threading.Event()
-
-    def overruns(_: Path) -> None:
-        running.set()
-        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 1.0)
-
-    monkeypatch.setattr(health, "_write_probe", overruns)
-    pool = StorageProber(max_workers=1, cache_seconds=0.0, success_grace_seconds=30.0)
-    worker = threading.Thread(target=pool.probe, args=(tmp_path / "data",))
-    worker.start()
-    try:
-        assert running.wait(2.0)
-        verdict = pool.probe(tmp_path / "data")
-    finally:
-        worker.join()
-        pool.shutdown()
-    assert verdict.errno_name == "ETIMEDOUT"
-    assert verdict.indeterminate is False
-    assert verdict.status == "unready"
-
-
 def test_a_wedged_mount_keeps_answering_unready_rather_than_going_quiet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -225,7 +163,7 @@ def test_a_wedged_mount_keeps_answering_unready_rather_than_going_quiet(
         release.set()
         pool.shutdown()
     assert all(p.errno_name == "ETIMEDOUT" for p in verdicts), [p.errno_name for p in verdicts]
-    assert all(p.indeterminate is False for p in verdicts)
+    assert all(p.writable is False for p in verdicts)
     assert all(p.status == "unready" for p in verdicts)
 
 
@@ -276,12 +214,144 @@ def test_a_stale_ready_result_is_not_served_after_the_mount_is_refused(
     assert after.errno_name == "EACCES"
 
 
-def test_an_idle_pool_is_not_reported_as_having_overrun() -> None:
-    """`all()` over an empty mapping is True, so without the emptiness guard a pool that
-    drained between a failed claim and this check would report a wedged mount rather than a
-    busy one. It fails safe, but the guard is load-bearing and was asserted nowhere."""
+def test_a_concurrent_caller_joins_the_probe_rather_than_guessing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-flight: a joiner reports what the real probe reports, so it cannot be wrong.
+
+    The two heuristics this replaced each failed in a different direction. Guessing busy from
+    slots still inside their timeout called a broken volume ready, because a flooder takes each
+    slot the moment one frees. Guessing busy from the absence of a recent success called a
+    healthy volume unready, and at the shipped parameters the cache expired one instant before
+    the grace did, so an unauthenticated flood could hold that window open and restart the pod.
+    """
+    started = threading.Event()
+
+    def slow_but_fine(path: Path) -> None:
+        started.set()
+        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS * 0.5)
+        path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(health, "_write_probe", slow_but_fine)
+    pool = StorageProber(cache_seconds=0.0)
+    results: list[bool] = []
+    worker = threading.Thread(target=lambda: results.append(pool.probe(tmp_path / "data").writable))
+    worker.start()
+    try:
+        assert started.wait(2.0)
+        joiner = pool.probe(tmp_path / "data")
+    finally:
+        worker.join()
+        pool.shutdown()
+    assert joiner.writable is True, "the joiner reported a healthy volume as broken"
+    assert results == [True]
+
+
+def test_a_write_that_misses_its_budget_is_never_reported_as_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A joiner arriving just after a slow write lands must not turn it into a pass.
+
+    Measured before this guard: an over-budget mount answered ready in 5 of 24 probes under a
+    flood, because a late joiner saw the completed future and cached the success. The budget is
+    the contract, so a write that misses it is unready for every caller, not just the unlucky.
+    """
+
+    def over_budget(path: Path) -> None:
+        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 0.4)
+        path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(health, "_write_probe", over_budget)
     pool = StorageProber(cache_seconds=0.0)
     try:
-        assert pool._all_in_flight_overran() is False
+        first = pool.probe(tmp_path / "data")
+        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 0.6)
+        # The write has now landed; a caller arriving here sees a completed future.
+        after = pool.probe(tmp_path / "data")
     finally:
         pool.shutdown()
+    assert first.errno_name == "ETIMEDOUT"
+    assert after.writable is False, "an over-budget write was reported as ready"
+    assert after.errno_name == "ETIMEDOUT"
+
+
+def test_a_write_that_fails_instantly_does_not_deadlock_the_prober(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A self-deadlock on the health path, made deterministic.
+
+    Registering the completion callback while holding the prober's guard deadlocks whenever
+    the future is ALREADY complete, because add_done_callback then runs the callback inline on
+    the calling thread and the callback takes the same non-reentrant lock. A write that raises
+    immediately does exactly that, which is the refused-mount case the probe exists to report.
+    Naturally it is a race, so the executor is stubbed to return a completed future and make
+    the inline path certain.
+    """
+
+    class AlreadyDone:
+        def submit(self, fn: object, *args: object) -> Future[None]:
+            future: Future[None] = Future()
+            future.set_exception(OSError(errno.EACCES, "permission denied"))
+            return future
+
+        def shutdown(self, wait: bool = True) -> None:
+            return None
+
+    pool = StorageProber(cache_seconds=0.0)
+    monkeypatch.setattr(pool, "_executor", AlreadyDone())
+    probe = pool.probe(tmp_path / "data")
+    assert probe.writable is False
+    assert probe.errno_name == "EACCES"
+    # The guard must be free afterwards, and a second probe must not block either.
+    assert pool.probe(tmp_path / "data").errno_name == "EACCES"
+
+
+def test_a_write_that_succeeds_instantly_does_not_deadlock_the_prober(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same inline-callback path, on the success side."""
+
+    class AlreadyDone:
+        def submit(self, fn: object, *args: object) -> Future[None]:
+            future: Future[None] = Future()
+            future.set_result(None)
+            return future
+
+        def shutdown(self, wait: bool = True) -> None:
+            return None
+
+    pool = StorageProber(cache_seconds=0.0)
+    monkeypatch.setattr(pool, "_executor", AlreadyDone())
+    assert pool.probe(tmp_path / "data").writable is True
+    assert pool.probe(tmp_path / "data").writable is True
+
+
+def test_a_success_observed_after_the_budget_expires_is_reported_unready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The over-budget guard itself, reached deterministically.
+
+    The natural route is a joiner arriving just after a slow write lands, which is a race. An
+    injected clock makes it certain: the probe starts at t=0, the write is already complete, and
+    the clock reads 2.0s by the time the result is observed, past the 1.5s budget. Without the
+    guard this returns ready and caches it, so an over-budget mount reads healthy.
+    """
+
+    class AlreadyDone:
+        def submit(self, fn: object, *args: object) -> Future[None]:
+            future: Future[None] = Future()
+            future.set_result(None)
+            return future
+
+        def shutdown(self, wait: bool = True) -> None:
+            return None
+
+    # Consumed in order: the probe start, the remaining-budget calculation, then the elapsed
+    # measurement after the result is in hand.
+    readings = iter([0.0, 0.0, STORAGE_PROBE_TIMEOUT_SECONDS + 0.5])
+    pool = StorageProber(cache_seconds=0.0, clock=lambda: next(readings))
+    monkeypatch.setattr(pool, "_executor", AlreadyDone())
+    probe = pool.probe(tmp_path / "data")
+    assert probe.writable is False, "an over-budget write was reported as ready"
+    assert probe.errno_name == "ETIMEDOUT"
+    assert probe.status == "unready"

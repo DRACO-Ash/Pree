@@ -36,7 +36,9 @@ the assessment store.
 | Every filesystem refusal surfaces as a handled 503, audited | `src/pree/store.py` | `test_a_real_storage_refusal_returns_503_and_audits_the_action`, `test_a_failed_lock_release_surfaces_as_a_store_error` |
 | The rate limiter fails closed when its key table saturates | `src/pree/ratelimit.py` | `test_a_saturated_key_table_fails_closed_rather_than_admitting_everyone` |
 | A busy probe pool never reports storage as broken | `src/pree/health.py` | `test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate` |
-| A busy verdict requires positive evidence, so a flood cannot force ready | `src/pree/health.py` | `test_a_busy_pool_with_no_recent_success_reports_unready` |
+| Concurrent probe callers join the probe in flight rather than guessing | `src/pree/health.py` | `test_a_concurrent_caller_joins_the_probe_rather_than_guessing` |
+| A write that misses its budget is never reported as ready | `src/pree/health.py` | `test_a_write_that_misses_its_budget_is_never_reported_as_ready` |
+| The retention cap holds even on a snapshot with a partial write order | `src/pree/store.py` | `test_a_partial_write_order_still_trims_to_the_cap` |
 | The assessment collection is capped, newest kept | `src/pree/store.py` | `test_the_collection_is_capped_and_the_newest_record_always_survives` |
 | A configured data directory must be absolute, and a pasted value is normalised | `src/pree/config.py` | `test_a_relative_data_directory_is_refused`, `test_a_quote_wrapped_path_is_normalised_not_taken_literally` |
 | A control character in any config value is refused | `src/pree/config.py` | `test_a_control_character_in_a_value_is_refused` |
@@ -90,12 +92,18 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    schedules one pod against this volume; a second replica needs the database add-on, not a
    tighter lock.
 
-7. **The assessment collection is capped at 5000 records rather than retained in full.**
-   The store is a single whole-file document, so retention costs both volume and per-write
-   time. Above the cap the oldest assessment is dropped, and the record just written is never
-   the one dropped. Accepted because Pree scores a live watch picture rather than serving as
-   an archive; if the watch floor needs longer history, that is the database add-on, not a
-   larger file.
+7. **The assessment collection is capped at 5000 records rather than retained in full, and
+   the cap is shared.** The store is a single whole-file document, so retention costs both
+   volume and per-write time. Above the cap the oldest assessment is dropped, and the record
+   just written is never the one dropped. Two consequences an operator needs stated plainly
+   rather than inferred. The cap is not "your last 5000": it is the app's last 5000 across
+   everyone sharing the team token, so a busy colleague can age out assessments you are still
+   watching. That follows from risk 1, but nobody should have to derive it. And the bound holds
+   only while the snapshot's write order covers every stored key exactly once, which the read
+   path now enforces in both directions; a snapshot whose order omitted keys retained far more
+   than the cap and then evicted each new write instead of the oldest record. Accepted because
+   Pree scores a live watch picture rather than serving as an archive; if the watch floor needs
+   longer history, that is the database add-on, not a larger file.
 
 8. **The diagnostics read-out reports the token length when authenticated.** A boolean and a
    length, never a value, and gated whenever a token is configured. Before a token exists the
@@ -150,11 +158,26 @@ the health check.
 
 The cap now keeps the newest and never drops the record just written, ordered by an explicit
 write-order list because the snapshot is serialised with sorted keys and object order does not
-survive the round trip. The busy verdict now requires positive evidence: a probe that
-completed inside its budget within the grace window. Verified in all four directions, so the
-fix does not reintroduce the opposite failure: healthy storage under a 24-way flood stays 200,
-slow-but-in-budget stays 200, a refused mount is 503, and the overrunning mount is now 503 on
-every probe.
+survive the round trip.
+
+The first attempt at the probe fix was wrong, and the fourth security review caught it. It made
+a busy verdict depend on a recent successful probe, and with the shipped parameters the result
+cache expired one instant before that grace did, leaving a window in which a saturated pool had
+no positive evidence and called a healthy volume unready. An unauthenticated flood of this
+unmetered path could hold the window open: measured at four false 503s in twenty-four probes at
+300 ms write latency and seven at 1.2 s, with four consecutive, which is enough to restart the
+pod. The claim recorded here that it had been verified in all four directions was sampling
+luck, not verification, and the guard test used a grace fifteen times the shipped value so it
+never exercised the real configuration.
+
+The heuristic is gone. Concurrent callers now JOIN the probe already in flight and report what
+it reports, so a joiner cannot be wrong about the volume, and one write serves every caller.
+Measured at the shipped parameters under an eight-way flood, sampling every 0.37 s: healthy at
+50 ms, 300 ms and 1.2 s latency each give zero false 503s in twenty-four probes; an overrunning
+mount, a refused mount and a wedged mount each give twenty-four out of twenty-four. One further
+defect surfaced only in that measurement: a joiner arriving just after a slow write finally
+landed reported ready and cached it, so an over-budget mount answered ready in five of
+twenty-four probes. A write that misses its budget is now unready for every caller.
 
 Each of these now has a named regression test in the control table above.
 

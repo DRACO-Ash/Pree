@@ -126,3 +126,28 @@ pasted path is normalised rather than becoming a literal directory inside the co
 control character in any value is refused; the boot line reports auth state and token length
 so a stale token is visible without a deploy cycle; the CSP exemption for the development docs
 is now test-enforced against production; and Retry-After never returns zero.
+
+### Fourth security review
+
+The probe fix from the previous round was wrong in the opposite direction, and the review
+caught it at the shipped parameters:
+
+● Making a busy verdict depend on a recent successful probe left a window, because the result
+  cache expired one instant before that grace did. An unauthenticated flood of the unmetered
+  probe path could hold it open and drive a healthy mount to 503: four false 503s in
+  twenty-four probes at 300 ms write latency, seven at 1.2 s, with four consecutive, which is
+  enough to restart the pod. The guard test used a grace fifteen times the shipped value, so it
+  never exercised the real configuration, and the claim recorded in the security policy that
+  all four directions had been verified was sampling luck rather than verification.
+● The heuristic is gone. Concurrent callers join the probe already in flight and report what it
+  reports, so a joiner cannot be wrong about the volume and one write serves every caller.
+● Measuring that fix surfaced a further defect it would otherwise have shipped with: a joiner
+  arriving just after a slow write finally landed reported ready and cached it, so an
+  over-budget mount answered ready in five of twenty-four probes. A write that misses its
+  budget is now unready for every caller.
+● The retention cap's bound held only while the snapshot's write order covered every stored key
+  exactly once. Pruning stale names enforced one half; a snapshot whose order omitted keys
+  retained far more than the cap and then evicted each new write instead of the oldest record.
+  Both directions are enforced on read now, and duplicates are collapsed.
+● The register now states that the cap is shared across everyone holding the team token rather
+  than per operator, and the deployment sheet publishes the measured per-write cost beside it.

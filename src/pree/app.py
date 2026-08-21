@@ -302,7 +302,7 @@ def register_health_routes(
         directory and the exact errno, so a screenshot of it is a full diagnosis.
         """
         probe = probe_now()
-        if not probe.writable and not probe.indeterminate:
+        if not probe.writable:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return probe.as_body()
 
@@ -448,7 +448,7 @@ def create_app(
     def probe_now() -> StorageProbe:
         """Probe storage and log any transition between writable and unwritable."""
         probe = storage.probe(config.data_dir)
-        if not probe.indeterminate and last_ready["writable"] != probe.writable:
+        if last_ready["writable"] != probe.writable:
             state = "ready" if probe.writable else "unready"
             print(
                 f"pree storage {state}: data_dir={probe.data_dir} "

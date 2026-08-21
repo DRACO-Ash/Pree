@@ -81,9 +81,18 @@ Inside the 8Gi and 6 CPU envelope. Two gunicorn workers with a 60 second timeout
 
 Storage growth is bounded by construction: the assessment collection is capped at 5000
 records, dropping the oldest and never the record just written, so the volume cannot fill
-through ordinary accumulation. At roughly 1.3 KiB per record that is about 6.5 MiB of steady
-state. If the watch floor needs longer history, that is the POSTGRESQL add-on rather than a
-larger cap, because every write rewrites the whole snapshot.
+through ordinary accumulation. Measured at 1258 bytes per record, which is about **6.0 MiB** of
+steady state.
+
+The number the cap's size actually trades against is write cost, so it is published here
+rather than left to be discovered. Every upsert reads, merges, serialises, fsyncs, copies the
+backup and renames the whole snapshot, all under one exclusive lock. Measured on this build:
+**101 ms** per write at 1500 records, extrapolating to roughly **340 ms** at the 5000 cap. That
+puts the pod's serialised write ceiling near three per second, against a coarse limit of 240
+per minute per address, so a handful of distinct addresses writing at the fine limit will queue
+on the lock and eventually meet gunicorn's 60 second timeout. It is authenticated traffic only,
+so it sits inside the shared-token risk, but it is the reason a larger cap is the wrong answer
+to wanting more history: that is the POSTGRESQL add-on.
 
 ## Health paths
 

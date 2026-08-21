@@ -57,7 +57,14 @@ def migrate_forward(snapshot: dict[str, Any]) -> dict[str, Any]:
         # a defined age order from the next write onward; the relative age of pre-existing
         # records is genuinely unknown and is not invented, only given a stable order.
         order = sorted(migrated["assessments"])
-    migrated["write_order"] = [k for k in order if k in migrated["assessments"]]
+    # The cap's bound holds only while the order covers EVERY stored key exactly once. Pruning
+    # names that no longer exist enforced one half of that; without the other half a snapshot
+    # whose order omitted keys (an older build appending to assessments while carrying this
+    # key through untouched) retained far more than the cap, and duplicates under-trimmed
+    # because removing one entry from the order frees nothing from the collection.
+    tracked = [k for k in dict.fromkeys(order) if k in migrated["assessments"]]
+    untracked = sorted(set(migrated["assessments"]) - set(tracked))
+    migrated["write_order"] = tracked + untracked
     return migrated
 
 

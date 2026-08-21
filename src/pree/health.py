@@ -8,8 +8,9 @@ Three probe shapes, deliberately distinct:
 * Storage proof. A separate path performs a real WRITE, not an existence check, because an
   existence check passes on a read-only or root-owned mount. It races a hard timeout
   strictly shorter than the platform probe, and its 503 body names the resolved directory
-  and the exact errno so a screenshot is a full diagnosis. A saturated probe pool is itself
-  reported, as EBUSY, rather than being mistaken for a timeout.
+  and the exact errno so a screenshot is a full diagnosis. Concurrent callers join the probe
+  already in flight rather than each costing a write, so this unauthenticated path cannot be
+  used to amplify load or to move the verdict in either direction.
 * Diagnostics. A secret-free read-out with every plausible field present at once, reporting
   each critical input as a boolean and a length, never a value.
 """
@@ -21,7 +22,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,16 +45,10 @@ class StorageProbe:
     errno_code: int | None
     errno_name: str | None
     duration_ms: int
-    # True when the probe could not be taken at all, as opposed to taken and refused. A
-    # saturated pool is not evidence that storage is broken, so it must not be reported as
-    # though it were: doing so let three concurrent sockets turn the container HEALTHCHECK red.
-    indeterminate: bool = False
 
     @property
     def status(self) -> str:
-        if self.writable:
-            return "ready"
-        return "unknown" if self.indeterminate else "unready"
+        return "ready" if self.writable else "unready"
 
     def as_body(self) -> dict[str, Any]:
         """The response body. Carries the directory and the errno, never file contents."""
@@ -77,86 +72,40 @@ def _write_probe(data_dir: Path) -> None:
 
 
 class StorageProber:
-    """Runs the storage probe on a bounded pool, with a short result cache.
+    """Runs the storage probe single-flight, with a short result cache.
 
-    Two properties matter more than the write itself:
+    Concurrent callers JOIN the probe already in flight rather than being handed a synthesised
+    verdict. That is the whole design, and it replaces two heuristics that each failed in a
+    different direction:
 
-    * A probe that overruns its timeout must still free its slot when the worker eventually
-      returns. Releasing only on the success and error paths meant a slow-but-successful
-      volume pinned the pool at capacity forever, so a healthy mount reported EBUSY on every
-      later probe and the container restarted in a loop.
-    * Concurrent callers must not each cost a write. The probe path is unauthenticated by
-      contract, so without a cache a handful of sockets could saturate the pool at will. One
-      write serves every caller inside the cache window.
+    * Guessing "busy" from slots still inside their timeout called a broken volume ready,
+      because a flooder takes each slot the moment one frees, so the newest was always fresh.
+    * Guessing "busy" from the absence of a recent success called a healthy volume unready.
+      At the shipped parameters the result cache expired one instant before that grace did,
+      and an unauthenticated flood of this deliberately unmetered path could hold the window
+      open and restart the pod.
+
+    A joiner cannot be wrong about the volume, because it reports what the real probe reports.
+    A wedged mount still answers unready: a joiner waits only until the in-flight probe's own
+    budget expires, which for a stuck probe is immediately.
     """
 
     def __init__(
         self,
         max_workers: int = 2,
         cache_seconds: float = 2.0,
-        success_grace_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._max_workers = max_workers
         self._cache_seconds = cache_seconds
-        # A busy verdict needs POSITIVE evidence that storage works: a probe that completed
-        # inside its budget, recently. Inferring "busy" from the absence of evidence let an
-        # unauthenticated flood of this unmetered path hold every slot with a probe that was
-        # always freshly started, so a mount whose writes overran the budget reported ready
-        # indefinitely and the container's three-strike check never fired.
-        self._success_grace = (
-            cache_seconds if success_grace_seconds is None else success_grace_seconds
-        )
         self._clock = clock
-        self._executor = ThreadPoolExecutor(
+        self._executor: Any = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="storage-probe"
         )
         self._guard = threading.Lock()
-        # Start time per in-flight probe, so a slot held by a probe that has already overrun
-        # its timeout can be told apart from one held by a probe still within it. Without that
-        # distinction a permanently wedged mount looked merely busy, so the endpoint whose
-        # whole purpose is catching a refused mount answered 200 forever.
-        self._in_flight: dict[int, float] = {}
-        self._next_id = 0
+        self._current: Future[None] | None = None
+        self._current_started = 0.0
         self._cached: StorageProbe | None = None
         self._cached_at = 0.0
-        self._last_success_at: float | None = None
-
-    def _claim(self) -> int | None:
-        with self._guard:
-            if len(self._in_flight) >= self._max_workers:
-                return None
-            self._next_id += 1
-            token = self._next_id
-            self._in_flight[token] = self._clock()
-            return token
-
-    def _release(self, token: int) -> None:
-        with self._guard:
-            self._in_flight.pop(token, None)
-
-    def _recently_succeeded(self) -> bool:
-        """True when a probe completed inside its budget within the grace window.
-
-        This is the only thing that justifies calling a saturated pool merely busy. Without
-        it, a caller that keeps every slot occupied with freshly started probes makes the
-        pool look healthy no matter how badly storage is behaving.
-        """
-        with self._guard:
-            if self._last_success_at is None:
-                return False
-            return self._clock() - self._last_success_at <= self._success_grace
-
-    def _all_in_flight_overran(self) -> bool:
-        """True when every held slot belongs to a probe that has already timed out."""
-        now = self._clock()
-        with self._guard:
-            if not self._in_flight:
-                return False
-            return all(
-                now - started >= STORAGE_PROBE_TIMEOUT_SECONDS
-                for started in self._in_flight.values()
-            )
 
     def _fresh_enough(self) -> StorageProbe | None:
         with self._guard:
@@ -172,31 +121,38 @@ class StorageProber:
             self._cached_at = self._clock()
         return probe
 
+    def _clear(self, future: Future[None]) -> None:
+        with self._guard:
+            if self._current is future:
+                self._current = None
+
+    def _join_or_start(self, data_dir: Path) -> tuple[Future[None], float]:
+        """Return the in-flight probe, starting one only if none is running."""
+        with self._guard:
+            if self._current is not None:
+                return self._current, self._current_started
+            future = self._executor.submit(_write_probe, data_dir)
+            self._current = future
+            self._current_started = self._clock()
+            started = self._current_started
+        # Registered OUTSIDE the guard, deliberately. add_done_callback runs the callback
+        # inline on the calling thread when the future is ALREADY complete, which is exactly
+        # what a write that fails instantly does, and the callback takes this same
+        # non-reentrant guard. Holding it here was a self-deadlock on the health path, in the
+        # refused-mount case the probe exists to report.
+        future.add_done_callback(lambda _: self._clear(future))
+        return future, started
+
     def probe(self, data_dir: Path) -> StorageProbe:
-        """Prove storage with a real write, racing a hard timeout."""
+        """Prove storage with a real write, racing the in-flight probe's own hard timeout."""
         cached = self._fresh_enough()
         if cached is not None:
             return cached
         directory = str(data_dir)
-        token = self._claim()
-        if token is None:
-            if self._all_in_flight_overran() or not self._recently_succeeded():
-                # Either every worker is stuck past its timeout, or nothing has completed
-                # inside its budget recently. Both are unready, and reporting them as merely
-                # busy is a fail-open an unauthenticated caller can trigger at will.
-                return StorageProbe(
-                    False, directory, errno.ETIMEDOUT, "ETIMEDOUT", 0, indeterminate=False
-                )
-            # Genuinely busy: storage demonstrably worked a moment ago and the slots are held
-            # by probes still inside their timeout. Not evidence about the volume either way.
-            return StorageProbe(False, directory, errno.EBUSY, "EBUSY", 0, indeterminate=True)
-        started = self._clock()
-        future = self._executor.submit(_write_probe, data_dir)
-        # The slot is freed by the worker itself, whenever it finishes, including long after
-        # this call has already given up and returned a timeout.
-        future.add_done_callback(lambda _: self._release(token))
+        future, started = self._join_or_start(data_dir)
+        remaining = max(0.0, started + STORAGE_PROBE_TIMEOUT_SECONDS - self._clock())
         try:
-            future.result(timeout=STORAGE_PROBE_TIMEOUT_SECONDS)
+            future.result(timeout=remaining)
         except FutureTimeout:
             elapsed = int((self._clock() - started) * 1000)
             return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
@@ -205,9 +161,14 @@ class StorageProber:
             code = exc.errno
             name = errno.errorcode.get(code) if code is not None else None
             return self._remember(StorageProbe(False, directory, code, name, elapsed))
-        elapsed = int((self._clock() - started) * 1000)
-        with self._guard:
-            self._last_success_at = self._clock()
+        waited = self._clock() - started
+        elapsed = int(waited * 1000)
+        if waited > STORAGE_PROBE_TIMEOUT_SECONDS:
+            # The write succeeded, but not inside the budget. A joiner arriving just after a
+            # slow write finally lands would otherwise report ready and cache it, so an
+            # over-budget mount read healthy to some callers and unready to others. The budget
+            # is the contract: a write that misses it is not a pass, whoever observed it.
+            return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
         return self._remember(StorageProbe(True, directory, None, None, elapsed))
 
     def shutdown(self) -> None:
