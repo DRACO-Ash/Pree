@@ -118,10 +118,19 @@ cannot drive the container HEALTHCHECK red and restart the pod. Every response, 
 
 `/healthz/storage` is the container HEALTHCHECK target and the only path that touches storage.
 It performs a real write, races a 1.5 second timeout shorter than the platform probe, and on
-failure returns 503 naming the resolved directory and the exact errno. A busy probe pool
-returns 200 with `"status": "unknown"` and `errno_name: "EBUSY"`, never 503: a saturated pool
-is not evidence that storage is broken, and treating it as such let a handful of concurrent
-requests restart the pod.
+failure returns 503 naming the resolved directory and the exact errno.
+
+Concurrency behaves as follows, and this replaces an earlier description in this sheet that no
+longer matches the code. Concurrent callers **join the probe already in flight** and receive
+its verdict, so one write serves every caller and no verdict is ever synthesised from guesswork
+about how busy the pool is. The response is 200 with `"status": "ready"`, or 503 with
+`"status": "unready"` and the errno. The only synthesised outcome is `ETIMEDOUT` when the
+in-flight probe's 1.5 second budget expires before it answers, which is the correct reading of
+a mount that is not responding. A concurrency-induced 503 is therefore possible and intended
+for a mount that is genuinely not working; it is not possible for one that is.
+
+A verdict is cached for two seconds, stamped from when the probe started, so the worst-case age
+of a `ready` answer is two seconds rather than two seconds plus however long the write took.
 
 `/diagnostics` is a secret-free read-out: every critical input as a boolean and a length, never
 a value, plus the resolved identity and storage state, with every field present at once. It is

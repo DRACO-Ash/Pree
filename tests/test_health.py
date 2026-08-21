@@ -254,34 +254,6 @@ def test_a_concurrent_caller_joins_the_probe_rather_than_guessing(
     assert writes["n"] == 1, f"the joiner started its own write; {writes['n']} writes ran"
 
 
-def test_a_write_that_misses_its_budget_is_never_reported_as_ready(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A joiner arriving just after a slow write lands must not turn it into a pass.
-
-    Measured before this guard: an over-budget mount answered ready in 5 of 24 probes under a
-    flood, because a late joiner saw the completed future and cached the success. The budget is
-    the contract, so a write that misses it is unready for every caller, not just the unlucky.
-    """
-
-    def over_budget(path: Path) -> None:
-        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 0.4)
-        path.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(health, "_write_probe", over_budget)
-    pool = StorageProber(cache_seconds=0.0)
-    try:
-        first = pool.probe(tmp_path / "data")
-        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 0.6)
-        # The write has now landed; a caller arriving here sees a completed future.
-        after = pool.probe(tmp_path / "data")
-    finally:
-        pool.shutdown()
-    assert first.errno_name == "ETIMEDOUT"
-    assert after.writable is False, "an over-budget write was reported as ready"
-    assert after.errno_name == "ETIMEDOUT"
-
-
 def test_a_write_that_fails_instantly_does_not_deadlock_the_prober(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -296,8 +268,8 @@ def test_a_write_that_fails_instantly_does_not_deadlock_the_prober(
     """
 
     class AlreadyDone:
-        def submit(self, fn: object, *args: object) -> Future[None]:
-            future: Future[None] = Future()
+        def submit(self, fn: object, *args: object) -> Future[float]:
+            future: Future[float] = Future()
             future.set_exception(OSError(errno.EACCES, "permission denied"))
             return future
 
@@ -319,9 +291,9 @@ def test_a_write_that_succeeds_instantly_does_not_deadlock_the_prober(
     """The same inline-callback path, on the success side."""
 
     class AlreadyDone:
-        def submit(self, fn: object, *args: object) -> Future[None]:
-            future: Future[None] = Future()
-            future.set_result(None)
+        def submit(self, fn: object, *args: object) -> Future[float]:
+            future: Future[float] = Future()
+            future.set_result(0.0)
             return future
 
         def shutdown(self, wait: bool = True) -> None:
@@ -333,32 +305,58 @@ def test_a_write_that_succeeds_instantly_does_not_deadlock_the_prober(
     assert pool.probe(tmp_path / "data").writable is True
 
 
-def test_a_success_observed_after_the_budget_expires_is_reported_unready(
+def test_a_write_that_took_longer_than_its_budget_is_reported_unready(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The over-budget guard itself, reached deterministically.
+    """The over-budget guard, judged on the write's own duration.
 
-    The natural route is a joiner arriving just after a slow write lands, which is a race. An
-    injected clock makes it certain: the probe starts at t=0, the write is already complete, and
-    the clock reads 2.0s by the time the result is observed, past the 1.5s budget. Without the
-    guard this returns ready and caches it, so an over-budget mount reads healthy.
+    A joiner arriving just after a slow write lands sees a completed future, so without this
+    guard the success is reported and cached and an over-budget mount reads healthy to some
+    callers and unready to others. Measured at 19 of 24 ready before the guard existed. The
+    worker reports its own duration, so a stub can state one and the branch is reached without
+    racing. An earlier version of this test asserted only that the second call came back
+    unready, which an implementation with no guard at all satisfies identically.
     """
 
-    class AlreadyDone:
-        def submit(self, fn: object, *args: object) -> Future[None]:
-            future: Future[None] = Future()
-            future.set_result(None)
+    class OverBudget:
+        def submit(self, fn: object, *args: object) -> Future[float]:
+            future: Future[float] = Future()
+            future.set_result(STORAGE_PROBE_TIMEOUT_SECONDS + 0.5)
             return future
 
         def shutdown(self, wait: bool = True) -> None:
             return None
 
-    # Consumed in order: the probe start, the remaining-budget calculation, then the elapsed
-    # measurement after the result is in hand.
-    readings = iter([0.0, 0.0, STORAGE_PROBE_TIMEOUT_SECONDS + 0.5])
-    pool = StorageProber(cache_seconds=0.0, clock=lambda: next(readings))
-    monkeypatch.setattr(pool, "_executor", AlreadyDone())
+    pool = StorageProber(cache_seconds=0.0)
+    monkeypatch.setattr(pool, "_executor", OverBudget())
     probe = pool.probe(tmp_path / "data")
     assert probe.writable is False, "an over-budget write was reported as ready"
     assert probe.errno_name == "ETIMEDOUT"
     assert probe.status == "unready"
+
+
+def test_an_observers_own_delay_is_not_charged_to_the_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The budget is a statement about the write, not about how promptly it was observed.
+
+    Measuring the observer's clock reading meant a request descheduled after taking the future
+    reported a perfectly healthy volume as timed out: fail-closed by luck rather than by
+    construction, and in the same direction as the false-unready major.
+    """
+
+    class FastWrite:
+        def submit(self, fn: object, *args: object) -> Future[float]:
+            future: Future[float] = Future()
+            future.set_result(0.001)
+            return future
+
+        def shutdown(self, wait: bool = True) -> None:
+            return None
+
+    # The clock jumps far past the budget between starting the probe and reading the result.
+    readings = iter([0.0, 0.0, STORAGE_PROBE_TIMEOUT_SECONDS * 10])
+    pool = StorageProber(cache_seconds=0.0, clock=lambda: next(readings))
+    monkeypatch.setattr(pool, "_executor", FastWrite())
+    probe = pool.probe(tmp_path / "data")
+    assert probe.writable is True, "the observer's own delay was charged to the mount"

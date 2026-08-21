@@ -35,9 +35,10 @@ the assessment store.
 | Interactive documentation not served in production | `src/pree/app.py` | `test_the_interactive_docs_are_not_served_in_production` |
 | Every filesystem refusal surfaces as a handled 503, audited | `src/pree/store.py` | `test_a_real_storage_refusal_returns_503_and_audits_the_action`, `test_a_failed_lock_release_surfaces_as_a_store_error` |
 | The rate limiter fails closed when its key table saturates | `src/pree/ratelimit.py` | `test_a_saturated_key_table_fails_closed_rather_than_admitting_everyone` |
-| A busy probe pool never reports storage as broken | `src/pree/health.py` | `test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate` |
 | Concurrent probe callers join the probe in flight rather than guessing | `src/pree/health.py` | `test_a_concurrent_caller_joins_the_probe_rather_than_guessing` |
-| A write that misses its budget is never reported as ready | `src/pree/health.py` | `test_a_write_that_misses_its_budget_is_never_reported_as_ready` |
+| A write that misses its budget is never reported as ready | `src/pree/health.py` | `test_a_write_that_took_longer_than_its_budget_is_reported_unready` |
+| An observer's own delay is never charged to the mount | `src/pree/health.py` | `test_an_observers_own_delay_is_not_charged_to_the_mount` |
+| A malformed stored value is dropped rather than crashing the handler | `src/pree/store.py` | `test_a_non_object_assessment_value_is_dropped_rather_than_crashing` |
 | The retention cap holds even on a snapshot with a partial write order | `src/pree/store.py` | `test_a_partial_write_order_still_trims_to_the_cap` |
 | The assessment collection is capped, newest kept | `src/pree/store.py` | `test_the_collection_is_capped_and_the_newest_record_always_survives` |
 | A configured data directory must be absolute, and a pasted value is normalised | `src/pree/config.py` | `test_a_relative_data_directory_is_refused`, `test_a_quote_wrapped_path_is_normalised_not_taken_literally` |

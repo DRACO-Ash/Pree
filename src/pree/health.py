@@ -10,7 +10,8 @@ Three probe shapes, deliberately distinct:
   strictly shorter than the platform probe, and its 503 body names the resolved directory
   and the exact errno so a screenshot is a full diagnosis. Concurrent callers join the probe
   already in flight rather than each costing a write, so this unauthenticated path cannot be
-  used to amplify load or to move the verdict in either direction.
+  used to amplify writes or to move the verdict in either direction. It does still occupy a
+  request worker for the length of the probe it joins, which is bounded by the probe budget.
 * Diagnostics. A secret-free read-out with every plausible field present at once, reporting
   each critical input as a boolean and a length, never a value.
 """
@@ -98,11 +99,11 @@ class StorageProber:
     ) -> None:
         self._cache_seconds = cache_seconds
         self._clock = clock
-        self._executor: Any = ThreadPoolExecutor(
+        self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="storage-probe"
         )
         self._guard = threading.Lock()
-        self._current: Future[None] | None = None
+        self._current: Future[float] | None = None
         self._current_started = 0.0
         self._cached: StorageProbe | None = None
         self._cached_at = 0.0
@@ -115,23 +116,39 @@ class StorageProber:
                 return None
             return self._cached
 
-    def _remember(self, probe: StorageProbe) -> StorageProbe:
+    def _remember(self, probe: StorageProbe, observed_at: float) -> StorageProbe:
+        """Cache a verdict, stamped with when the probe STARTED.
+
+        Stamping at observation time made the worst-case staleness the cache window plus the
+        write latency, which is a different and larger number than the one documented.
+        """
         with self._guard:
             self._cached = probe
-            self._cached_at = self._clock()
+            self._cached_at = observed_at
         return probe
 
-    def _clear(self, future: Future[None]) -> None:
+    def _timed_write(self, data_dir: Path) -> float:
+        """Perform the write and return ITS OWN duration.
+
+        The budget is a statement about the write, not about how promptly a caller managed to
+        observe it. Measuring the observer's clock reading charged an observer's own delay to
+        the mount, so a descheduled request could report a healthy volume as timed out.
+        """
+        started = self._clock()
+        _write_probe(data_dir)
+        return self._clock() - started
+
+    def _clear(self, future: Future[float]) -> None:
         with self._guard:
             if self._current is future:
                 self._current = None
 
-    def _join_or_start(self, data_dir: Path) -> tuple[Future[None], float]:
+    def _join_or_start(self, data_dir: Path) -> tuple[Future[float], float]:
         """Return the in-flight probe, starting one only if none is running."""
         with self._guard:
             if self._current is not None:
                 return self._current, self._current_started
-            future = self._executor.submit(_write_probe, data_dir)
+            future = self._executor.submit(self._timed_write, data_dir)
             self._current = future
             self._current_started = self._clock()
             started = self._current_started
@@ -152,7 +169,7 @@ class StorageProber:
         future, started = self._join_or_start(data_dir)
         remaining = max(0.0, started + STORAGE_PROBE_TIMEOUT_SECONDS - self._clock())
         try:
-            future.result(timeout=remaining)
+            duration = future.result(timeout=remaining)
         except FutureTimeout:
             elapsed = int((self._clock() - started) * 1000)
             return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
@@ -160,16 +177,15 @@ class StorageProber:
             elapsed = int((self._clock() - started) * 1000)
             code = exc.errno
             name = errno.errorcode.get(code) if code is not None else None
-            return self._remember(StorageProbe(False, directory, code, name, elapsed))
-        waited = self._clock() - started
-        elapsed = int(waited * 1000)
-        if waited > STORAGE_PROBE_TIMEOUT_SECONDS:
+            return self._remember(StorageProbe(False, directory, code, name, elapsed), started)
+        elapsed = int(duration * 1000)
+        if duration > STORAGE_PROBE_TIMEOUT_SECONDS:
             # The write succeeded, but not inside the budget. A joiner arriving just after a
             # slow write finally lands would otherwise report ready and cache it, so an
             # over-budget mount read healthy to some callers and unready to others. The budget
             # is the contract: a write that misses it is not a pass, whoever observed it.
             return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
-        return self._remember(StorageProbe(True, directory, None, None, elapsed))
+        return self._remember(StorageProbe(True, directory, None, None, elapsed), started)
 
     def shutdown(self) -> None:
         """Release the pool. A blocked worker is not waited on; it would never return."""

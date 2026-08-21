@@ -280,8 +280,14 @@ def register_health_routes(
 ) -> None:
     """Register the liveness paths, the storage proof, and the diagnostics read-out."""
 
-    def liveness() -> dict[str, str]:
-        """Liveness only: 200, unauthenticated, touching nothing, so it cannot hang."""
+    async def liveness() -> dict[str, str]:
+        """Liveness only: 200, unauthenticated, touching nothing, so it cannot hang.
+
+        Declared async deliberately. A sync handler runs in the shared request threadpool, so
+        under a flood of the storage-probe path (each caller of which holds a worker for up to
+        the probe budget) liveness queued behind it: measured at 1.46s p95 against a 0.045s
+        baseline. Nothing here needs a thread.
+        """
         return {"status": "ok", "service": "pree", "version": __version__}
 
     for path in LIVENESS_PATHS:

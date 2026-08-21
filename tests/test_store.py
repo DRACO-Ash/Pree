@@ -486,3 +486,31 @@ def test_the_write_order_always_covers_every_stored_key_exactly_once(
     assert sorted(order) == ["a:1", "a:2", "a:3"]
     assert len(order) == len(set(order))
     assert order[0] == "a:2", "a tracked key keeps its position ahead of untracked ones"
+
+
+def test_a_non_object_assessment_value_is_dropped_rather_than_crashing(
+    tmp_path: Path,
+) -> None:
+    """A malformed value raised ValueError, which the store's error contract does not cover.
+
+    The result was a framework 500 with no audit line, where every other storage fault is a
+    handled 503. Validating the container but not its values left the fail-closed claim one
+    level short.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "assessments.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "assessments": {"good:one": {"score": 1.0}, "bad:two": "not an object"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = JsonStore(data_dir)
+    snapshot = store.read()
+    assert "good:one" in snapshot["assessments"]
+    assert "bad:two" not in snapshot["assessments"]
+    # And the merge path no longer raises on it.
+    assert store.upsert("bad:two", {"score": 2.0})["assessments"]["bad:two"] == {"score": 2.0}

@@ -51,6 +51,12 @@ def migrate_forward(snapshot: dict[str, Any]) -> dict[str, Any]:
         migrated["schema_version"] = SCHEMA_VERSION
     if not isinstance(migrated.get("assessments"), dict):
         migrated["assessments"] = {}
+    # Validate the VALUES too, not only the container. A non-object value raised ValueError out
+    # of the merge, which the store's error contract does not cover, so a malformed snapshot
+    # returned a framework 500 with no audit line rather than the handled 503.
+    migrated["assessments"] = {
+        key: value for key, value in migrated["assessments"].items() if isinstance(value, dict)
+    }
     order = migrated.get("write_order")
     if not isinstance(order, list) or not all(isinstance(k, str) for k in order):
         # An older snapshot carries no write order. Seed it from the stored keys so the cap has

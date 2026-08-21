@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -111,3 +112,37 @@ def test_the_launch_command_targets_the_factory_that_actually_exists() -> None:
     module = importlib.import_module("pree.main")
     assert callable(module.build)
     assert not hasattr(module, "app")
+
+
+def test_every_test_the_security_register_cites_actually_exists() -> None:
+    """A control row whose evidence does not exist is an unverifiable claim.
+
+    The register carried a row citing a test deleted in the same commit that removed the
+    behaviour it described, so the document asserted a control the code no longer implemented
+    and pointed at nothing. Reviewing prose cannot catch that reliably; this can.
+    """
+    register = (REPO_ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
+    cited = set(re.findall(r"`(test_[a-z0-9_]+)`", register))
+    assert cited, "the register cites no tests, which is itself suspicious"
+    defined: set[str] = set()
+    for path in (REPO_ROOT / "tests").glob("test_*.py"):
+        defined |= set(
+            re.findall(r"^def (test_[a-z0-9_]+)", path.read_text(encoding="utf-8"), re.M)
+        )
+    missing = sorted(cited - defined)
+    assert not missing, f"the security register cites tests that do not exist: {missing}"
+
+
+def test_the_deployment_sheet_describes_only_states_the_code_can_emit() -> None:
+    """The operator sheet described a response shape the app cannot produce.
+
+    It documented a busy probe pool returning 200 with status "unknown" and errno EBUSY, for
+    the endpoint that gates pod restarts, long after that behaviour was deleted. An operator
+    reading it would have believed a concurrency-induced 503 was impossible when it is now the
+    designed answer for a mount that is genuinely not working.
+    """
+    sheet = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    health_source = (REPO_ROOT / "src" / "pree" / "health.py").read_text(encoding="utf-8")
+    for retired in ("EBUSY", '"unknown"', "indeterminate"):
+        assert retired not in health_source, f"{retired} is back in the source; update the docs"
+        assert retired not in sheet, f"the deployment sheet still documents {retired}"
