@@ -458,7 +458,8 @@ def create_app(
             last_ready["writable"] = probe.writable
         return probe
 
-    # --- innermost of the four middlewares: the body cap, above the routes ---
+    # --- innermost of the middleware stack, above the routes (four layers with CORS
+    # configured, three without, since that registration is conditional) ---
     app.add_middleware(BodySizeLimit)
 
     @app.middleware("http")

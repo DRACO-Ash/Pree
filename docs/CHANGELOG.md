@@ -16,7 +16,7 @@ Foundations baseline.
 ● The container: hash-locked install in a build stage, a prep stage whose last mutation is the
   suid and sgid sweep, and a flattened `FROM scratch` ship stage.
 ● The loop: `ruff`, `mypy` over source and tests, `pytest` with a Cobertura report, and
-  `pip-audit`, at 99% coverage over 184 tests against a gate bar of 80%.
+  `pip-audit`, at 99% coverage over 194 tests against a gate bar of 80%.
 
 Ten defects found by the binding engineering and security gates on first review are fixed in
 this release, each with a named regression test:
@@ -93,3 +93,11 @@ Two further regressions from the second round of fixes, and three holes the test
   life of the worker. The clock is injected now and two tests cover expiry.
 ● The Dockerfile launch target and the module factory were not tied together by any test, so
   reverting the target left the suite green while the container could not start at all.
+
+### Fifth gate round
+
+The engineering gate passed the change with four minor items, fixed here rather than banked:
+the masking test asserted only that some `StoreError` surfaced, so inverting which error won
+left it green; the middleware count in a comment ignored that the CORS registration is
+conditional; the test count above was stale at 184; and this file gained no row for the
+previous commit, which the project's own convention requires. No behavioural change.

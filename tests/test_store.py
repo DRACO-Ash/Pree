@@ -321,5 +321,7 @@ def test_a_failed_release_masks_the_body_error_but_keeps_the_contract(
 
     monkeypatch.setattr(fcntl, "flock", refuse_release)
     monkeypatch.setattr(tempfile, "mkstemp", refuse_write)
-    with pytest.raises(StoreError):
+    # Match the release message specifically. Asserting only StoreError pins nothing the
+    # sibling test does not already cover, and leaves an inversion of the masking green.
+    with pytest.raises(StoreError, match="could not release"):
         store.upsert("a:b", {"score": 1.0})
