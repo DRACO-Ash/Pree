@@ -39,6 +39,10 @@ the assessment store.
 | A write that misses its budget is never reported as ready | `src/pree/health.py` | `test_a_write_that_took_longer_than_its_budget_is_reported_unready` |
 | An observer's own delay is never charged to the mount | `src/pree/health.py` | `test_an_observers_own_delay_is_not_charged_to_the_mount` |
 | A malformed stored value is dropped rather than crashing the handler | `src/pree/store.py` | `test_a_non_object_assessment_value_is_dropped_rather_than_crashing` |
+| A snapshot too deep to parse fails closed, not into an unhandled 500 | `src/pree/store.py` | `test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing` |
+| The liveness handlers never occupy the shared request threadpool | `src/pree/app.py` | `test_the_liveness_routes_never_occupy_the_shared_request_threadpool` |
+| Every control row here cites an artefact that exists | `docs/SECURITY.md` | `test_every_control_row_cites_an_artefact_that_exists` |
+| The deployment sheet documents only states the code can return | `docs/DEPLOYMENT.md` | `test_the_deployment_sheet_documents_only_probe_states_the_code_can_return` |
 | The retention cap holds even on a snapshot with a partial write order | `src/pree/store.py` | `test_a_partial_write_order_still_trims_to_the_cap` |
 | The assessment collection is capped, newest kept | `src/pree/store.py` | `test_the_collection_is_capped_and_the_newest_record_always_survives` |
 | A configured data directory must be absolute, and a pasted value is normalised | `src/pree/config.py` | `test_a_relative_data_directory_is_refused`, `test_a_quote_wrapped_path_is_normalised_not_taken_literally` |
@@ -179,6 +183,28 @@ mount, a refused mount and a wedged mount each give twenty-four out of twenty-fo
 defect surfaced only in that measurement: a joiner arriving just after a slow write finally
 landed reported ready and cached it, so an over-budget mount answered ready in five of
 twenty-four probes. A write that misses its budget is now unready for every caller.
+
+Fifth review: two majors of evidence rather than code. A test passed with the control it was
+named after deleted, and the register cited it as that control's evidence while the test which
+actually pins the control went uncited. And the deployment sheet still described a busy probe
+pool returning 200 with status "unknown" and errno EBUSY for the endpoint that gates pod
+restarts, two commits after that behaviour was removed, with a register row asserting the same
+retired control and citing a test deleted alongside it. Five residual defects came with them,
+two of them fail-closed by luck rather than construction: the budget judged on the observer's
+clock rather than the write's own duration, and the cache stamped at observation time.
+
+Sixth review: making the liveness handlers synchronous again left the entire suite green while
+measuring a 500-fold liveness latency regression under an unauthenticated flood of the unmetered
+probe path, enough to restart a healthy pod. A RecursionError from a deeply nested snapshot
+escaped the store's error contract into an unhandled 500 with no hardening headers and no audit
+line. And both guards added in the fifth round were themselves defeatable: the register check
+matched bare test names only, and the deployment-sheet check was a denylist wearing the name of
+a property.
+
+Four times across those two rounds a fix shipped with nothing distinguishing it from the
+behaviour it replaced. That is the recurring failure of this work, and it is a failure of
+testing rather than of code: the reviewer named two instances, mutation testing found the third,
+and the reviewer found the fourth. Every control listed above is now mutation-proven.
 
 Each of these now has a named regression test in the control table above.
 

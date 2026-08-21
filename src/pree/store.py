@@ -224,7 +224,10 @@ class JsonStore:
         """Parse and migrate one snapshot file, or fail closed."""
         try:
             raw = json.loads(source.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, RecursionError) as exc:
+            # RecursionError is a RuntimeError, not a ValueError, so a deeply nested snapshot
+            # escaped this contract entirely: the client got a framework 500 with no hardening
+            # headers and no audit line, where every other storage fault is a handled 503.
             raise StoreError(f"snapshot at {source} is unreadable") from exc
         if not isinstance(raw, dict):
             raise StoreError(f"snapshot at {source} is not a JSON object")

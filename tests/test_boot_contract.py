@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from pree.health import StorageProbe
+
 ON_PLATFORM_RUNNER = os.environ.get("GITLAB_CI") == "true"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -114,35 +116,80 @@ def test_the_launch_command_targets_the_factory_that_actually_exists() -> None:
     assert not hasattr(module, "app")
 
 
-def test_every_test_the_security_register_cites_actually_exists() -> None:
-    """A control row whose evidence does not exist is an unverifiable claim.
+def _register_control_rows() -> list[tuple[str, str]]:
+    """Every row of the control table, as (control name, evidence column)."""
+    rows: list[tuple[str, str]] = []
+    for line in (REPO_ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8").splitlines():
+        if not line.startswith("|") or set(line) <= set("|- "):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 3 or cells[0] == "Control":
+            continue
+        rows.append((cells[0], cells[2]))
+    return rows
 
-    The register carried a row citing a test deleted in the same commit that removed the
-    behaviour it described, so the document asserted a control the code no longer implemented
-    and pointed at nothing. Reviewing prose cannot catch that reliably; this can.
+
+def test_every_control_row_cites_an_artefact_that_exists() -> None:
+    """A control row whose evidence cannot be checked is an unverifiable claim.
+
+    The first version of this test matched bare test names only, so a row citing a test FILE
+    went unchecked and a row citing nothing at all - "verified by manual inspection", "the
+    operator confirms it" - was invisible. Three fabricated rows of those shapes passed it.
+    Now every row must cite at least one backticked artefact, every cited test name must be a
+    real function, and every cited path must exist on disk.
     """
-    register = (REPO_ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8")
-    cited = set(re.findall(r"`(test_[a-z0-9_]+)`", register))
-    assert cited, "the register cites no tests, which is itself suspicious"
     defined: set[str] = set()
     for path in (REPO_ROOT / "tests").glob("test_*.py"):
         defined |= set(
             re.findall(r"^def (test_[a-z0-9_]+)", path.read_text(encoding="utf-8"), re.M)
         )
-    missing = sorted(cited - defined)
-    assert not missing, f"the security register cites tests that do not exist: {missing}"
+
+    rows = _register_control_rows()
+    assert len(rows) > 10, f"only {len(rows)} control rows parsed; the parser has drifted"
+
+    uncited: list[str] = []
+    missing_tests: list[str] = []
+    missing_paths: list[str] = []
+    for control, evidence in rows:
+        tokens = re.findall(r"`([^`]+)`", evidence)
+        if not tokens:
+            uncited.append(control)
+            continue
+        for token in tokens:
+            is_test_name = re.fullmatch(r"test_[a-z0-9_]+", token) is not None
+            looks_like_path = "/" in token or token.endswith((".py", ".sh", ".txt", ".md"))
+            if is_test_name and token not in defined:
+                missing_tests.append(f"{control} -> {token}")
+            elif not is_test_name and looks_like_path and not (REPO_ROOT / token).exists():
+                missing_paths.append(f"{control} -> {token}")
+
+    assert not uncited, f"control rows citing no checkable artefact: {uncited}"
+    assert not missing_tests, f"control rows citing tests that do not exist: {missing_tests}"
+    assert not missing_paths, f"control rows citing paths that do not exist: {missing_paths}"
 
 
-def test_the_deployment_sheet_describes_only_states_the_code_can_emit() -> None:
-    """The operator sheet described a response shape the app cannot produce.
+def test_the_deployment_sheet_documents_only_probe_states_the_code_can_return() -> None:
+    """The sheet must not describe a probe state the code cannot produce.
 
-    It documented a busy probe pool returning 200 with status "unknown" and errno EBUSY, for
-    the endpoint that gates pod restarts, long after that behaviour was deleted. An operator
-    reading it would have believed a concurrency-induced 503 was impossible when it is now the
-    designed answer for a mount that is genuinely not working.
+    The first version was a three-token denylist wearing this name, so the sheet could drift in
+    any NEW direction: a fabricated section documenting a "degraded" status, an EAGAIN errno, a
+    429 on the probe path and a 204 on readiness passed it untouched. The allowed set is now
+    derived from the code itself.
     """
+    emittable = {
+        StorageProbe(True, "/data", None, None, 1).status,
+        StorageProbe(False, "/data", 13, "EACCES", 1).status,
+    }
     sheet = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r'"status":\s*"([a-z]+)"', sheet))
+    assert documented, "the sheet documents no probe status at all, which is itself a drift"
+    unproducible = documented - emittable
+    assert not unproducible, (
+        f"the sheet documents statuses the code cannot return: {sorted(unproducible)}; "
+        f"the code can return {sorted(emittable)}"
+    )
+    # And the retired states must not come back by any spelling.
     health_source = (REPO_ROOT / "src" / "pree" / "health.py").read_text(encoding="utf-8")
-    for retired in ("EBUSY", '"unknown"', "indeterminate"):
+    for retired in ("EBUSY", "indeterminate"):
         assert retired not in health_source, f"{retired} is back in the source; update the docs"
         assert retired not in sheet, f"the deployment sheet still documents {retired}"

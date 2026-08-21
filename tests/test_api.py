@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import logging
@@ -535,3 +536,30 @@ def test_the_diagnostics_read_out_reports_whether_the_data_dir_was_configured(
 ) -> None:
     body = client.get("/diagnostics", headers=AUTH).json()
     assert body["data_dir_was_configured"] is True
+
+
+def test_the_liveness_routes_never_occupy_the_shared_request_threadpool(
+    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+) -> None:
+    """The liveness handlers must be coroutines, and nothing asserted it.
+
+    A sync handler runs in the shared request threadpool alongside probe callers, each of whom
+    holds a worker for up to the probe budget. Measured with the handlers made sync: liveness
+    p95 went from 3ms to 1588ms and throughput from 336/s to 1.25/s under a 120-way
+    unauthenticated flood of the unmetered probe path, which is enough to push the platform's
+    liveness probe past its timeout and restart the pod. A one-word edit, and the whole suite
+    stayed green.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    store = JsonStore(config.data_dir)
+    store.seed()
+    app = create_app(config, store, logger=quiet_logger, prober=prober)
+    synchronous = [
+        getattr(route, "path", "")
+        for route in app.routes
+        if getattr(route, "path", None) in LIVENESS_PATHS
+        and not inspect.iscoroutinefunction(getattr(route, "endpoint", None))
+    ]
+    assert not synchronous, (
+        f"sync liveness handlers queue behind probe callers in the threadpool: {synchronous}"
+    )

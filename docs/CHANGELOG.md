@@ -16,7 +16,8 @@ Foundations baseline.
 ● The container: hash-locked install in a build stage, a prep stage whose last mutation is the
   suid and sgid sweep, and a flattened `FROM scratch` ship stage.
 ● The loop: `ruff`, `mypy` over source and tests, `pytest` with a Cobertura report, and
-  `pip-audit`, at 99% coverage over 194 tests against a gate bar of 80%.
+  `pip-audit`, at 99% coverage against a gate bar of 80%. The test count moves with every
+  round, so it is reported by the loop rather than pinned here where it goes stale.
 
 Ten defects found by the binding engineering and security gates on first review are fixed in
 this release, each with a named regression test:
@@ -151,3 +152,49 @@ caught it at the shipped parameters:
   Both directions are enforced on read now, and duplicates are collapsed.
 ● The register now states that the cap is shared across everyone holding the team token rather
   than per operator, and the deployment sheet publishes the measured per-write cost beside it.
+
+### Fifth security review
+
+Two majors, both failures of evidence rather than exploitable code, plus five residual defects:
+
+● A test passed with the control it was named after deleted. Its second call started a fresh
+  over-budget write whose timeout came through the ordinary path, so an implementation with no
+  over-budget guard satisfied it identically. Deleted; the register now cites the stub-driven
+  test that actually kills that mutation.
+● The deployment sheet still told the operator that a busy probe pool returns 200 with status
+  "unknown" and errno EBUSY, "never 503", for the endpoint that gates pod restarts, two commits
+  after that behaviour was deleted. A register row asserted the same retired control and cited
+  a test deleted with it.
+● The budget was measured against the observer's clock rather than the write's own duration, so
+  a descheduled request charged its delay to the mount. The worker reports its duration now.
+● The cache was stamped at observation time, making worst-case staleness the window plus the
+  write latency. It is stamped from the probe start, and the real bound is published.
+● A non-object stored value raised ValueError past the store's error contract into a framework
+  500 with no audit line.
+● The liveness routes were sync handlers sharing the request threadpool with probe callers.
+● A bare Any on the executor silenced type checking on every call to it.
+
+Mutation testing then found a third instance of the same shape the review had named twice:
+reverting the cache stamp left the whole health suite green. That fix now has a test that
+distinguishes it.
+
+### Sixth security review
+
+One major and four minors. The reviewer could not make the probe lie in either direction under
+a 40-way flood across six mount conditions, could not make a joiner disagree with its owner,
+and confirmed single-flight holds at one concurrent write under load. It also accepted, with
+measurements, the decision to leave the storage-probe route synchronous rather than duplicate
+the verdict logic in an async path.
+
+● The major was the fourth instance of the recurring shape: making the liveness handlers sync
+  again left all 217 tests green, while measuring a 500x liveness latency regression and a 269x
+  throughput collapse under a 120-way flood, which is enough to restart a healthy pod. A
+  structural test now asserts those handlers are coroutines.
+● RecursionError is a RuntimeError, so a deeply nested snapshot escaped the store's error
+  contract entirely: a framework 500 with no hardening headers and no audit line, falsifying
+  three register rows at once.
+● The register-citation guard matched bare test names only, so a row citing a test FILE went
+  unchecked and a row citing nothing at all was invisible. Three fabricated rows passed it.
+● The deployment-sheet guard was a three-token denylist wearing the name of a property, so the
+  sheet could drift in any new direction. The allowed states are derived from the code now.
+● This changelog reported a stale test count and had recorded neither of the last two reviews.

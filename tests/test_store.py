@@ -514,3 +514,18 @@ def test_a_non_object_assessment_value_is_dropped_rather_than_crashing(
     assert "bad:two" not in snapshot["assessments"]
     # And the merge path no longer raises on it.
     assert store.upsert("bad:two", {"score": 2.0})["assessments"]["bad:two"] == {"score": 2.0}
+
+
+def test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing(tmp_path: Path) -> None:
+    """RecursionError is a RuntimeError, so it escaped the store's declared error contract.
+
+    A snapshot deep enough to exhaust the parser produced a framework 500 with no hardening
+    headers and no audit line, where every other storage fault is a handled 503. That
+    falsified three register rows at once.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    depth = 20_000
+    (data_dir / "assessments.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
+    with pytest.raises(StoreError, match="unreadable"):
+        JsonStore(data_dir).read()
