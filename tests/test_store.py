@@ -273,3 +273,53 @@ def test_a_recovery_does_not_destroy_the_backup_it_recovered_from(tmp_path: Path
     # And a second corruption is still survivable, which is the whole point of a backup.
     (data_dir / "assessments.json").write_text("{corrupt again", encoding="utf-8")
     assert "keep:one" in store.read()["assessments"]
+
+
+def test_a_failed_lock_release_surfaces_as_a_store_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The release half of the lock wrap, which the acquire test cannot reach.
+
+    The parametrised flock case raises on LOCK_EX, so the context manager never enters its
+    body and the LOCK_UN handler never runs. Deleting that handler therefore left the whole
+    suite green, which means half of the "every filesystem refusal is a handled 503" control
+    asserted nothing and was free to regress into a bare OSError.
+    """
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    real = fcntl.flock
+
+    def refuse_release(fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_UN:
+            raise OSError(errno.EIO, "device refused the unlock")
+        real(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", refuse_release)
+    with pytest.raises(StoreError, match="could not release"):
+        store.upsert("a:b", {"score": 1.0})
+
+
+def test_a_failed_release_masks_the_body_error_but_keeps_the_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raising from inside `finally` replaces an in-flight exception from the body.
+
+    Both are StoreError, so the caller's contract holds either way. Pinning it here is what
+    stops the nesting being "simplified" into something that leaks a bare OSError.
+    """
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    real = fcntl.flock
+
+    def refuse_release(fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_UN:
+            raise OSError(errno.EIO, "device refused the unlock")
+        real(fd, operation)
+
+    def refuse_write(*_: object, **__: object) -> object:
+        raise PermissionError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(fcntl, "flock", refuse_release)
+    monkeypatch.setattr(tempfile, "mkstemp", refuse_write)
+    with pytest.raises(StoreError):
+        store.upsert("a:b", {"score": 1.0})

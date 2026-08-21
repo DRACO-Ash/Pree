@@ -458,7 +458,7 @@ def create_app(
             last_ready["writable"] = probe.writable
         return probe
 
-    # --- innermost of the three middlewares: the body cap, above the routes ---
+    # --- innermost of the four middlewares: the body cap, above the routes ---
     app.add_middleware(BodySizeLimit)
 
     @app.middleware("http")
@@ -483,7 +483,8 @@ def create_app(
             )
         return await call_next(request)
 
-    # --- outermost: CORS, so it wraps every rejection the layers below emit ---
+    # --- second-outermost: CORS, so it wraps every rejection the layers below emit. The
+    # hardening headers are registered after this and are therefore outermost. ---
     # Fail-closed by construction: only the configured origin, and load_config refuses to
     # start on a wildcard origin with a token, so by here the origin is absent or safe.
     if config.allowed_origin:

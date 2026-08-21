@@ -489,3 +489,21 @@ def test_a_real_storage_refusal_returns_503_and_audits_the_action(
     ]
     assert audits, f"no audit line for a failed privileged action: {buffer.getvalue()!r}"
     assert audits[-1]["outcome"] == "error"
+
+
+def test_the_storage_state_is_logged_once_per_transition_not_once_per_probe(
+    tmp_path: Path,
+    quiet_logger: logging.Logger,
+    prober: StorageProber,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The log-once promise in the factory's docstring, which nothing asserted."""
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    with build_client(config, quiet_logger, prober) as probing:
+        capsys.readouterr()
+        for _ in range(3):
+            probing.get(STORAGE_PROBE_PATH)
+        printed = capsys.readouterr().out
+    transitions = [line for line in printed.splitlines() if line.startswith("pree storage ")]
+    assert len(transitions) == 1, f"expected one transition line, got {transitions}"
+    assert "pree storage ready" in transitions[0]

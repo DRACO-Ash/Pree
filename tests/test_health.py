@@ -236,3 +236,14 @@ def test_a_stale_ready_result_is_not_served_after_the_mount_is_refused(
         pool.shutdown()
     assert after.writable is False
     assert after.errno_name == "EACCES"
+
+
+def test_an_idle_pool_is_not_reported_as_having_overrun() -> None:
+    """`all()` over an empty mapping is True, so without the emptiness guard a pool that
+    drained between a failed claim and this check would report a wedged mount rather than a
+    busy one. It fails safe, but the guard is load-bearing and was asserted nowhere."""
+    pool = StorageProber(cache_seconds=0.0)
+    try:
+        assert pool._all_in_flight_overran() is False
+    finally:
+        pool.shutdown()
