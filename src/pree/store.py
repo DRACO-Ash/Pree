@@ -77,6 +77,20 @@ class JsonStore:
     def _backup_path(self) -> Path:
         return self._path.with_suffix(self._path.suffix + _BACKUP_SUFFIX)
 
+    def _readable_primary(self) -> Path | None:
+        """The primary, but only if it parses. Otherwise there is nothing worth backing up.
+
+        Copying an unparseable primary over a good backup destroyed the only remaining copy,
+        so one corruption became unrecoverable on the very next write.
+        """
+        try:
+            if not self._path.exists():
+                return None
+            self._load(self._path)
+        except (OSError, StoreError):
+            return None
+        return self._path
+
     @contextmanager
     def _exclusive(self) -> Iterator[None]:
         """Hold an exclusive lock across a whole read-modify-write.
@@ -93,11 +107,19 @@ class JsonStore:
         except OSError as exc:
             raise StoreError(f"could not acquire the store lock at {lock_path}") from exc
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise StoreError(f"could not lock the store at {lock_path}") from exc
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                # A failed release must not escape as a bare OSError either: flock was the one
+                # filesystem call in this method left outside the wrap.
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError as exc:
+                    raise StoreError(f"could not release the store lock at {lock_path}") from exc
         finally:
             handle.close()
 
@@ -176,8 +198,9 @@ class JsonStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if self._path.exists():
-                shutil.copy2(self._path, self._backup_path)
+            previous = self._readable_primary()
+            if previous is not None:
+                shutil.copy2(previous, self._backup_path)
             tmp_path.replace(self._path)
         except OSError as exc:
             tmp_path.unlink(missing_ok=True)

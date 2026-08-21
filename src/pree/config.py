@@ -84,7 +84,7 @@ def _resolve_data_dir(env: dict[str, str]) -> Path:
     return path
 
 
-def _validate_origin_shape(token: str | None, origin: str | None) -> None:
+def _validate_origin_shape(origin: str | None) -> None:
     """Reject an origin that is not a real origin, in every environment.
 
     The wildcard check used to live inside the production branch and match `*` exactly, so
@@ -104,8 +104,6 @@ def _validate_origin_shape(token: str | None, origin: str | None) -> None:
             f"Refusing to start: PREE_ALLOWED_ORIGIN must look like "
             f"scheme://host[:port], got {origin!r}."
         )
-    if token is None:
-        return
 
 
 def _validate_production_auth(token: str | None, origin: str | None, environment: str) -> None:
@@ -145,7 +143,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
 
     token = _read(source, "PREE_TEAM_TOKEN")
     origin = _read(source, "PREE_ALLOWED_ORIGIN")
-    _validate_origin_shape(token, origin)
+    _validate_origin_shape(origin)
     _validate_production_auth(token, origin, environment)
 
     return Config(

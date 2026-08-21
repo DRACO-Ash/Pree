@@ -35,7 +35,11 @@ the assessment store.
 | Interactive documentation not served in production | `src/pree/app.py` | `test_the_interactive_docs_are_not_served_in_production` |
 | Every filesystem refusal surfaces as a handled 503, audited | `src/pree/store.py` | `test_a_real_storage_refusal_returns_503_and_audits_the_action` |
 | The rate limiter fails closed when its key table saturates | `src/pree/ratelimit.py` | `test_a_saturated_key_table_fails_closed_rather_than_admitting_everyone` |
-| A busy probe pool never reports storage as broken | `src/pree/health.py` | `test_a_busy_pool_is_indeterminate_rather_than_unready` |
+| A busy probe pool never reports storage as broken | `src/pree/health.py` | `test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate` |
+| A wedged mount keeps reporting unready, and never goes quiet | `src/pree/health.py` | `test_a_wedged_mount_keeps_answering_unready_rather_than_going_quiet` |
+| The readiness signal cannot freeze on a stale cached result | `src/pree/health.py` | `test_the_cached_result_expires` |
+| A recovery never destroys the backup it recovered from | `src/pree/store.py` | `test_a_recovery_does_not_destroy_the_backup_it_recovered_from` |
+| The launch command targets a factory that exists | `Dockerfile` | `test_the_launch_command_targets_the_factory_that_actually_exists` |
 | The allowed origin must be a concrete origin, in any environment | `src/pree/config.py` | `test_an_origin_that_is_not_a_concrete_origin_is_refused_in_any_environment` |
 | Atomic writes; a failed write never becomes the snapshot | `src/pree/store.py` | `test_a_failed_write_fails_closed_and_leaves_no_temporary_file` |
 | Merges never shrink the stored dataset | `src/pree/store.py` | `test_merge_never_deletes_a_key_the_update_omitted` |
@@ -107,6 +111,17 @@ controls that had never existed: the interactive documentation was served in pro
 no response carried a Content-Security-Policy or any hardening header. And it found four store
 call sites still raising bare `OSError`, so the documented first-deploy mount failure produced
 a framework 500 with no audit line at all.
+
+Third review, which caught two more regressions from the second round of fixes plus three
+holes the tests had left open: reporting a saturated probe pool as merely busy meant a
+permanently wedged mount answered 200 from its third probe onward, so the container health
+check never saw three consecutive failures and a pod with unavailable storage stayed in
+service; and the new unreadable-primary recovery copied the corrupt primary over its own good
+backup on the next write, making a second corruption unrecoverable. It also found `flock`
+still raising bare `OSError` past the store's error contract, the cache-expiry check asserted
+nowhere (deleting it froze the readiness signal for the life of the worker), and the coupling
+between the Dockerfile launch target and the module factory untested, so reverting the target
+left the suite green while the container could not start at all.
 
 Each of these now has a named regression test in the control table above.
 

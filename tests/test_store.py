@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
+import tempfile
 import threading
 from pathlib import Path
 
@@ -205,7 +207,7 @@ def test_two_concurrent_upserts_both_survive(tmp_path: Path) -> None:
     assert len([k for k in keys if k.startswith("worker-b:")]) == 15
 
 
-@pytest.mark.parametrize("failing_call", ["mkdir", "open", "mkstemp", "exists"])
+@pytest.mark.parametrize("failing_call", ["mkdir", "open", "mkstemp", "exists", "flock"])
 def test_every_filesystem_refusal_surfaces_as_a_store_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_call: str
 ) -> None:
@@ -221,11 +223,12 @@ def test_every_filesystem_refusal_surfaces_as_a_store_error(
     def refuse(*_: object, **__: object) -> object:
         raise PermissionError(errno.EACCES, "permission denied")
 
-    targets = {
+    targets: dict[str, tuple[object, str]] = {
         "mkdir": (Path, "mkdir"),
         "open": (Path, "open"),
-        "mkstemp": (__import__("tempfile"), "mkstemp"),
+        "mkstemp": (tempfile, "mkstemp"),
         "exists": (Path, "exists"),
+        "flock": (fcntl, "flock"),
     }
     owner, attribute = targets[failing_call]
     monkeypatch.setattr(owner, attribute, refuse)
@@ -242,4 +245,31 @@ def test_a_corrupt_primary_recovers_from_the_backup(tmp_path: Path) -> None:
     store.upsert("keep:two", {"score": 2.0})
     (data_dir / "assessments.json").write_text("{truncated", encoding="utf-8")
     recovered = store.read()["assessments"]
-    assert "keep:one" in recovered
+    # The backup lags the primary by one write by construction, so keep:two is expected to be
+    # absent. Stating the exact surviving set is the point: a membership check would pass even
+    # if recovery silently returned a single stale record.
+    assert sorted(recovered) == ["keep:one"]
+
+
+def test_a_recovery_does_not_destroy_the_backup_it_recovered_from(tmp_path: Path) -> None:
+    """The recovery used to poison its own safety net.
+
+    After recovering from the backup, the next write copied the still-corrupt primary over the
+    good backup, so a second corruption was unrecoverable and every later read raised. The
+    backup is now refreshed only from a primary that parses.
+    """
+    data_dir = tmp_path / "data"
+    store = JsonStore(data_dir)
+    store.seed()
+    store.upsert("keep:one", {"score": 1.0})
+    store.upsert("keep:two", {"score": 2.0})
+    (data_dir / "assessments.json").write_text("{truncated", encoding="utf-8")
+
+    store.upsert("new:three", {"score": 3.0})
+
+    backup = json.loads((data_dir / "assessments.json.bak").read_text(encoding="utf-8"))
+    assert isinstance(backup, dict), "the backup was overwritten with the corrupt primary"
+    assert "keep:one" in backup["assessments"]
+    # And a second corruption is still survivable, which is the whole point of a backup.
+    (data_dir / "assessments.json").write_text("{corrupt again", encoding="utf-8")
+    assert "keep:one" in store.read()["assessments"]

@@ -20,6 +20,7 @@ import errno
 import os
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
@@ -89,40 +90,64 @@ class StorageProber:
       write serves every caller inside the cache window.
     """
 
-    def __init__(self, max_workers: int = 2, cache_seconds: float = 2.0) -> None:
+    def __init__(
+        self,
+        max_workers: int = 2,
+        cache_seconds: float = 2.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._max_workers = max_workers
         self._cache_seconds = cache_seconds
+        self._clock = clock
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="storage-probe"
         )
         self._guard = threading.Lock()
-        self._in_flight = 0
+        # Start time per in-flight probe, so a slot held by a probe that has already overrun
+        # its timeout can be told apart from one held by a probe still within it. Without that
+        # distinction a permanently wedged mount looked merely busy, so the endpoint whose
+        # whole purpose is catching a refused mount answered 200 forever.
+        self._in_flight: dict[int, float] = {}
+        self._next_id = 0
         self._cached: StorageProbe | None = None
         self._cached_at = 0.0
 
-    def _claim(self) -> bool:
+    def _claim(self) -> int | None:
         with self._guard:
-            if self._in_flight >= self._max_workers:
-                return False
-            self._in_flight += 1
-            return True
+            if len(self._in_flight) >= self._max_workers:
+                return None
+            self._next_id += 1
+            token = self._next_id
+            self._in_flight[token] = self._clock()
+            return token
 
-    def _release(self) -> None:
+    def _release(self, token: int) -> None:
         with self._guard:
-            self._in_flight -= 1
+            self._in_flight.pop(token, None)
+
+    def _all_in_flight_overran(self) -> bool:
+        """True when every held slot belongs to a probe that has already timed out."""
+        now = self._clock()
+        with self._guard:
+            if not self._in_flight:
+                return False
+            return all(
+                now - started >= STORAGE_PROBE_TIMEOUT_SECONDS
+                for started in self._in_flight.values()
+            )
 
     def _fresh_enough(self) -> StorageProbe | None:
         with self._guard:
             if self._cached is None:
                 return None
-            if time.monotonic() - self._cached_at > self._cache_seconds:
+            if self._clock() - self._cached_at > self._cache_seconds:
                 return None
             return self._cached
 
     def _remember(self, probe: StorageProbe) -> StorageProbe:
         with self._guard:
             self._cached = probe
-            self._cached_at = time.monotonic()
+            self._cached_at = self._clock()
         return probe
 
     def probe(self, data_dir: Path) -> StorageProbe:
@@ -131,25 +156,33 @@ class StorageProber:
         if cached is not None:
             return cached
         directory = str(data_dir)
-        if not self._claim():
-            # Not cached: a busy answer is about this instant, not about the volume.
+        token = self._claim()
+        if token is None:
+            if self._all_in_flight_overran():
+                # Every worker is stuck past its timeout. That is not a busy pool, it is a
+                # wedged mount, and it must keep answering unready for as long as it lasts.
+                return StorageProbe(
+                    False, directory, errno.ETIMEDOUT, "ETIMEDOUT", 0, indeterminate=False
+                )
+            # Genuinely busy: slots held by probes still inside their timeout. That is not
+            # evidence about the volume either way, so it must not change the health verdict.
             return StorageProbe(False, directory, errno.EBUSY, "EBUSY", 0, indeterminate=True)
-        started = time.monotonic()
+        started = self._clock()
         future = self._executor.submit(_write_probe, data_dir)
         # The slot is freed by the worker itself, whenever it finishes, including long after
         # this call has already given up and returned a timeout.
-        future.add_done_callback(lambda _: self._release())
+        future.add_done_callback(lambda _: self._release(token))
         try:
             future.result(timeout=STORAGE_PROBE_TIMEOUT_SECONDS)
         except FutureTimeout:
-            elapsed = int((time.monotonic() - started) * 1000)
+            elapsed = int((self._clock() - started) * 1000)
             return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
         except OSError as exc:
-            elapsed = int((time.monotonic() - started) * 1000)
+            elapsed = int((self._clock() - started) * 1000)
             code = exc.errno
             name = errno.errorcode.get(code) if code is not None else None
             return self._remember(StorageProbe(False, directory, code, name, elapsed))
-        elapsed = int((time.monotonic() - started) * 1000)
+        elapsed = int((self._clock() - started) * 1000)
         return self._remember(StorageProbe(True, directory, None, None, elapsed))
 
     def shutdown(self) -> None:

@@ -2,6 +2,10 @@
 # Simulates the platform pipeline against the ARTEFACT, not the repository, including the
 # files and environment the platform adds to its own checkout.
 #
+# EXIT: 0 every stage green, image build included, and the only state that clears an
+# upload. 2 every stage green except containerize, deferred to CI for want of a Docker
+# daemon; exit 2 is NOT a pass. Anything else is a real failure in the last stage printed.
+#
 # The platform copies the zip into a project it owns, commits its own generated
 # .gitlab-ci.yml into that checkout, sets GITLAB_CI=true, and runs the stages strictly in
 # order. Reproducing that here is the single highest-value control, because the platform

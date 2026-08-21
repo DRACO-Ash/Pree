@@ -74,3 +74,22 @@ Verified without a Docker daemon: the exact launch command boots under gunicorn 
 uvicorn workers, binds `0.0.0.0`, answers 200 at `/`, hides OpenAPI in production and emits
 every hardening header; and the store's file lock holds across four real worker processes,
 with 30 of 30 concurrent writes surviving.
+
+### Third gate round
+
+Two further regressions from the second round of fixes, and three holes the tests had left:
+
+● Reporting a saturated probe pool as busy rather than unready meant a permanently wedged
+  mount answered 200 from its third probe onward, forever. The container health check never
+  reached three consecutive failures, so a pod with completely unavailable storage stayed in
+  service. A pool whose every slot has already overrun its timeout is now reported as a wedged
+  mount; only slots still inside their timeout count as busy.
+● The unreadable-primary recovery destroyed its own safety net: the next write copied the
+  corrupt primary over the good backup, so a second corruption was unrecoverable. The backup is
+  now refreshed only from a primary that parses.
+● `fcntl.flock` was the one filesystem call still outside the store's error wrap, so a refused
+  lock produced a framework 500 with no audit line.
+● The cache-expiry check was asserted nowhere; deleting it froze the readiness signal for the
+  life of the worker. The clock is injected now and two tests cover expiry.
+● The Dockerfile launch target and the module factory were not tied together by any test, so
+  reverting the target left the suite green while the container could not start at all.

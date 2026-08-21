@@ -7,6 +7,7 @@ the platform runner that gates the deploy, because the platform commits its own 
 
 from __future__ import annotations
 
+import importlib
 import os
 from pathlib import Path
 
@@ -95,3 +96,18 @@ def test_the_example_environment_file_carries_no_real_value() -> None:
 )
 def test_no_environment_file_is_tracked_in_the_working_tree() -> None:
     assert not (REPO_ROOT / ".env").exists()
+
+
+def test_the_launch_command_targets_the_factory_that_actually_exists() -> None:
+    """The load-bearing coupling between the Dockerfile and the module, which was untested.
+
+    Asserting only "exec gunicorn" meant reverting the target to `pree.main:app` kept the whole
+    suite green while the container could not start at all: gunicorn exits 4 with
+    "Failed to find attribute 'app'". Both halves are asserted here so they cannot drift.
+    """
+    body = _dockerfile()
+    assert "pree.main:build()" in body
+    assert "pree.main:app" not in body
+    module = importlib.import_module("pree.main")
+    assert callable(module.build)
+    assert not hasattr(module, "app")

@@ -46,10 +46,11 @@ Integration because no Docker daemon is reachable. Exit 2 is not a pass.
 | `GET /healthz/storage` | no | proves storage with a real write, races a hard timeout |
 | `GET /diagnostics` | when a token exists | secret-free read-out: booleans and lengths, never values |
 
-`/openapi.json`, `/docs` and `/redoc` are served in development only, never in production.
-Every response carries a locked `Content-Security-Policy` and the usual hardening headers.
 | `POST /v1/assess` | yes | score one candidate against one protected asset |
 | `GET /v1/assessments/{key}` | yes | read a stored assessment, with ETag support |
+
+`/openapi.json`, `/docs` and `/redoc` are served in development only, never in production.
+Every response carries a locked `Content-Security-Policy` and the usual hardening headers.
 
 ```sh
 curl -s localhost:8080/v1/assess \

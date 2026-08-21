@@ -5,6 +5,7 @@ what a deploy failure actually shows the operator.
 from __future__ import annotations
 
 import errno
+import threading
 import time
 from pathlib import Path
 
@@ -142,25 +143,96 @@ def test_concurrent_callers_cost_one_write(tmp_path: Path, monkeypatch: pytest.M
     assert calls["n"] == 1, f"expected one write for ten callers, got {calls['n']}"
 
 
-def test_a_busy_pool_is_indeterminate_rather_than_unready(
+def test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A saturated pool is not evidence that storage is broken, so it must not read as broken.
+    """A slot held by a healthy in-flight probe says nothing about the volume either way."""
+    running = threading.Event()
 
-    Reporting EBUSY as unready let three concurrent sockets turn the container HEALTHCHECK red.
-    """
+    def slow(_: Path) -> None:
+        running.set()
+        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS * 0.5)
 
-    def hang(_: Path) -> None:
-        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS * 20)
-
-    monkeypatch.setattr(health, "_write_probe", hang)
+    monkeypatch.setattr(health, "_write_probe", slow)
     pool = StorageProber(max_workers=1, cache_seconds=0.0)
+    worker = threading.Thread(target=pool.probe, args=(tmp_path / "data",))
+    worker.start()
     try:
-        assert pool.probe(tmp_path / "data").errno_name == "ETIMEDOUT"
+        assert running.wait(2.0)
         busy = pool.probe(tmp_path / "data")
     finally:
+        worker.join()
         pool.shutdown()
     assert busy.errno_name == "EBUSY"
     assert busy.indeterminate is True
     assert busy.status == "unknown"
-    assert busy.as_body()["status"] == "unknown"
+
+
+def test_a_wedged_mount_keeps_answering_unready_rather_than_going_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fail-open that mattered.
+
+    Once every worker was stuck, a saturated pool reported EBUSY, which mapped to 200 and
+    "unknown". The container HEALTHCHECK therefore never saw three consecutive failures, so a
+    pod with completely unavailable storage stayed in service indefinitely. A pool whose every
+    slot has already overrun its timeout is a wedged mount, not a busy pool.
+    """
+    release = threading.Event()
+    monkeypatch.setattr(health, "_write_probe", lambda _: release.wait(30))
+    pool = StorageProber(max_workers=2, cache_seconds=0.0)
+    try:
+        verdicts = [pool.probe(tmp_path / "data") for _ in range(5)]
+    finally:
+        release.set()
+        pool.shutdown()
+    assert all(p.errno_name == "ETIMEDOUT" for p in verdicts), [p.errno_name for p in verdicts]
+    assert all(p.indeterminate is False for p in verdicts)
+    assert all(p.status == "unready" for p in verdicts)
+
+
+def test_the_cached_result_expires(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The only bound on staleness of the readiness signal, and it was asserted nowhere.
+
+    Deleting the expiry check left the suite green, which meant the endpoint could freeze at
+    its first observed value for the life of the worker while storage broke underneath it.
+    """
+    calls = {"n": 0}
+    real = health._write_probe
+
+    def counted(path: Path) -> None:
+        calls["n"] += 1
+        real(path)
+
+    monkeypatch.setattr(health, "_write_probe", counted)
+    now = [1000.0]
+    pool = StorageProber(cache_seconds=2.0, clock=lambda: now[0])
+    try:
+        assert pool.probe(tmp_path / "data").writable is True
+        pool.probe(tmp_path / "data")
+        assert calls["n"] == 1, "the second call inside the window should have been cached"
+        now[0] += 5.0
+        pool.probe(tmp_path / "data")
+    finally:
+        pool.shutdown()
+    assert calls["n"] == 2, "the cache never expired, so the readiness signal was frozen"
+
+
+def test_a_stale_ready_result_is_not_served_after_the_mount_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [1000.0]
+    pool = StorageProber(cache_seconds=2.0, clock=lambda: now[0])
+    try:
+        assert pool.probe(tmp_path / "data").writable is True
+
+        def refuse(_: Path) -> None:
+            raise OSError(errno.EACCES, "permission denied")
+
+        monkeypatch.setattr(health, "_write_probe", refuse)
+        now[0] += 5.0
+        after = pool.probe(tmp_path / "data")
+    finally:
+        pool.shutdown()
+    assert after.writable is False
+    assert after.errno_name == "EACCES"

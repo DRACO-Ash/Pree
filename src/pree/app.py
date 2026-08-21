@@ -8,11 +8,13 @@ The request pipeline is, in order: rate limit, then reject an oversize body, the
 on cost-incurring and state-changing routes, then validate the body at the boundary, then the
 handler, then a generic error response with the detail logged server-side.
 
-Middleware nesting is deliberate, outermost first: CORS, then the coarse rate limiter, then
-the body cap, then the routes. CORS must be outermost or a 429 or 413 reaches a browser
-client with no origin header and cannot be read by it. The body cap must sit above the routes
-because the framework buffers the whole body before it resolves the token dependency, so an
-unauthenticated caller can otherwise make the process hold an arbitrary payload.
+Middleware nesting is deliberate. Outermost first: the hardening headers, then CORS, then
+the coarse rate limiter, then the body cap, then the routes. The headers go outermost so every
+response carries them, including one CORS short-circuits. CORS sits above the limiter or a 429
+or 413 reaches a browser client with no origin header and cannot be read by it. The body cap
+must sit above the routes because the framework buffers the whole body before it resolves the
+token dependency, so an unauthenticated caller can otherwise make the process hold an
+arbitrary payload.
 """
 
 from __future__ import annotations

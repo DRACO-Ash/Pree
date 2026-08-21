@@ -447,6 +447,14 @@ def test_the_hardening_headers_survive_a_rejection(client: TestClient) -> None:
     assert rejected.status_code == 401
     assert "default-src 'none'" in rejected.headers["content-security-policy"]
 
+    oversize = json.dumps(FULL_BODY)[:-1] + ',"pad":"' + "x" * (MAX_BODY_BYTES * 2) + '"}'
+    too_large = client.post(
+        "/v1/assess", content=oversize, headers={**AUTH, "content-type": "application/json"}
+    )
+    assert too_large.status_code == 413
+    assert "default-src 'none'" in too_large.headers["content-security-policy"]
+    assert too_large.headers["x-content-type-options"] == "nosniff"
+
 
 def test_a_real_storage_refusal_returns_503_and_audits_the_action(
     tmp_path: Path, prober: StorageProber, monkeypatch: pytest.MonkeyPatch
