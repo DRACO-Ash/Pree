@@ -1,0 +1,74 @@
+[project]
+name = "pree"
+version = "0.1.0"
+description = "Confidence-tiered threat scoring for Space Domain Awareness Protect and Defend operators."
+requires-python = "==3.12.*"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Sonar-equivalent local profile. Kept at least as strict as the platform profile so a
+# violation surfaces here, one at a time, rather than in bulk on upload.
+select = [
+  "E", "W",      # pycodestyle
+  "F",           # pyflakes
+  "I",           # import order
+  "B",           # bugbear
+  "C4",          # comprehensions
+  "S",           # bandit security rules
+  "SIM",         # simplify
+  "RET",         # return shapes
+  "PTH",         # pathlib over os.path
+  "N",           # naming
+  "UP",          # pyupgrade
+  "TRY",         # exception handling
+  "PL",          # pylint subset
+  "RUF",         # ruff-specific
+]
+ignore = [
+  "PLR0913",     # argument count: the app factory takes injected dependencies by design
+  "TRY003",      # long messages inline: fail-closed errors must name the cause
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert, use fixed dummy tokens, and touch temp paths by design.
+"tests/*" = ["S101", "S105", "S106", "PLR2004"]
+
+[tool.ruff.lint.mccabe]
+# SonarQube rule S3776 caps cognitive complexity at 15. Ruff measures cyclomatic
+# complexity, which is a different metric, so cap it tighter to stay inside S3776.
+max-complexity = 10
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["pree"]
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers --strict-config"
+
+[tool.coverage.run]
+source = ["src/pree"]
+branch = true
+
+[tool.coverage.report]
+# The App Store quality gate needs at least 80% line coverage. Fail the local loop at the
+# same bar so the platform never learns it first.
+fail_under = 80
+show_missing = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.coverage.xml]
+# Cobertura XML at the repository root is the path the Sonar gate reads for Python.
+output = "coverage.xml"

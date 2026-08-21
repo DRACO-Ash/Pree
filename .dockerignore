@@ -1,0 +1,32 @@
+# Shapes the IMAGE. The upload package allowlist is a separate contract: the platform tests
+# the zip before it builds this image, so the zip keeps the tests the image does not need.
+.git
+.github
+.claude
+.venv
+__pycache__
+*.py[cod]
+.mypy_cache
+.ruff_cache
+.pytest_cache
+tests
+docs
+scripts
+coverage
+coverage.xml
+.coverage
+.coverage.*
+htmlcov
+data
+.env
+.env.*
+*.zip
+appstore-package
+README.md
+CLAUDE.md
+READINESS.md
+requirements.in
+requirements-dev.in
+requirements-dev.txt
+sonar-project.properties
+pyproject.toml

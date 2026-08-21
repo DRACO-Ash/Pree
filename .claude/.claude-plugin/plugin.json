@@ -1,0 +1,46 @@
+{
+  "name": "bluestaq-foundations",
+  "version": "1.57.0",
+  "description": "Portable, App Store ready engineering baseline for Bluestaq code projects. Covers both archetypes (single-file/static and server-backed container): a cold-start runbook, twenty-nine per-domain skills, five front-door commands (/flight-plan, /scaffold, /retro, /readiness, /learn), three fail-closed verification gates, an advisory design critic, the Bluestaq house voice, and three guardrail hooks. Drop into a project's .claude/ to inherit the standards. Use whenever bootstrapping a new repository, hardening an existing one, or preparing a Bluestaq App Store submission.",
+  "author": "Bluestaq Limited",
+  "commands": "./commands",
+  "skills": [
+    "skills/getting-started",
+    "skills/flight-plan",
+    "skills/working-with-ai",
+    "skills/resource-discipline",
+    "skills/environment-setup",
+    "skills/toolchain-adapters",
+    "skills/glossary",
+    "skills/code-architecture",
+    "skills/dependencies",
+    "skills/data-layer",
+    "skills/api-and-integration",
+    "skills/frontend-and-rendering",
+    "skills/state-management",
+    "skills/design-system",
+    "skills/accessibility",
+    "skills/testing-standards",
+    "skills/ci-cd",
+    "skills/packaging",
+    "skills/observability-and-audit",
+    "skills/security-hardening",
+    "skills/release-and-deploy",
+    "skills/app-store-deployment",
+    "skills/deploy-recipes",
+    "skills/app-store-readiness",
+    "skills/appstore-gate-compliance",
+    "skills/project-retrospective",
+    "skills/learn-from-feedback"
+  ],
+  "agents": [
+    "agents/engineering-reviewer.md",
+    "agents/security-reviewer.md",
+    "agents/deploy-gate.md",
+    "agents/design-critic.md"
+  ],
+  "outputStyles": [
+    "output-styles/house-voice.md"
+  ],
+  "hooks": "hooks/hooks.json"
+}

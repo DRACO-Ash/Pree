@@ -1,0 +1,30 @@
+# Secrets: never tracked, never packaged.
+.env
+.env.local
+.env.*.local
+
+# Local data and backups (the store lives on the platform volume at runtime).
+data/
+*.bak
+
+# Coverage and test artefacts.
+coverage/
+coverage.xml
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# Python build and cache artefacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging output.
+appstore-package/
+*.zip

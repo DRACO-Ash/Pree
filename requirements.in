@@ -1,0 +1,11 @@
+# Runtime dependencies. Server archetype policy: no new runtime dependency without a
+# recorded reason (dependencies skill). Each reason is stated below.
+#
+# fastapi  : boundary validation. Every request body is parsed and rejected by a typed
+#            model before a handler runs, which is the validate-at-the-boundary standard
+#            rather than hand-rolled checks. Named framework in the Python deploy recipe.
+# uvicorn  : the ASGI worker class the deploy recipe's gunicorn command loads.
+# gunicorn : the process manager in the deploy recipe CMD, so SIGTERM reaches the app.
+fastapi
+uvicorn
+gunicorn

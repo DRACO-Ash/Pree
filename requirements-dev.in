@@ -1,0 +1,9 @@
+# Development and verification-loop dependencies. Never installed into the runtime image.
+-r requirements.in
+pytest
+pytest-cov
+coverage
+httpx
+ruff
+mypy
+pip-audit

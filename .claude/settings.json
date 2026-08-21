@@ -1,0 +1,87 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm ci)",
+      "Bash(npm install)",
+      "Bash(npm test)",
+      "Bash(npm run dev)",
+      "Bash(npm run build)",
+      "Bash(npm run seed)",
+      "Bash(npm run test:e2e)",
+      "Bash(npm run validate)",
+      "Bash(npm run render-check)",
+      "Bash(npm run static)",
+      "Bash(npm audit:*)",
+      "Bash(node scripts/validate.mjs)",
+      "Bash(node scripts/render-check.mjs)",
+      "Bash(bash scripts/static-checks.sh)",
+      "Bash(./scripts/static-checks.sh)",
+      "Bash(node --check:*)",
+      "Bash(docker build:*)",
+      "Bash(docker run:*)",
+      "Bash(git status)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(unzip -l:*)",
+      "Bash(curl -i:*)",
+      "Bash(curl -s:*)",
+      "Read",
+      "Grep",
+      "Glob",
+      "mcp__appstore__list_my_apps",
+      "mcp__appstore__get_pipeline_status",
+      "mcp__appstore__get_pipeline_diagnosis",
+      "mcp__appstore__get_job_log",
+      "mcp__appstore__get_job_artifact",
+      "mcp__appstore__list_pods",
+      "mcp__appstore__get_pod_logs",
+      "mcp__appstore__get_env_vars",
+      "mcp__appstore__get_app_details",
+      "mcp__appstore__list_docs",
+      "mcp__appstore__read_doc"
+    ],
+    "deny": [
+      "Bash(curl -X POST:*)",
+      "Bash(curl -X PUT:*)",
+      "Bash(wget:*)",
+      "Bash(rm -rf:*)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/secret-scan.mjs\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/format-gate.sh\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/skills-check.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
