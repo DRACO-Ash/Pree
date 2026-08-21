@@ -116,80 +116,162 @@ def test_the_launch_command_targets_the_factory_that_actually_exists() -> None:
     assert not hasattr(module, "app")
 
 
-def _register_control_rows() -> list[tuple[str, str]]:
-    """Every row of the control table, as (control name, evidence column)."""
-    rows: list[tuple[str, str]] = []
-    for line in (REPO_ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8").splitlines():
-        if not line.startswith("|") or set(line) <= set("|- "):
-            continue
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) != 3 or cells[0] == "Control":
-            continue
-        rows.append((cells[0], cells[2]))
-    return rows
+def _controls_section() -> list[str]:
+    """The lines of the Controls section, up to the next top-level heading."""
+    lines = (REPO_ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "## Controls")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return lines[start:end]
 
 
-def test_every_control_row_cites_an_artefact_that_exists() -> None:
+def _defined_test_names() -> set[str]:
+    names: set[str] = set()
+    for path in (REPO_ROOT / "tests").glob("test_*.py"):
+        names |= set(re.findall(r"^def (test_[a-z0-9_]+)", path.read_text(encoding="utf-8"), re.M))
+    return names
+
+
+def test_every_control_row_cites_a_test_that_exists() -> None:
     """A control row whose evidence cannot be checked is an unverifiable claim.
 
-    The first version of this test matched bare test names only, so a row citing a test FILE
-    went unchecked and a row citing nothing at all - "verified by manual inspection", "the
-    operator confirms it" - was invisible. Three fabricated rows of those shapes passed it.
-    Now every row must cite at least one backticked artefact, every cited test name must be a
-    real function, and every cited path must exist on disk.
-    """
-    defined: set[str] = set()
-    for path in (REPO_ROOT / "tests").glob("test_*.py"):
-        defined |= set(
-            re.findall(r"^def (test_[a-z0-9_]+)", path.read_text(encoding="utf-8"), re.M)
-        )
+    Two earlier versions of this guard were defeated. The first matched bare test names only,
+    so a row citing a test FILE went unchecked and a row citing nothing at all was invisible.
+    The second skipped any row it could not parse, so a four-cell row, a row indented by two
+    spaces, and a row whose first cell was the word "Control" all slipped through, as did a row
+    citing an existing but unrelated source file, and a token like `test_x()` that is neither a
+    bare test name nor a path so no branch asserted anything. All rendered as ordinary rows.
 
-    rows = _register_control_rows()
-    assert len(rows) > 10, f"only {len(rows)} control rows parsed; the parser has drifted"
+    This version fails on anything it cannot check rather than skipping it, finds the header by
+    position rather than by its text, and requires each row to cite at least one real TEST, not
+    merely something that exists.
+    """
+    lines = _controls_section()
+    separator = next(
+        i for i, line in enumerate(lines) if set(line.strip()) <= set("|- ") and "|" in line
+    )
+    defined = _defined_test_names()
+
+    rows: list[tuple[str, str]] = []
+    malformed: list[str] = []
+    for line in lines[separator + 1 :]:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) != 3:
+            malformed.append(stripped[:80])
+            continue
+        rows.append((cells[0], cells[2]))
+
+    assert not malformed, f"control-table rows that do not have three cells: {malformed}"
+    assert len(rows) > 20, f"only {len(rows)} rows parsed; the parser has drifted"
 
     uncited: list[str] = []
-    missing_tests: list[str] = []
-    missing_paths: list[str] = []
+    unresolvable: list[str] = []
     for control, evidence in rows:
         tokens = re.findall(r"`([^`]+)`", evidence)
-        if not tokens:
-            uncited.append(control)
-            continue
+        cites_a_test = False
         for token in tokens:
-            is_test_name = re.fullmatch(r"test_[a-z0-9_]+", token) is not None
-            looks_like_path = "/" in token or token.endswith((".py", ".sh", ".txt", ".md"))
-            if is_test_name and token not in defined:
-                missing_tests.append(f"{control} -> {token}")
-            elif not is_test_name and looks_like_path and not (REPO_ROOT / token).exists():
-                missing_paths.append(f"{control} -> {token}")
+            verifies = token in defined or (
+                token.startswith(("tests/", "scripts/")) and (REPO_ROOT / token).exists()
+            )
+            if verifies:
+                cites_a_test = True
+            elif (REPO_ROOT / token).exists():
+                continue
+            else:
+                unresolvable.append(f"{control} -> {token}")
+        if not cites_a_test:
+            uncited.append(control)
 
-    assert not uncited, f"control rows citing no checkable artefact: {uncited}"
-    assert not missing_tests, f"control rows citing tests that do not exist: {missing_tests}"
-    assert not missing_paths, f"control rows citing paths that do not exist: {missing_paths}"
+    assert not unresolvable, (
+        f"control rows citing tokens that are neither a real test nor an existing "
+        f"path: {unresolvable}"
+    )
+    assert not uncited, f"control rows citing no test that exists: {uncited}"
 
 
-def test_the_deployment_sheet_documents_only_probe_states_the_code_can_return() -> None:
-    """The sheet must not describe a probe state the code cannot produce.
+def test_the_where_column_of_every_control_row_points_at_a_real_file() -> None:
+    lines = _controls_section()
+    separator = next(
+        i for i, line in enumerate(lines) if set(line.strip()) <= set("|- ") and "|" in line
+    )
+    missing: list[str] = []
+    for line in lines[separator + 1 :]:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) != 3:
+            continue
+        for token in re.findall(r"`([^`]+)`", cells[1]):
+            if not (REPO_ROOT / token).exists():
+                missing.append(f"{cells[0]} -> {token}")
+    assert not missing, f"control rows whose Where column names a missing file: {missing}"
 
-    The first version was a three-token denylist wearing this name, so the sheet could drift in
-    any NEW direction: a fabricated section documenting a "degraded" status, an EAGAIN errno, a
-    429 on the probe path and a 204 on readiness passed it untouched. The allowed set is now
-    derived from the code itself.
+
+def _health_section() -> str:
+    """The health-paths section of the deployment sheet."""
+    text = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    start = text.index("## Health paths")
+    end = text.find("\n## ", start + 1)
+    return text[start:] if end == -1 else text[start:end]
+
+
+def test_the_deployment_sheet_documents_only_probe_behaviour_the_code_can_produce() -> None:
+    """The sheet must not describe a probe state, code, errno or header the app cannot emit.
+
+    Two earlier versions were defeated. The first was a three-token denylist wearing the name of
+    a property. The second checked one spelling, a lowercase quoted `"status": "..."`, so an
+    uppercase status, a hyphenated one, an unquoted one, a 429 stated in prose, a fabricated
+    X-Pree header and a 204 on readiness all passed. The vocabulary is derived from the code and
+    checked without depending on how the sheet happens to punctuate it.
     """
-    emittable = {
+    emittable_status = {
         StorageProbe(True, "/data", None, None, 1).status,
         StorageProbe(False, "/data", 13, "EACCES", 1).status,
     }
-    sheet = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
-    documented = set(re.findall(r'"status":\s*"([a-z]+)"', sheet))
-    assert documented, "the sheet documents no probe status at all, which is itself a drift"
-    unproducible = documented - emittable
-    assert not unproducible, (
-        f"the sheet documents statuses the code cannot return: {sorted(unproducible)}; "
-        f"the code can return {sorted(emittable)}"
+    section = _health_section()
+
+    # Any word presented as a status, however it is quoted or cased.
+    documented_status = {
+        word.lower()
+        for word in re.findall(r'status["\'`:\s]{1,6}["\'`]?([A-Za-z][A-Za-z-]*)', section)
+    }
+    documented_status -= {"code", "codes", "is", "of", "the", "and", "or", "for"}
+    impossible = sorted(documented_status - emittable_status)
+    assert not impossible, (
+        f"the sheet presents statuses the code cannot return: {impossible}; "
+        f"the code can return {sorted(emittable_status)}"
     )
-    # And the retired states must not come back by any spelling.
+
+    # HTTP codes, judged only in sentences that are actually about the probe. Elsewhere the
+    # section legitimately mentions other codes, for instance which responses carry the
+    # hardening headers, and the rule that the root must never return a redirect.
+    probe_claims = [
+        sentence
+        for sentence in re.split(r"(?<=[.!?])\s+", section.replace("\n", " "))
+        if "/healthz/storage" in sentence or "status" in sentence.lower()
+    ]
+    assert probe_claims, "the sheet makes no statement about the probe at all"
+    claimed_codes = {
+        int(code)
+        for sentence in probe_claims
+        for code in re.findall(r"\b([1-5][0-9]{2})\b", sentence)
+    }
+    unexpected_codes = sorted(claimed_codes - {200, 503})
+    assert not unexpected_codes, (
+        f"the sheet claims HTTP codes the probe never returns: {unexpected_codes}"
+    )
+
+    # Response headers named in the sheet must be ones the app actually sets.
+    app_source = (REPO_ROOT / "src" / "pree" / "app.py").read_text(encoding="utf-8")
+    named_headers = set(re.findall(r"\b(X-[A-Za-z]+(?:-[A-Za-z]+)*)\b", section))
+    invented = sorted(h for h in named_headers if h not in app_source)
+    assert not invented, f"the sheet names headers the app does not set: {invented}"
+
+    # And the retired synthesised states must not return by any spelling.
     health_source = (REPO_ROOT / "src" / "pree" / "health.py").read_text(encoding="utf-8")
-    for retired in ("EBUSY", "indeterminate"):
+    for retired in ("EBUSY", "indeterminate", "degraded"):
         assert retired not in health_source, f"{retired} is back in the source; update the docs"
-        assert retired not in sheet, f"the deployment sheet still documents {retired}"
+        assert retired.lower() not in section.lower(), f"the sheet still documents {retired}"

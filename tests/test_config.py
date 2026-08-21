@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from pree.config import DEFAULT_PORT, MAX_PORT, MIN_PORT, ConfigError, load_config
+from pree.config import (
+    DEFAULT_PORT,
+    MAX_PORT,
+    MIN_PORT,
+    MIN_PRODUCTION_TOKEN_LENGTH,
+    ConfigError,
+    load_config,
+)
 
 
 def test_port_defaults_to_8080_when_unset(tmp_path: Path) -> None:
@@ -71,7 +78,7 @@ def test_token_without_allowed_origin_refuses_to_start_in_production(tmp_path: P
         load_config(
             {
                 "PREE_ENV": "production",
-                "PREE_TEAM_TOKEN": "t",
+                "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
                 "PREE_DATA_DIR": str(tmp_path),
             }
         )
@@ -82,7 +89,7 @@ def test_wildcard_origin_with_a_token_refuses_to_start_in_production(tmp_path: P
         load_config(
             {
                 "PREE_ENV": "production",
-                "PREE_TEAM_TOKEN": "t",
+                "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
                 "PREE_ALLOWED_ORIGIN": "*",
                 "PREE_DATA_DIR": str(tmp_path),
             }
@@ -93,7 +100,7 @@ def test_a_named_origin_with_a_token_starts_in_production(tmp_path: Path) -> Non
     config = load_config(
         {
             "PREE_ENV": "production",
-            "PREE_TEAM_TOKEN": "t",
+            "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
             "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
             "PREE_DATA_DIR": str(tmp_path),
         }
@@ -104,7 +111,11 @@ def test_a_named_origin_with_a_token_starts_in_production(tmp_path: Path) -> Non
 
 def test_development_mode_tolerates_a_token_without_an_origin(tmp_path: Path) -> None:
     config = load_config(
-        {"PREE_ENV": "development", "PREE_TEAM_TOKEN": "t", "PREE_DATA_DIR": str(tmp_path)}
+        {
+            "PREE_ENV": "development",
+            "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
+            "PREE_DATA_DIR": str(tmp_path),
+        }
     )
     assert config.auth_enabled is True
     assert config.is_production is False
@@ -230,3 +241,42 @@ def test_a_control_character_in_a_value_is_refused(tmp_path: Path) -> None:
                 "PREE_BUILD_ID": 'v1\n{"kind":"forged"}',
             }
         )
+
+
+@pytest.mark.parametrize("weak", ["a", "changeme", "pree", "x" * 23])
+def test_production_refuses_a_short_or_guessable_token(tmp_path: Path, weak: str) -> None:
+    """The single credential guarding the whole store deserves a fail-closed boot check.
+
+    Wrong-token attempts are rate limited per address, but the coarse tier allows 240 a minute
+    per address per worker, which puts a dictionary of common choices well inside an hour from
+    one address and far less across several. A one-character token started production happily.
+    """
+    with pytest.raises(ConfigError, match="below the"):
+        load_config(
+            {
+                "PREE_ENV": "production",
+                "PREE_TEAM_TOKEN": weak,
+                "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
+                "PREE_DATA_DIR": str(tmp_path),
+            }
+        )
+
+
+def test_a_token_of_the_required_length_is_accepted_in_production(tmp_path: Path) -> None:
+    config = load_config(
+        {
+            "PREE_ENV": "production",
+            "PREE_TEAM_TOKEN": "y" * MIN_PRODUCTION_TOKEN_LENGTH,
+            "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
+            "PREE_DATA_DIR": str(tmp_path),
+        }
+    )
+    assert config.auth_enabled is True
+
+
+def test_development_does_not_impose_the_length_floor(tmp_path: Path) -> None:
+    """Local single-user work is not the threat model the floor exists for."""
+    config = load_config(
+        {"PREE_ENV": "development", "PREE_TEAM_TOKEN": "short", "PREE_DATA_DIR": str(tmp_path)}
+    )
+    assert config.auth_enabled is True

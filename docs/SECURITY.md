@@ -41,8 +41,10 @@ the assessment store.
 | A malformed stored value is dropped rather than crashing the handler | `src/pree/store.py` | `test_a_non_object_assessment_value_is_dropped_rather_than_crashing` |
 | A snapshot too deep to parse fails closed, not into an unhandled 500 | `src/pree/store.py` | `test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing` |
 | The liveness handlers never occupy the shared request threadpool | `src/pree/app.py` | `test_the_liveness_routes_never_occupy_the_shared_request_threadpool` |
-| Every control row here cites an artefact that exists | `docs/SECURITY.md` | `test_every_control_row_cites_an_artefact_that_exists` |
-| The deployment sheet documents only states the code can return | `docs/DEPLOYMENT.md` | `test_the_deployment_sheet_documents_only_probe_states_the_code_can_return` |
+| The five documented liveness paths exist and stay unmetered | `src/pree/app.py` | `test_the_liveness_contract_is_exactly_the_five_documented_paths`, `test_every_documented_liveness_path_is_exempt_from_rate_limiting` |
+| Production refuses a short or guessable team token | `src/pree/config.py` | `test_production_refuses_a_short_or_guessable_token` |
+| Every control row here cites a test that exists | `docs/SECURITY.md` | `test_every_control_row_cites_a_test_that_exists`, `test_the_where_column_of_every_control_row_points_at_a_real_file` |
+| The deployment sheet documents only probe behaviour the code can produce | `docs/DEPLOYMENT.md` | `test_the_deployment_sheet_documents_only_probe_behaviour_the_code_can_produce` |
 | The retention cap holds even on a snapshot with a partial write order | `src/pree/store.py` | `test_a_partial_write_order_still_trims_to_the_cap` |
 | The assessment collection is capped, newest kept | `src/pree/store.py` | `test_the_collection_is_capped_and_the_newest_record_always_survives` |
 | A configured data directory must be absolute, and a pasted value is normalised | `src/pree/config.py` | `test_a_relative_data_directory_is_refused`, `test_a_quote_wrapped_path_is_normalised_not_taken_literally` |
@@ -57,7 +59,7 @@ the assessment store.
 | Atomic writes; a failed write never becomes the snapshot | `src/pree/store.py` | `test_a_failed_write_fails_closed_and_leaves_no_temporary_file` |
 | Merges never shrink the stored dataset | `src/pree/store.py` | `test_merge_never_deletes_a_key_the_update_omitted` |
 | Non-root numeric user, no suid or sgid bits, one flattened layer | `Dockerfile` | `tests/test_boot_contract.py` |
-| Hash-locked dependencies, scanned for vulnerabilities | `requirements.txt` | `pip-audit` in `scripts/verify.sh` |
+| Hash-locked dependencies, scanned for vulnerabilities | `requirements.txt` | `scripts/verify.sh` |
 
 ## Deliberately accepted risks
 
@@ -204,7 +206,22 @@ a property.
 Four times across those two rounds a fix shipped with nothing distinguishing it from the
 behaviour it replaced. That is the recurring failure of this work, and it is a failure of
 testing rather than of code: the reviewer named two instances, mutation testing found the third,
-and the reviewer found the fourth. Every control listed above is now mutation-proven.
+and the reviewer found the fourth. Every control named in those reviews was mutation-tested and each mutation was caught. That is a statement about the controls the reviews examined, not a universal claim over every row in the table above: an earlier version of this sentence asserted the universal on the strength of a partial sample, which is the same evidence inflation the paragraph above it apologises for.
+
+Seventh review: three majors, all of them in the guards added by the previous two rounds
+rather than in the code they protect, which held every attack that round ran. The liveness
+guard derived its expectation from the very constant it was policing, so deleting a path from
+that constant left the whole suite green while the route returned 404 and silently lost its
+rate-limit exemption. The register guard was defeated six ways, including a four-cell row, an
+indented row, a row whose first cell was the word "Control", an existing but unrelated
+citation, backticked prose, and a non-existent test name with trailing parentheses. The
+deployment-sheet guard was defeated six ways, including an uppercase status, a hyphenated one,
+an unquoted one, an HTTP code stated in prose, a fabricated response header, and a 204 on
+readiness. All three are rebuilt to fail on anything they cannot check rather than skip it, and
+every one of those twelve fabrications is now caught. The rebuilt register guard immediately
+found real drift: two rows citing test names that had been renamed without the register
+following. One security fix came with them: production accepted a one-character team token,
+and now refuses anything shorter than 24 characters.
 
 Each of these now has a named regression test in the control table above.
 

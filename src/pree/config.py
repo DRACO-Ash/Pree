@@ -18,6 +18,11 @@ from pathlib import Path
 # The shortest string that can be a quoted value: the two quotes themselves.
 _QUOTED_MINIMUM = 2
 _CONTROL_CHARS = frozenset(chr(code) for code in [*range(0, 32), 127])
+# The single credential guarding the whole assessment store. Wrong-token attempts are rate
+# limited per address, but 240 a minute per address per worker puts a dictionary of common
+# choices well inside an hour, so a short or guessable token gets the same fail-closed boot
+# treatment as an unsafe origin rather than a warning nobody reads.
+MIN_PRODUCTION_TOKEN_LENGTH = 24
 _ORIGIN_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
 
 DEFAULT_PORT = 8080
@@ -146,6 +151,12 @@ def _validate_production_auth(token: str | None, origin: str | None, environment
             "Refusing to start: PREE_ENV is 'production' with no PREE_TEAM_TOKEN. "
             "Production must never serve the assessment store unauthenticated. "
             "Set PREE_TEAM_TOKEN and PREE_ALLOWED_ORIGIN together."
+        )
+    if len(token) < MIN_PRODUCTION_TOKEN_LENGTH:
+        raise ConfigError(
+            f"Refusing to start: PREE_TEAM_TOKEN is {len(token)} characters, below the "
+            f"{MIN_PRODUCTION_TOKEN_LENGTH} required in production. Generate one with "
+            f'python -c "import secrets; print(secrets.token_urlsafe(32))".'
         )
     if origin is None:
         raise ConfigError(

@@ -14,7 +14,9 @@ from pree.config import Config, load_config
 from pree.health import StorageProber
 from pree.store import JsonStore
 
-TEST_TOKEN = "test-token-0123456789"
+# At least MIN_PRODUCTION_TOKEN_LENGTH characters, so the production configurations the
+# suite builds are ones the app would actually accept.
+TEST_TOKEN = "test-token-0123456789-abcdef"
 AUTH = {"x-pree-token": TEST_TOKEN}
 
 

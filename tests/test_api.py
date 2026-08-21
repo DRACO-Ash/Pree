@@ -19,6 +19,11 @@ from pree.ratelimit import RateLimiter
 from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, TEST_TOKEN, build_client, make_config
 
+# Pinned literals, deliberately NOT derived from LIVENESS_PATHS. These five paths are the
+# contract in CLAUDE.md and in the deployment sheet; a test that reads them from the constant
+# it is checking cannot notice the constant shrinking.
+EXPECTED_LIVENESS_PATHS = frozenset({"/", "/healthz", "/readyz", "/livez", "/ping"})
+
 FULL_BODY = {
     "protected_asset_id": "asset-01",
     "candidate_id": "cand-99",
@@ -33,7 +38,7 @@ FULL_BODY = {
 }
 
 
-@pytest.mark.parametrize("path", LIVENESS_PATHS)
+@pytest.mark.parametrize("path", sorted(EXPECTED_LIVENESS_PATHS))
 def test_every_conventional_health_path_returns_200_unauthenticated(
     client: TestClient, path: str
 ) -> None:
@@ -538,28 +543,60 @@ def test_the_diagnostics_read_out_reports_whether_the_data_dir_was_configured(
     assert body["data_dir_was_configured"] is True
 
 
+def test_the_liveness_contract_is_exactly_the_five_documented_paths() -> None:
+    """Pin the set itself, not just the properties of whatever the set happens to contain.
+
+    Deleting "/readyz" from LIVENESS_PATHS left the whole suite green while GET /readyz
+    returned 404, because every liveness assertion, including the threadpool guard, derived
+    its expectation from the constant being policed. The path also silently left
+    UNMETERED_PATHS, so the rate-limit exemption stopped covering it with nothing turning red.
+    """
+    assert set(LIVENESS_PATHS) == set(EXPECTED_LIVENESS_PATHS)
+
+
 def test_the_liveness_routes_never_occupy_the_shared_request_threadpool(
     tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
 ) -> None:
-    """The liveness handlers must be coroutines, and nothing asserted it.
+    """Each documented path must exist AND be served by a coroutine.
 
     A sync handler runs in the shared request threadpool alongside probe callers, each of whom
     holds a worker for up to the probe budget. Measured with the handlers made sync: liveness
     p95 went from 3ms to 1588ms and throughput from 336/s to 1.25/s under a 120-way
-    unauthenticated flood of the unmetered probe path, which is enough to push the platform's
-    liveness probe past its timeout and restart the pod. A one-word edit, and the whole suite
-    stayed green.
+    unauthenticated flood of the unmetered probe path, enough to push the platform's liveness
+    probe past its timeout and restart the pod.
+
+    Asserted positively, per literal path. A negative assertion over the registered routes was
+    satisfied by a route that had gone missing, and by a sub-application mounted at "/", whose
+    Mount path Starlette normalises to "" so the walk never saw its handlers.
     """
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
     store = JsonStore(config.data_dir)
     store.seed()
     app = create_app(config, store, logger=quiet_logger, prober=prober)
-    synchronous = [
-        getattr(route, "path", "")
+    by_path = {
+        getattr(route, "path", ""): route
         for route in app.routes
-        if getattr(route, "path", None) in LIVENESS_PATHS
-        and not inspect.iscoroutinefunction(getattr(route, "endpoint", None))
-    ]
+        if getattr(route, "endpoint", None) is not None
+    }
+    missing = sorted(p for p in EXPECTED_LIVENESS_PATHS if p not in by_path)
+    assert not missing, f"documented liveness paths with no registered endpoint: {missing}"
+    synchronous = sorted(
+        path
+        for path in EXPECTED_LIVENESS_PATHS
+        if not inspect.iscoroutinefunction(getattr(by_path[path], "endpoint", None))
+    )
     assert not synchronous, (
         f"sync liveness handlers queue behind probe callers in the threadpool: {synchronous}"
     )
+
+
+def test_every_documented_liveness_path_is_exempt_from_rate_limiting(
+    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+) -> None:
+    """The exemption is derived from LIVENESS_PATHS, so it shrank silently along with it."""
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    with build_client(config, quiet_logger, prober, global_limiter=RateLimiter(1, 60.0)) as limited:
+        assert limited.get("/v1/assessments/a:b", headers=AUTH).status_code == 404
+        assert limited.get("/v1/assessments/a:b", headers=AUTH).status_code == 429
+        for path in sorted(EXPECTED_LIVENESS_PATHS):
+            assert limited.get(path).status_code == 200, f"{path} was metered"

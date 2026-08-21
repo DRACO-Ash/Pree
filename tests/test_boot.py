@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import pree.main
-from pree.config import ConfigError
+from pree.config import MIN_PRODUCTION_TOKEN_LENGTH, ConfigError
 from pree.main import build
 
 
@@ -48,7 +48,7 @@ def test_boot_records_a_refused_mount_but_still_serves_liveness(
 
 def test_boot_fails_closed_on_an_unsafe_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PREE_ENV", "production")
-    monkeypatch.setenv("PREE_TEAM_TOKEN", "a-token")
+    monkeypatch.setenv("PREE_TEAM_TOKEN", "a" * MIN_PRODUCTION_TOKEN_LENGTH)
     monkeypatch.delenv("PREE_ALLOWED_ORIGIN", raising=False)
     with pytest.raises(ConfigError, match="no PREE_ALLOWED_ORIGIN"):
         build()

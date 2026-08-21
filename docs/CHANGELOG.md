@@ -198,3 +198,24 @@ the verdict logic in an async path.
 ● The deployment-sheet guard was a three-token denylist wearing the name of a property, so the
   sheet could drift in any new direction. The allowed states are derived from the code now.
 ● This changelog reported a stale test count and had recorded neither of the last two reviews.
+
+### Seventh security review
+
+Three majors, all in the guards the previous two rounds added rather than in the code they
+protect, which held every attack the round ran:
+
+● The liveness guard derived its expectation from the constant it was meant to police. Deleting
+  "/readyz" from that constant left the whole suite green while the route returned 404, and the
+  path silently left the rate-limit exemption with nothing turning red. The five documented
+  paths are pinned as literals now, each required to exist and to be served by a coroutine.
+● The register guard was defeated six ways and the deployment-sheet guard six more, including
+  fabrications that render as ordinary rows and prose a reader would believe. Both are rebuilt
+  to fail on anything they cannot check rather than skip it, and all twelve fabrications are
+  now caught. The rebuilt register guard immediately found two rows citing test names that had
+  been renamed without the register following.
+● Production accepted a one-character team token. At 240 attempts a minute per address per
+  worker a dictionary of common choices sits well inside an hour, so production now refuses
+  anything shorter than 24 characters and the sheet names the generation command.
+
+Also corrected: this policy claimed every control was mutation-proven on the strength of a
+partial sample, which is the evidence inflation the surrounding paragraph apologises for.
