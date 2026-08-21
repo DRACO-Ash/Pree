@@ -36,6 +36,12 @@ the assessment store.
 | Every filesystem refusal surfaces as a handled 503, audited | `src/pree/store.py` | `test_a_real_storage_refusal_returns_503_and_audits_the_action`, `test_a_failed_lock_release_surfaces_as_a_store_error` |
 | The rate limiter fails closed when its key table saturates | `src/pree/ratelimit.py` | `test_a_saturated_key_table_fails_closed_rather_than_admitting_everyone` |
 | A busy probe pool never reports storage as broken | `src/pree/health.py` | `test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate` |
+| A busy verdict requires positive evidence, so a flood cannot force ready | `src/pree/health.py` | `test_a_busy_pool_with_no_recent_success_reports_unready` |
+| The assessment collection is capped, newest kept | `src/pree/store.py` | `test_the_collection_is_capped_and_the_newest_record_always_survives` |
+| A configured data directory must be absolute, and a pasted value is normalised | `src/pree/config.py` | `test_a_relative_data_directory_is_refused`, `test_a_quote_wrapped_path_is_normalised_not_taken_literally` |
+| A control character in any config value is refused | `src/pree/config.py` | `test_a_control_character_in_a_value_is_refused` |
+| The CSP exemption for the dev docs cannot reach production | `src/pree/app.py` | `test_the_csp_exemption_cannot_reach_production` |
+| Retry-After never tells a refused caller to retry immediately | `src/pree/ratelimit.py` | `test_retry_after_is_never_zero_even_for_a_key_with_no_history` |
 | A wedged mount keeps reporting unready, and never goes quiet | `src/pree/health.py` | `test_a_wedged_mount_keeps_answering_unready_rather_than_going_quiet` |
 | The readiness signal cannot freeze on a stale cached result | `src/pree/health.py` | `test_the_cached_result_expires` |
 | A recovery never destroys the backup it recovered from | `src/pree/store.py` | `test_a_recovery_does_not_destroy_the_backup_it_recovered_from` |
@@ -84,7 +90,14 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    schedules one pod against this volume; a second replica needs the database add-on, not a
    tighter lock.
 
-7. **The diagnostics read-out reports the token length when authenticated.** A boolean and a
+7. **The assessment collection is capped at 5000 records rather than retained in full.**
+   The store is a single whole-file document, so retention costs both volume and per-write
+   time. Above the cap the oldest assessment is dropped, and the record just written is never
+   the one dropped. Accepted because Pree scores a live watch picture rather than serving as
+   an archive; if the watch floor needs longer history, that is the database add-on, not a
+   larger file.
+
+8. **The diagnostics read-out reports the token length when authenticated.** A boolean and a
    length, never a value, and gated whenever a token is configured. Before a token exists the
    read-out is open, which is deliberate: a first deploy needs it and has no token to present,
    and in that state there is no length to disclose.
@@ -122,6 +135,26 @@ still raising bare `OSError` past the store's error contract, the cache-expiry c
 nowhere (deleting it froze the readiness signal for the life of the worker), and the coupling
 between the Dockerfile launch target and the module factory untested, so reverting the target
 left the suite green while the container could not start at all.
+
+Third security review, which found one required control that had never existed and one
+residual fail-open narrowed rather than closed by the previous round. The store had no cap and
+no pruning, so a token holder writing distinct pairs at the per-address rate limit added tens
+of megabytes a day to a volume that only grows, with per-write cost rising linearly because
+every upsert rewrites the whole snapshot; the end state is a full volume, `ENOSPC`, a
+permanent 503 on the storage proof and a pod out of service with no application-level way
+back. And the busy-versus-wedged rule required EVERY held slot to have overrun, so an
+unauthenticated flood of the unmetered probe path kept the newest slot always fresh: a mount
+whose writes overran the probe budget reported ready indefinitely. Measured before the fix at
+one 503 in twelve probes under an eight-way flood, against three consecutive needed to fail
+the health check.
+
+The cap now keeps the newest and never drops the record just written, ordered by an explicit
+write-order list because the snapshot is serialised with sorted keys and object order does not
+survive the round trip. The busy verdict now requires positive evidence: a probe that
+completed inside its budget within the grace window. Verified in all four directions, so the
+fix does not reintroduce the opposite failure: healthy storage under a 24-way flood stays 200,
+slow-but-in-budget stays 200, a refused mount is 503, and the overrunning mount is now 503 on
+every probe.
 
 Each of these now has a named regression test in the control table above.
 

@@ -189,3 +189,44 @@ def test_a_concrete_origin_is_accepted(tmp_path: Path, good_origin: str) -> None
         }
     )
     assert config.allowed_origin == good_origin
+
+
+@pytest.mark.parametrize("wrapped", ['"{path}"', "'{path}'"])
+def test_a_quote_wrapped_path_is_normalised_not_taken_literally(
+    tmp_path: Path, wrapped: str
+) -> None:
+    """A pasted value arrives wrapped in the quotes that surrounded it in a document.
+
+    Taken literally, `"/data"` resolves to a directory of that name inside the working
+    directory, which the app can write to, so the store silently misses the mounted volume
+    and every restart loses the data. The fault presents as data loss, not as an error.
+    """
+    target = tmp_path / "data"
+    config = load_config({"PREE_ENV": "development", "PREE_DATA_DIR": wrapped.format(path=target)})
+    assert config.data_dir == target
+
+
+def test_a_relative_data_directory_is_refused(tmp_path: Path) -> None:
+    """resolve() makes every value absolute, so the check must run before it or never fail."""
+    with pytest.raises(ConfigError, match="absolute path"):
+        load_config({"PREE_ENV": "development", "PREE_DATA_DIR": "relative/data"})
+
+
+def test_the_local_default_is_still_permitted_when_nothing_is_configured(
+    tmp_path: Path,
+) -> None:
+    """The default is deliberately relative; only a CONFIGURED value must be absolute."""
+    config = load_config({"PREE_ENV": "development"})
+    assert config.data_dir == Path("./data").resolve()
+    assert config.data_dir_was_configured is False
+
+
+def test_a_control_character_in_a_value_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="control character"):
+        load_config(
+            {
+                "PREE_ENV": "development",
+                "PREE_DATA_DIR": str(tmp_path),
+                "PREE_BUILD_ID": 'v1\n{"kind":"forged"}',
+            }
+        )

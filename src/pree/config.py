@@ -15,6 +15,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+# The shortest string that can be a quoted value: the two quotes themselves.
+_QUOTED_MINIMUM = 2
+_CONTROL_CHARS = frozenset(chr(code) for code in [*range(0, 32), 127])
 _ORIGIN_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
 
 DEFAULT_PORT = 8080
@@ -37,6 +40,7 @@ class Config:
     allowed_origin: str | None
     environment: str
     build_id: str
+    data_dir_was_configured: bool
 
     @property
     def is_production(self) -> bool:
@@ -49,12 +53,21 @@ class Config:
 
 
 def _read(env: dict[str, str], name: str) -> str | None:
-    """Read a variable, treating blank and whitespace-only as absent.
+    """Read a variable, normalising what a console paste actually delivers.
 
-    An operator who clears a console field leaves an empty string, not a missing key, and a
-    blank token must never count as a configured token.
+    Three things, all of them observed failure modes rather than theory. A cleared console
+    field leaves an empty string, not a missing key, so blank counts as absent and a blank
+    token never counts as a configured token. A pasted value often arrives wrapped in the
+    quotes that surrounded it in a document, and `"/data"` used as a path resolves to a
+    literal directory named `"/data"` inside the working directory, which is writable, so the
+    fault presents as silent data loss rather than an error. And a control character in a
+    value would carry into a log line or a header.
     """
     value = env.get(name, "").strip()
+    if len(value) >= _QUOTED_MINIMUM and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1].strip()
+    if any(ch in value for ch in _CONTROL_CHARS):
+        raise ConfigError(f"{name} contains a control character")
     return value or None
 
 
@@ -77,8 +90,18 @@ def _resolve_data_dir(env: dict[str, str]) -> Path:
     The resolved path must be absolute and must not be the filesystem root. Both are
     rejected at boot rather than discovered on the first write.
     """
-    raw = _read(env, "PREE_DATA_DIR") or _read(env, "STORAGE_MOUNT_PATH") or LOCAL_DATA_DIR
-    path = Path(raw).expanduser().resolve()
+    explicit = _read(env, "PREE_DATA_DIR") or _read(env, "STORAGE_MOUNT_PATH")
+    raw = explicit or LOCAL_DATA_DIR
+    expanded = Path(raw).expanduser()
+    if explicit is not None and not expanded.is_absolute():
+        # Checked BEFORE resolving, or the check cannot fail: resolve() makes every value
+        # absolute against the working directory, so a relative or quote-wrapped path became a
+        # writable directory inside the container and the store silently missed the volume.
+        raise ConfigError(
+            f"the data directory must be an absolute path, got {raw!r}. A relative value "
+            f"resolves inside the container and is lost on every restart."
+        )
+    path = expanded.resolve()
     if path == Path(path.anchor):
         raise ConfigError(f"data directory must not be the filesystem root, got {path}")
     return path
@@ -149,6 +172,10 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     return Config(
         port=_resolve_port(source),
         data_dir=_resolve_data_dir(source),
+        data_dir_was_configured=(
+            _read(source, "PREE_DATA_DIR") or _read(source, "STORAGE_MOUNT_PATH")
+        )
+        is not None,
         team_token=token,
         allowed_origin=origin,
         environment=environment,

@@ -59,10 +59,15 @@ def test_keys_are_limited_independently() -> None:
     assert limiter.allow("a") is False
 
 
-def test_retry_after_is_at_least_one_second_and_zero_for_an_unseen_key() -> None:
+def test_retry_after_is_never_zero_even_for_a_key_with_no_history() -> None:
+    """A refused key whose bucket the fail-closed branch evicted has no history.
+
+    Answering 0 there tells a compliant client to retry immediately, in a tight loop, for as
+    long as the table stays saturated, so the floor is one second in every case.
+    """
     now = [0.0]
     limiter = RateLimiter(1, 30.0, clock=lambda: now[0])
-    assert limiter.retry_after_seconds("unseen") == 0
+    assert limiter.retry_after_seconds("unseen") == 1
     limiter.allow("k")
     assert limiter.retry_after_seconds("k") >= 1
 

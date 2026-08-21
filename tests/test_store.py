@@ -9,10 +9,17 @@ import os
 import tempfile
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from pree.store import SCHEMA_VERSION, JsonStore, StoreError, merge_without_shrinking
+from pree import store as store_module
+from pree.store import (
+    SCHEMA_VERSION,
+    JsonStore,
+    StoreError,
+    merge_without_shrinking,
+)
 
 
 def test_seed_is_idempotent(tmp_path: Path) -> None:
@@ -26,7 +33,7 @@ def test_seed_is_idempotent(tmp_path: Path) -> None:
 
 def test_a_missing_snapshot_reads_as_empty_rather_than_failing(tmp_path: Path) -> None:
     snapshot = JsonStore(tmp_path / "absent").read()
-    assert snapshot == {"schema_version": SCHEMA_VERSION, "assessments": {}}
+    assert snapshot == {"schema_version": SCHEMA_VERSION, "assessments": {}, "write_order": []}
 
 
 def test_write_leaves_no_temporary_file_behind(tmp_path: Path) -> None:
@@ -325,3 +332,88 @@ def test_a_failed_release_masks_the_body_error_but_keeps_the_contract(
     # sibling test does not already cover, and leaves an inversion of the masking green.
     with pytest.raises(StoreError, match="could not release"):
         store.upsert("a:b", {"score": 1.0})
+
+
+def test_the_collection_is_capped_and_the_newest_record_always_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uncapped whole-file snapshot fills the volume and takes the pod out of service.
+
+    Every upsert rewrites the whole document, so size sets the cost of every write as well as
+    the storage ceiling. The data-layer standard requires a cap that never silently loses a
+    fresh entry, so the record just written must be the last thing dropped, never the first.
+    """
+    monkeypatch.setattr(store_module, "MAX_ASSESSMENTS", 5)
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    for index in range(12):
+        snapshot = store.upsert(f"asset-01:cand-{index}", {"score": float(index)})
+        assert len(snapshot["assessments"]) <= 5
+        # The write that just happened is always present, whatever the cap dropped.
+        assert f"asset-01:cand-{index}" in snapshot["assessments"]
+    surviving = set(store.read()["assessments"])
+    # The five newest by WRITE order, which is not the same as the five highest by name.
+    assert surviving == {f"asset-01:cand-{i}" for i in range(7, 12)}, sorted(surviving)
+    assert store.read()["write_order"] == [f"asset-01:cand-{i}" for i in range(7, 12)]
+
+
+def test_re_writing_an_existing_key_does_not_grow_the_collection(tmp_path: Path) -> None:
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    for _ in range(5):
+        snapshot = store.upsert("asset-01:cand-01", {"score": 1.0})
+    assert len(snapshot["assessments"]) == 1
+
+
+def test_re_writing_an_existing_key_still_merges_without_shrinking(tmp_path: Path) -> None:
+    """The re-insertion that keeps age order must not lose the record's existing fields."""
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    store.upsert("a:b", {"score": 1.0, "confidence": "low"})
+    snapshot = store.upsert("a:b", {"score": 9.0})
+    assert snapshot["assessments"]["a:b"] == {"score": 9.0, "confidence": "low"}
+
+
+def test_an_older_snapshot_without_a_write_order_gains_a_stable_one(tmp_path: Path) -> None:
+    """Migration must not invent an age order it cannot know, only give a stable one."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "assessments.json").write_text(
+        json.dumps({"schema_version": 1, "assessments": {"b:2": {}, "a:1": {}}}),
+        encoding="utf-8",
+    )
+    snapshot = JsonStore(data_dir).read()
+    assert snapshot["write_order"] == ["a:1", "b:2"]
+
+
+def test_a_write_order_naming_absent_records_is_pruned(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "assessments.json").write_text(
+        json.dumps(
+            {"schema_version": 1, "assessments": {"a:1": {}}, "write_order": ["gone:9", "a:1"]}
+        ),
+        encoding="utf-8",
+    )
+    assert JsonStore(data_dir).read()["write_order"] == ["a:1"]
+
+
+def test_the_cap_never_drops_the_protected_key_even_if_it_is_the_oldest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct test of the guard, because upsert always appends the written key last.
+
+    The guard is unreachable through upsert by construction, so it is only defence for a
+    future caller that does not. Asserting it here is what stops it being removed as dead
+    code and the invariant being lost with it.
+    """
+    monkeypatch.setattr(store_module, "MAX_ASSESSMENTS", 3)
+    assessments: dict[str, Any] = {f"a:{i}": {} for i in range(6)}
+    order = list(assessments)
+    trimmed, kept = store_module._capped(assessments, order, protected="a:0")
+    assert "a:0" in trimmed, "the protected key was dropped despite being the oldest"
+    assert "a:0" in kept
+    assert len(trimmed) == 3
+    # The three kept are the protected one plus the two newest, and the order list agrees.
+    assert set(trimmed) == {"a:0", "a:4", "a:5"}
+    assert kept == ["a:0", "a:4", "a:5"]

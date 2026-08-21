@@ -94,10 +94,19 @@ class StorageProber:
         self,
         max_workers: int = 2,
         cache_seconds: float = 2.0,
+        success_grace_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._max_workers = max_workers
         self._cache_seconds = cache_seconds
+        # A busy verdict needs POSITIVE evidence that storage works: a probe that completed
+        # inside its budget, recently. Inferring "busy" from the absence of evidence let an
+        # unauthenticated flood of this unmetered path hold every slot with a probe that was
+        # always freshly started, so a mount whose writes overran the budget reported ready
+        # indefinitely and the container's three-strike check never fired.
+        self._success_grace = (
+            cache_seconds if success_grace_seconds is None else success_grace_seconds
+        )
         self._clock = clock
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="storage-probe"
@@ -111,6 +120,7 @@ class StorageProber:
         self._next_id = 0
         self._cached: StorageProbe | None = None
         self._cached_at = 0.0
+        self._last_success_at: float | None = None
 
     def _claim(self) -> int | None:
         with self._guard:
@@ -124,6 +134,18 @@ class StorageProber:
     def _release(self, token: int) -> None:
         with self._guard:
             self._in_flight.pop(token, None)
+
+    def _recently_succeeded(self) -> bool:
+        """True when a probe completed inside its budget within the grace window.
+
+        This is the only thing that justifies calling a saturated pool merely busy. Without
+        it, a caller that keeps every slot occupied with freshly started probes makes the
+        pool look healthy no matter how badly storage is behaving.
+        """
+        with self._guard:
+            if self._last_success_at is None:
+                return False
+            return self._clock() - self._last_success_at <= self._success_grace
 
     def _all_in_flight_overran(self) -> bool:
         """True when every held slot belongs to a probe that has already timed out."""
@@ -158,14 +180,15 @@ class StorageProber:
         directory = str(data_dir)
         token = self._claim()
         if token is None:
-            if self._all_in_flight_overran():
-                # Every worker is stuck past its timeout. That is not a busy pool, it is a
-                # wedged mount, and it must keep answering unready for as long as it lasts.
+            if self._all_in_flight_overran() or not self._recently_succeeded():
+                # Either every worker is stuck past its timeout, or nothing has completed
+                # inside its budget recently. Both are unready, and reporting them as merely
+                # busy is a fail-open an unauthenticated caller can trigger at will.
                 return StorageProbe(
                     False, directory, errno.ETIMEDOUT, "ETIMEDOUT", 0, indeterminate=False
                 )
-            # Genuinely busy: slots held by probes still inside their timeout. That is not
-            # evidence about the volume either way, so it must not change the health verdict.
+            # Genuinely busy: storage demonstrably worked a moment ago and the slots are held
+            # by probes still inside their timeout. Not evidence about the volume either way.
             return StorageProbe(False, directory, errno.EBUSY, "EBUSY", 0, indeterminate=True)
         started = self._clock()
         future = self._executor.submit(_write_probe, data_dir)
@@ -183,6 +206,8 @@ class StorageProber:
             name = errno.errorcode.get(code) if code is not None else None
             return self._remember(StorageProbe(False, directory, code, name, elapsed))
         elapsed = int((self._clock() - started) * 1000)
+        with self._guard:
+            self._last_success_at = self._clock()
         return self._remember(StorageProbe(True, directory, None, None, elapsed))
 
     def shutdown(self) -> None:
@@ -209,7 +234,10 @@ def diagnostics(config: Config, probe: StorageProbe) -> dict[str, Any]:
         "allowed_origin_length": len(origin) if origin else 0,
         "allowed_origin_is_wildcard": origin == "*",
         "data_dir": str(config.data_dir),
+        # The resolved path is always absolute, so reporting that says nothing. What the
+        # operator needs is whether the resolved directory is the one they configured.
         "data_dir_is_absolute": config.data_dir.is_absolute(),
+        "data_dir_was_configured": config.data_dir_was_configured,
         "storage_writable": probe.writable,
         "storage_errno": probe.errno_code,
         "storage_errno_name": probe.errno_name,

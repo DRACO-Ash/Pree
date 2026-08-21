@@ -79,6 +79,12 @@ is a one-screenshot diagnosis rather than a silent pod kill.
 
 Inside the 8Gi and 6 CPU envelope. Two gunicorn workers with a 60 second timeout.
 
+Storage growth is bounded by construction: the assessment collection is capped at 5000
+records, dropping the oldest and never the record just written, so the volume cannot fill
+through ordinary accumulation. At roughly 1.3 KiB per record that is about 6.5 MiB of steady
+state. If the watch floor needs longer history, that is the POSTGRESQL add-on rather than a
+larger cap, because every write rewrites the whole snapshot.
+
 ## Health paths
 
 The complete list of unauthenticated paths in production, and nothing else answers without

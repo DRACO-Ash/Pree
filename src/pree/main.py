@@ -34,8 +34,14 @@ def build() -> FastAPI:
         storage_state = "refused"
     # One decisive boot line to stdout, which is where the platform collects pod logs.
     print(
+        # auth and token length are server-side only, never the value. Without them a stale
+        # token is invisible on a deployed pod: every client gets 401 and the only read-out
+        # that would show it sits behind the very token that is wrong.
         f"pree boot: build={config.build_id} env={config.environment} "
-        f"port={config.port} data_dir={config.data_dir} storage={storage_state}",
+        f"port={config.port} data_dir={config.data_dir} "
+        f"data_dir_configured={config.data_dir_was_configured} "
+        f"auth={'on' if config.auth_enabled else 'off'} "
+        f"token_len={len(config.team_token or '')} storage={storage_state}",
         flush=True,
     )
     return create_app(config, store)

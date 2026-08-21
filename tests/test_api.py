@@ -507,3 +507,31 @@ def test_the_storage_state_is_logged_once_per_transition_not_once_per_probe(
     transitions = [line for line in printed.splitlines() if line.startswith("pree storage ")]
     assert len(transitions) == 1, f"expected one transition line, got {transitions}"
     assert "pree storage ready" in transitions[0]
+
+
+def test_the_csp_exemption_cannot_reach_production(
+    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+) -> None:
+    """The one load-bearing guard in the headers middleware that nothing pinned.
+
+    Removing the production conjunct from the exemption left all tests green. The doc paths do
+    not exist in production, so their 404 must still carry the policy.
+    """
+    config = make_config(
+        tmp_path,
+        PREE_ENV="production",
+        PREE_TEAM_TOKEN=TEST_TOKEN,
+        PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
+    )
+    with build_client(config, quiet_logger, prober) as production:
+        for path in ("/openapi.json", "/docs", "/redoc"):
+            response = production.get(path)
+            assert response.status_code == 404, path
+            assert "default-src 'none'" in response.headers["content-security-policy"], path
+
+
+def test_the_diagnostics_read_out_reports_whether_the_data_dir_was_configured(
+    client: TestClient,
+) -> None:
+    body = client.get("/diagnostics", headers=AUTH).json()
+    assert body["data_dir_was_configured"] is True

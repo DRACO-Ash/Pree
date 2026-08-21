@@ -146,7 +146,15 @@ def test_concurrent_callers_cost_one_write(tmp_path: Path, monkeypatch: pytest.M
 def test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A slot held by a healthy in-flight probe says nothing about the volume either way."""
+    """A slot held by a healthy in-flight probe says nothing about the volume either way.
+
+    A busy verdict now requires positive evidence that storage works, so this test records a
+    real success first. Without that evidence the honest answer is unready, which is what
+    stops an unauthenticated flood from holding every slot and reporting ready regardless.
+    """
+    pool = StorageProber(max_workers=1, cache_seconds=0.0, success_grace_seconds=30.0)
+    assert pool.probe(tmp_path / "data").writable is True
+
     running = threading.Event()
 
     def slow(_: Path) -> None:
@@ -154,7 +162,6 @@ def test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate(
         time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS * 0.5)
 
     monkeypatch.setattr(health, "_write_probe", slow)
-    pool = StorageProber(max_workers=1, cache_seconds=0.0)
     worker = threading.Thread(target=pool.probe, args=(tmp_path / "data",))
     worker.start()
     try:
@@ -166,6 +173,37 @@ def test_a_pool_busy_with_probes_still_inside_their_timeout_is_indeterminate(
     assert busy.errno_name == "EBUSY"
     assert busy.indeterminate is True
     assert busy.status == "unknown"
+
+
+def test_a_busy_pool_with_no_recent_success_reports_unready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attacker-triggerable fail-open, closed.
+
+    An unauthenticated flood of this unmetered path kept every slot occupied with freshly
+    started probes, so a mount whose writes overran the probe budget never had all slots
+    overrun at once and the pool reported merely busy. The container's three-strike check
+    therefore never fired and a pod that could not complete a write stayed in service.
+    """
+    running = threading.Event()
+
+    def overruns(_: Path) -> None:
+        running.set()
+        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 1.0)
+
+    monkeypatch.setattr(health, "_write_probe", overruns)
+    pool = StorageProber(max_workers=1, cache_seconds=0.0, success_grace_seconds=30.0)
+    worker = threading.Thread(target=pool.probe, args=(tmp_path / "data",))
+    worker.start()
+    try:
+        assert running.wait(2.0)
+        verdict = pool.probe(tmp_path / "data")
+    finally:
+        worker.join()
+        pool.shutdown()
+    assert verdict.errno_name == "ETIMEDOUT"
+    assert verdict.indeterminate is False
+    assert verdict.status == "unready"
 
 
 def test_a_wedged_mount_keeps_answering_unready_rather_than_going_quiet(

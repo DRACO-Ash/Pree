@@ -18,6 +18,14 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+# The snapshot is one whole-file document rewritten on every write, so its size sets the cost
+# of every upsert and the volume only ever grows. Left uncapped, a token holder writing
+# distinct asset and candidate pairs at the per-address rate limit adds tens of megabytes a
+# day until the volume fills, at which point writes return ENOSPC, the storage proof goes 503
+# and the pod is out of service with no application-level way back. The data-layer standard
+# requires a capped collection that never silently loses a fresh entry, so the cap keeps the
+# newest and the record just written is never the one dropped.
+MAX_ASSESSMENTS = 5000
 _SNAPSHOT_NAME = "assessments.json"
 _BACKUP_SUFFIX = ".bak"
 _LOCK_NAME = ".assessments.lock"
@@ -28,7 +36,7 @@ class StoreError(RuntimeError):
 
 
 def _empty_snapshot() -> dict[str, Any]:
-    return {"schema_version": SCHEMA_VERSION, "assessments": {}}
+    return {"schema_version": SCHEMA_VERSION, "assessments": {}, "write_order": []}
 
 
 def migrate_forward(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -43,7 +51,39 @@ def migrate_forward(snapshot: dict[str, Any]) -> dict[str, Any]:
         migrated["schema_version"] = SCHEMA_VERSION
     if not isinstance(migrated.get("assessments"), dict):
         migrated["assessments"] = {}
+    order = migrated.get("write_order")
+    if not isinstance(order, list) or not all(isinstance(k, str) for k in order):
+        # An older snapshot carries no write order. Seed it from the stored keys so the cap has
+        # a defined age order from the next write onward; the relative age of pre-existing
+        # records is genuinely unknown and is not invented, only given a stable order.
+        order = sorted(migrated["assessments"])
+    migrated["write_order"] = [k for k in order if k in migrated["assessments"]]
     return migrated
+
+
+def _capped(
+    assessments: dict[str, Any], order: list[str], protected: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Bound the collection, dropping the oldest first and never the record just written.
+
+    Age comes from an explicit write-order list, not from dict insertion order. The snapshot
+    is serialised with sorted keys, so object order does NOT survive the round trip: relying
+    on it dropped whichever key sorted first alphabetically rather than the oldest one.
+    """
+    if len(assessments) <= MAX_ASSESSMENTS:
+        return assessments, order
+    trimmed = dict(assessments)
+    kept_order = list(order)
+    surplus = len(trimmed) - MAX_ASSESSMENTS
+    for key in list(kept_order):
+        if surplus == 0:
+            break
+        if key == protected:
+            continue
+        kept_order.remove(key)
+        trimmed.pop(key, None)
+        surplus -= 1
+    return trimmed, kept_order
 
 
 def merge_without_shrinking(stored: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
@@ -216,6 +256,11 @@ class JsonStore:
             snapshot = self.read()
             assessments = dict(snapshot["assessments"])
             assessments[key] = merge_without_shrinking(assessments.get(key, {}), record)
-            snapshot["assessments"] = assessments
+            # Age comes from an explicit list, because the snapshot is written with sorted
+            # keys and object order does not survive the round trip. The written key goes to
+            # the end, so it is the last thing the cap would ever drop.
+            order = [k for k in snapshot["write_order"] if k != key]
+            order.append(key)
+            snapshot["assessments"], snapshot["write_order"] = _capped(assessments, order, key)
             self.write(snapshot)
         return snapshot

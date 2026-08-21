@@ -101,3 +101,28 @@ the masking test asserted only that some `StoreError` surfaced, so inverting whi
 left it green; the middleware count in a comment ignored that the CORS registration is
 conditional; the test count above was stale at 184; and this file gained no row for the
 previous commit, which the project's own convention requires. No behavioural change.
+
+### Third security review
+
+One required control that had never existed, and one fail-open the previous round narrowed
+rather than closed:
+
+● The assessment collection had no cap and no pruning. Every upsert rewrites the whole
+  snapshot, so retention set both the volume ceiling and the per-write cost, and a token
+  holder at the per-address rate limit added tens of megabytes a day until the volume filled
+  and the pod went out of service. Capped at 5000, oldest dropped first, the record just
+  written never dropped, ordered by an explicit write-order list because the snapshot is
+  serialised with sorted keys and object order does not survive the round trip.
+● The busy-versus-wedged rule required every held slot to have overrun, so an unauthenticated
+  flood of the unmetered probe path kept the newest slot always fresh and a mount whose writes
+  overran the probe budget reported ready indefinitely. Measured at one 503 in twelve probes
+  under an eight-way flood, against three consecutive needed. A busy verdict now requires
+  positive evidence of a completed probe, verified in all four directions so the fix does not
+  reintroduce a false unready.
+
+Also: a configured data directory must be absolute and is checked before resolution, because
+resolve() makes every value absolute and the check could therefore never fail; a quote-wrapped
+pasted path is normalised rather than becoming a literal directory inside the container; a
+control character in any value is refused; the boot line reports auth state and token length
+so a stale token is visible without a deploy cycle; the CSP exemption for the development docs
+is now test-enforced against production; and Retry-After never returns zero.

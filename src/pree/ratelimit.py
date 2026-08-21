@@ -86,6 +86,8 @@ class RateLimiter:
         """Seconds until the oldest hit in the window expires, for the Retry-After header."""
         bucket = self._hits.get(key)
         if not bucket:
-            return 0
+            # A refused key whose bucket was evicted by the fail-closed branch has no history,
+            # and answering 0 tells a compliant client to retry immediately, in a tight loop.
+            return 1
         remaining = self._window - (self._clock() - bucket[0])
         return max(1, int(remaining) + 1)
