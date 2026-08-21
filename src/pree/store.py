@@ -86,14 +86,20 @@ class JsonStore:
         a sibling file serialises them. The lock is per-volume, so it holds across workers in
         the same pod, which is exactly the scope that has the problem.
         """
-        self._data_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._data_dir / _LOCK_NAME
-        with lock_path.open("a+") as handle:
+        try:
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+")
+        except OSError as exc:
+            raise StoreError(f"could not acquire the store lock at {lock_path}") from exc
+        try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
     def seed(self) -> dict[str, Any]:
         """Create the snapshot if it is absent. Idempotent on re-run, and safe under a race."""
@@ -110,9 +116,16 @@ class JsonStore:
         the API would answer 404 for records that still exist, and the next successful write
         would overwrite the backup and make the loss permanent.
         """
+        try:
+            primary_exists = self._path.exists()
+            backup_exists = self._backup_path.exists()
+        except OSError as exc:
+            # Path.exists does not swallow EACCES, so an unreadable directory raises here
+            # rather than reporting False.
+            raise StoreError(f"could not stat the snapshot at {self._path}") from exc
         source = self._path
-        if not source.exists():
-            if self._backup_path.exists():
+        if not primary_exists:
+            if backup_exists:
                 # Decisive line: a recovery is a fact the operator needs, not an internal detail.
                 print(
                     f"pree store: primary snapshot absent, recovering from {self._backup_path}",
@@ -121,6 +134,19 @@ class JsonStore:
                 source = self._backup_path
             else:
                 return _empty_snapshot()
+        try:
+            return self._load(source)
+        except StoreError:
+            if source == self._path and backup_exists:
+                print(
+                    f"pree store: primary snapshot unreadable, recovering from {self._backup_path}",
+                    flush=True,
+                )
+                return self._load(self._backup_path)
+            raise
+
+    def _load(self, source: Path) -> dict[str, Any]:
+        """Parse and migrate one snapshot file, or fail closed."""
         try:
             raw = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -138,9 +164,12 @@ class JsonStore:
         this method did, means a refused write leaves no snapshot at all: the dataset then
         reads as empty and the next write destroys the backup too.
         """
-        self._data_dir.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(snapshot, indent=2, sort_keys=True)
-        handle, tmp_name = tempfile.mkstemp(dir=self._data_dir, suffix=".tmp")
+        try:
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            handle, tmp_name = tempfile.mkstemp(dir=self._data_dir, suffix=".tmp")
+        except OSError as exc:
+            raise StoreError(f"could not open a temporary file in {self._data_dir}") from exc
         tmp_path = Path(tmp_name)
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as stream:

@@ -17,19 +17,31 @@ _LOGGER_NAME = "pree.audit"
 def build_logger(stream: Any = None) -> logging.Logger:
     """Return the audit logger, wired to a single-line formatter.
 
-    An explicitly supplied stream gets its own logger, because handlers are cached per logger
-    name: sharing one name meant the first caller's stream won and every later injection was
-    silently ignored.
+    An explicitly supplied stream gets its own logger instance, because handlers are cached
+    per logger name: sharing one name meant the first caller's stream won and every later
+    injection was silently ignored.
     """
-    name = _LOGGER_NAME if stream is None else f"{_LOGGER_NAME}.{id(stream):x}"
-    logger = logging.getLogger(name)
+    if stream is not None:
+        # Built outside the global registry, which never reclaims a logger, so an injected
+        # stream cannot leak one per call.
+        logger = logging.Logger(_LOGGER_NAME)
+        logger.addHandler(_handler_for(stream))
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        return logger
+    logger = logging.getLogger(_LOGGER_NAME)
     if not logger.handlers:
-        handler = logging.StreamHandler(stream or sys.stdout)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
+        logger.addHandler(_handler_for(sys.stdout))
         logger.setLevel(logging.INFO)
         logger.propagate = False
     return logger
+
+
+def _handler_for(stream: Any) -> logging.Handler:
+    """One line per record, no prefix: the record is already structured JSON."""
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    return handler
 
 
 def audit(

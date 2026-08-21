@@ -150,6 +150,9 @@ def test_a_refused_write_leaves_every_prior_record_readable(
         store.upsert("new:three", {"score": 3.0})
     monkeypatch.undo()
 
+    # The PRIMARY must still be there. Asserting only that the records are readable passes
+    # under the old ordering too, because the backup fallback recovers them.
+    assert (tmp_path / "data" / "assessments.json").exists()
     surviving = store.read()["assessments"]
     assert sorted(surviving) == ["keep:one", "keep:two"]
     assert surviving["keep:one"]["score"] == 1.0
@@ -200,3 +203,43 @@ def test_two_concurrent_upserts_both_survive(tmp_path: Path) -> None:
     keys = JsonStore(data_dir).read()["assessments"]
     assert len([k for k in keys if k.startswith("worker-a:")]) == 15
     assert len([k for k in keys if k.startswith("worker-b:")]) == 15
+
+
+@pytest.mark.parametrize("failing_call", ["mkdir", "open", "mkstemp", "exists"])
+def test_every_filesystem_refusal_surfaces_as_a_store_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_call: str
+) -> None:
+    """The store's contract is StoreError, and the app handles exactly that.
+
+    Four call sites raised bare OSError, so on the documented root-owned mount the API returned
+    a framework 500 with no audit line: the two controls the security policy claims for that
+    exact state were false.
+    """
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+
+    def refuse(*_: object, **__: object) -> object:
+        raise PermissionError(errno.EACCES, "permission denied")
+
+    targets = {
+        "mkdir": (Path, "mkdir"),
+        "open": (Path, "open"),
+        "mkstemp": (__import__("tempfile"), "mkstemp"),
+        "exists": (Path, "exists"),
+    }
+    owner, attribute = targets[failing_call]
+    monkeypatch.setattr(owner, attribute, refuse)
+    with pytest.raises(StoreError):
+        store.upsert("a:b", {"score": 1.0})
+
+
+def test_a_corrupt_primary_recovers_from_the_backup(tmp_path: Path) -> None:
+    """Fail-closed is not the same as unrecoverable when a good backup is sitting there."""
+    data_dir = tmp_path / "data"
+    store = JsonStore(data_dir)
+    store.seed()
+    store.upsert("keep:one", {"score": 1.0})
+    store.upsert("keep:two", {"score": 2.0})
+    (data_dir / "assessments.json").write_text("{truncated", encoding="utf-8")
+    recovered = store.read()["assessments"]
+    assert "keep:one" in recovered

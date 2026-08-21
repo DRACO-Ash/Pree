@@ -16,7 +16,7 @@ Foundations baseline.
 ● The container: hash-locked install in a build stage, a prep stage whose last mutation is the
   suid and sgid sweep, and a flattened `FROM scratch` ship stage.
 ● The loop: `ruff`, `mypy` over source and tests, `pytest` with a Cobertura report, and
-  `pip-audit`, at 99% coverage against a gate bar of 80%.
+  `pip-audit`, at 99% coverage over 184 tests against a gate bar of 80%.
 
 Ten defects found by the binding engineering and security gates on first review are fixed in
 this release, each with a named regression test:
@@ -39,3 +39,38 @@ this release, each with a named regression test:
   bypassed it. Both tiers now key on the peer address.
 ● A corrupt snapshot raised through module import, so the pod never bound and left no
   diagnosable surface at all.
+
+### Second gate round
+
+Both binding gates failed the first fix pass. Three of their findings were regressions the
+fixes themselves introduced, which is recorded rather than smoothed over:
+
+● The storage probe never released its worker slot after a timeout, so a volume that was slow
+  but healthy pinned the pool at capacity and the container restarted in a loop. The slot is
+  now freed by the worker whenever it finishes, and results are cached briefly so concurrent
+  callers cost one write.
+● The new rate-limit eviction policy failed open: once the key table saturated, the key being
+  counted was the only evictable bucket, so it evicted itself and was admitted without bound.
+  It now excludes that key and denies when nothing is evictable.
+● The production auth refusal was conditional on `PREE_ENV`, which defaulted to `development`.
+  The default is now `production`, so one forgotten console variable cannot reopen the gate.
+
+Two controls had never existed and were added:
+
+● The interactive documentation was served in production, publishing the route table and the
+  token header name, and `/docs` loaded a floating-tag script from a content delivery network
+  onto the app origin. It is development-only now.
+● No response carried a Content-Security-Policy or any hardening header. Every response now
+  carries a locked policy plus nosniff, frame denial, no-referrer and an opener policy.
+
+Also fixed: four store call sites still raised bare `OSError`, so the documented first-deploy
+mount failure returned a framework 500 with no audit line; an unreadable primary snapshot now
+recovers from the backup; the allowed origin must be a concrete origin in any environment,
+rejecting `null` and lists as well as `*`; `apt` and `dpkg` are stripped from the runtime
+image; and boot is no longer an import side effect, which means a configuration error is a
+logged refusal rather than a worker that dies before it can say why.
+
+Verified without a Docker daemon: the exact launch command boots under gunicorn with two
+uvicorn workers, binds `0.0.0.0`, answers 200 at `/`, hides OpenAPI in production and emits
+every hardening header; and the store's file lock holds across four real worker processes,
+with 30 of 30 concurrent writes surviving.

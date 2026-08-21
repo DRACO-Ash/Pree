@@ -11,8 +11,11 @@ variable, then a local default. A control that cannot be verified is treated as 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+_ORIGIN_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
 
 DEFAULT_PORT = 8080
 MIN_PORT = 1
@@ -81,6 +84,30 @@ def _resolve_data_dir(env: dict[str, str]) -> Path:
     return path
 
 
+def _validate_origin_shape(token: str | None, origin: str | None) -> None:
+    """Reject an origin that is not a real origin, in every environment.
+
+    The wildcard check used to live inside the production branch and match `*` exactly, so
+    development accepted `*` with credentials, and `null` (which allows every opaque origin:
+    a sandboxed iframe, a `data:` document) was accepted anywhere. An origin is either a
+    concrete scheme and host or it is not usable.
+    """
+    if origin is None:
+        return
+    if origin in {"*", "null"} or "," in origin:
+        raise ConfigError(
+            f"Refusing to start: PREE_ALLOWED_ORIGIN must be a single concrete origin, "
+            f"got {origin!r}. A wildcard, 'null', or a list is never an allowed origin."
+        )
+    if not _ORIGIN_PATTERN.match(origin):
+        raise ConfigError(
+            f"Refusing to start: PREE_ALLOWED_ORIGIN must look like "
+            f"scheme://host[:port], got {origin!r}."
+        )
+    if token is None:
+        return
+
+
 def _validate_production_auth(token: str | None, origin: str | None, environment: str) -> None:
     """Fail closed on every unsafe production posture.
 
@@ -104,11 +131,6 @@ def _validate_production_auth(token: str | None, origin: str | None, environment
             "Refusing to start: PREE_TEAM_TOKEN is set with no PREE_ALLOWED_ORIGIN. "
             "Set the allowed origin to the app's real origin."
         )
-    if origin == "*":
-        raise ConfigError(
-            "Refusing to start: PREE_ALLOWED_ORIGIN is '*' with a token set. "
-            "Set the allowed origin to the app's real origin."
-        )
 
 
 def load_config(env: dict[str, str] | None = None) -> Config:
@@ -117,12 +139,13 @@ def load_config(env: dict[str, str] | None = None) -> Config:
     The environment is injected so boot behaviour is testable without mutating the process.
     """
     source = dict(os.environ if env is None else env)
-    environment = (_read(source, "PREE_ENV") or "development").lower()
+    environment = (_read(source, "PREE_ENV") or "production").lower()
     if environment not in {"development", "production"}:
         raise ConfigError(f"PREE_ENV must be 'development' or 'production', got {environment!r}")
 
     token = _read(source, "PREE_TEAM_TOKEN")
     origin = _read(source, "PREE_ALLOWED_ORIGIN")
+    _validate_origin_shape(token, origin)
     _validate_production_auth(token, origin, environment)
 
     return Config(

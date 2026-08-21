@@ -7,9 +7,11 @@ that claim true rather than aspirational:
 * ``strict=True``. Without it the validator runs in lax mode and quietly coerces, so the
   string ``"5"`` was accepted as ``5.0`` and scored, while the docstring claimed otherwise.
 * ``allow_inf_nan=False``. ``Infinity``, ``-Infinity``, ``NaN`` and an overflowing literal
-  such as ``1e400`` are non-standard JSON that Python's parser accepts. Left permitted, the
-  value reached the framework's default error handler, which cannot serialise a non-finite
-  float, so a boundary rejection became a 500.
+  such as ``1e400`` are non-standard JSON that Python's parser accepts. The range bounds
+  below already reject all four, so this setting is defence in depth rather than the control
+  doing the work: it keeps the rejection correct on any future field that carries no bounds.
+  What actually turned those literals into a 500 was the framework's default error handler
+  echoing the offending value back, which it cannot serialise; that is fixed in ``app.py``.
 """
 
 from __future__ import annotations

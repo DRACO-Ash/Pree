@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+import pree.main
 from pree.config import ConfigError
 from pree.main import build
 
@@ -15,6 +17,7 @@ def test_boot_wires_a_serving_app_and_seeds_the_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     data_dir = tmp_path / "data"
+    monkeypatch.setenv("PREE_ENV", "development")
     monkeypatch.setenv("PREE_DATA_DIR", str(data_dir))
     monkeypatch.setenv("PREE_BUILD_ID", "boot-test")
     monkeypatch.delenv("PREE_TEAM_TOKEN", raising=False)
@@ -34,6 +37,7 @@ def test_boot_records_a_refused_mount_but_still_serves_liveness(
     """A storage fault must leave a narrative and a live pod, not a silent kill."""
     blocker = tmp_path / "blocker"
     blocker.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PREE_ENV", "development")
     monkeypatch.setenv("PREE_DATA_DIR", str(blocker / "data"))
     app = build()
     assert "storage=refused" in capsys.readouterr().out
@@ -62,6 +66,7 @@ def test_a_corrupt_snapshot_still_leaves_a_live_diagnosable_pod(
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "assessments.json").write_text("{not json at all", encoding="utf-8")
+    monkeypatch.setenv("PREE_ENV", "development")
     monkeypatch.setenv("PREE_DATA_DIR", str(data_dir))
     monkeypatch.delenv("PREE_TEAM_TOKEN", raising=False)
     app = build()
@@ -71,3 +76,20 @@ def test_a_corrupt_snapshot_still_leaves_a_live_diagnosable_pod(
         assert client.get("/").status_code == 200
         # The read-out is reachable, which is what makes the fault diagnosable at all.
         assert client.get("/diagnostics").status_code == 200
+
+
+def test_importing_the_module_does_not_boot_the_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boot must not be an import side effect.
+
+    A module-level `app = build()` read the real environment at import, so a fail-closed
+    configuration error surfaced as an ImportError: unimportable to a test collector, and to
+    gunicorn a worker that dies before it can log the reason. The launch command calls the
+    factory explicitly instead.
+    """
+    monkeypatch.setenv("PREE_ENV", "production")
+    monkeypatch.delenv("PREE_TEAM_TOKEN", raising=False)
+    reloaded = importlib.reload(pree.main)
+    assert not hasattr(reloaded, "app")
+    assert callable(reloaded.build)

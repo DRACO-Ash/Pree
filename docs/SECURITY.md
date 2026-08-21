@@ -23,13 +23,20 @@ the assessment store.
 | Platform probes exempt from rate limiting | `src/pree/app.py` | `test_the_coarse_limit_never_touches_a_platform_probe` |
 | Request bodies capped before the token gate runs | `src/pree/app.py` | `tests/test_body_cap.py` |
 | Production refuses to start with the gate open | `src/pree/config.py` | `test_production_refuses_to_start_with_no_token_at_all` |
-| A refused write never loses a stored record | `src/pree/store.py` | `test_a_refused_write_leaves_every_prior_record_readable` |
-| Concurrent writers serialised by an exclusive lock | `src/pree/store.py` | `test_two_concurrent_upserts_both_survive` |
+| A refused write never loses a stored record, and leaves the primary in place | `src/pree/store.py` | `test_a_refused_write_leaves_every_prior_record_readable` |
+| An unreadable primary snapshot recovers from the backup | `src/pree/store.py` | `test_a_corrupt_primary_recovers_from_the_backup` |
+| Concurrent writers serialised by an exclusive lock | `src/pree/store.py` | `test_two_concurrent_upserts_both_survive`, and verified against four real worker processes |
 | A failed privileged action is still audited | `src/pree/app.py` | `test_a_failing_store_returns_a_generic_503_and_still_audits_the_action` |
 | Validation errors never echo caller input | `src/pree/app.py` | `test_the_validation_error_never_echoes_the_callers_input_back` |
 | Boundary validation, strict, extras forbidden, non-finite numbers refused | `src/pree/api_models.py` | `test_out_of_range_unknown_or_coercible_input_is_rejected_at_the_boundary` |
 | Actor labels sanitised and length-capped against log forging | `src/pree/security.py` | `test_actor_sanitisation_strips_log_forging_characters` |
 | No secret in any log, audit line, health body, or error | `src/pree/health.py` | `test_diagnostics_reports_secrets_as_a_boolean_and_a_length_only` |
+| Locked Content-Security-Policy and hardening headers on every response | `src/pree/app.py` | `test_every_response_carries_the_hardening_headers` |
+| Interactive documentation not served in production | `src/pree/app.py` | `test_the_interactive_docs_are_not_served_in_production` |
+| Every filesystem refusal surfaces as a handled 503, audited | `src/pree/store.py` | `test_a_real_storage_refusal_returns_503_and_audits_the_action` |
+| The rate limiter fails closed when its key table saturates | `src/pree/ratelimit.py` | `test_a_saturated_key_table_fails_closed_rather_than_admitting_everyone` |
+| A busy probe pool never reports storage as broken | `src/pree/health.py` | `test_a_busy_pool_is_indeterminate_rather_than_unready` |
+| The allowed origin must be a concrete origin, in any environment | `src/pree/config.py` | `test_an_origin_that_is_not_a_concrete_origin_is_refused_in_any_environment` |
 | Atomic writes; a failed write never becomes the snapshot | `src/pree/store.py` | `test_a_failed_write_fails_closed_and_leaves_no_temporary_file` |
 | Merges never shrink the stored dataset | `src/pree/store.py` | `test_merge_never_deletes_a_key_the_update_omitted` |
 | Non-root numeric user, no suid or sgid bits, one flattened layer | `Dockerfile` | `tests/test_boot_contract.py` |
@@ -66,22 +73,42 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    for the watch floor to tune against real outcomes, and they are stated as such rather than
    presented as validated.
 
-6. **The diagnostics read-out reports the token length when authenticated.** A boolean and a
+6. **The file lock is advisory and local to the volume.** `flock` serialises the two workers
+   in one pod, which is the scope that has the problem, and it was verified against four real
+   worker processes. It is not a distributed lock: on a network filesystem, or across two pods
+   sharing one volume, `flock` semantics are not guaranteed. Accepted because the platform
+   schedules one pod against this volume; a second replica needs the database add-on, not a
+   tighter lock.
+
+7. **The diagnostics read-out reports the token length when authenticated.** A boolean and a
    length, never a value, and gated whenever a token is configured. Before a token exists the
    read-out is open, which is deliberate: a first deploy needs it and has no token to present,
    and in that state there is no length to disclose.
 
 ## Corrected, not accepted
 
-Six control failures were found by the binding security and engineering gates on the first
-review of this scaffold and are fixed rather than written off. They are recorded here because
-the fix is only trustworthy if the failure is named: production booting with the auth gate
-open while this document claimed every route was gated; a refused write destroying the whole
-snapshot and reading back as empty; the fine rate-limit tier keyed on a caller-supplied
-header; no cap on a request body that the framework buffers before the token gate; a
-non-finite number turning a boundary rejection into a 500 that echoed caller input; and two
-workers losing writes to an unsynchronised read-modify-write. Each now has a named regression
-test in the control table above.
+The binding gates ran twice over this scaffold and failed it both times. Every failure they
+found is fixed rather than written off, and each is named here, because a fix is only
+trustworthy if the failure it addresses is stated plainly.
+
+First review: production booting with the auth gate open while this document claimed every
+route was gated; a refused write destroying the whole snapshot and reading back as empty; the
+fine rate-limit tier keyed on a caller-supplied header; no cap on a request body that the
+framework buffers before the token gate; a non-finite number turning a boundary rejection into
+a 500 that echoed caller input; and two workers losing writes to an unsynchronised
+read-modify-write.
+
+Second review, which caught three regressions introduced by the first round of fixes: the
+storage probe never releasing its slot after a timeout, so a slow-but-healthy volume pinned the
+pod unready and restarted it in a loop; the new rate-limit eviction policy failing open once
+its key table saturated, admitting a fresh peer without bound; and the production auth refusal
+being conditional on `PREE_ENV`, which defaulted to the permissive value. It also found two
+controls that had never existed: the interactive documentation was served in production, and
+no response carried a Content-Security-Policy or any hardening header. And it found four store
+call sites still raising bare `OSError`, so the documented first-deploy mount failure produced
+a framework 500 with no audit line at all.
+
+Each of these now has a named regression test in the control table above.
 
 ## Not accepted, and why it is not a risk here
 

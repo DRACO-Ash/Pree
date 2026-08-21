@@ -40,7 +40,7 @@ def quiet_logger() -> logging.Logger:
 
 @pytest.fixture
 def prober() -> Iterator[StorageProber]:
-    pool = StorageProber()
+    pool = StorageProber(cache_seconds=0.0)
     yield pool
     pool.shutdown()
 

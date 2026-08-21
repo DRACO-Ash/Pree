@@ -43,11 +43,21 @@ class StorageProbe:
     errno_code: int | None
     errno_name: str | None
     duration_ms: int
+    # True when the probe could not be taken at all, as opposed to taken and refused. A
+    # saturated pool is not evidence that storage is broken, so it must not be reported as
+    # though it were: doing so let three concurrent sockets turn the container HEALTHCHECK red.
+    indeterminate: bool = False
+
+    @property
+    def status(self) -> str:
+        if self.writable:
+            return "ready"
+        return "unknown" if self.indeterminate else "unready"
 
     def as_body(self) -> dict[str, Any]:
         """The response body. Carries the directory and the errno, never file contents."""
         return {
-            "status": "ready" if self.writable else "unready",
+            "status": self.status,
             "storage_writable": self.writable,
             "data_dir": self.data_dir,
             "errno": self.errno_code,
@@ -66,22 +76,29 @@ def _write_probe(data_dir: Path) -> None:
 
 
 class StorageProber:
-    """Runs the storage probe on a bounded pool, and never blocks on a saturated one.
+    """Runs the storage probe on a bounded pool, with a short result cache.
 
-    A hung mount leaves its worker thread blocked forever. With a plain shared pool, later
-    probes then queue behind the dead ones and every answer becomes a timeout produced by
-    queue starvation rather than by a fresh observation, so the diagnostics read-out stops
-    reporting the storage state it exists to report. Tracking in-flight probes lets a
-    saturated pool be reported as exactly that, immediately and honestly, as EBUSY.
+    Two properties matter more than the write itself:
+
+    * A probe that overruns its timeout must still free its slot when the worker eventually
+      returns. Releasing only on the success and error paths meant a slow-but-successful
+      volume pinned the pool at capacity forever, so a healthy mount reported EBUSY on every
+      later probe and the container restarted in a loop.
+    * Concurrent callers must not each cost a write. The probe path is unauthenticated by
+      contract, so without a cache a handful of sockets could saturate the pool at will. One
+      write serves every caller inside the cache window.
     """
 
-    def __init__(self, max_workers: int = 2) -> None:
+    def __init__(self, max_workers: int = 2, cache_seconds: float = 2.0) -> None:
         self._max_workers = max_workers
+        self._cache_seconds = cache_seconds
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="storage-probe"
         )
         self._guard = threading.Lock()
         self._in_flight = 0
+        self._cached: StorageProbe | None = None
+        self._cached_at = 0.0
 
     def _claim(self) -> bool:
         with self._guard:
@@ -94,31 +111,46 @@ class StorageProber:
         with self._guard:
             self._in_flight -= 1
 
+    def _fresh_enough(self) -> StorageProbe | None:
+        with self._guard:
+            if self._cached is None:
+                return None
+            if time.monotonic() - self._cached_at > self._cache_seconds:
+                return None
+            return self._cached
+
+    def _remember(self, probe: StorageProbe) -> StorageProbe:
+        with self._guard:
+            self._cached = probe
+            self._cached_at = time.monotonic()
+        return probe
+
     def probe(self, data_dir: Path) -> StorageProbe:
         """Prove storage with a real write, racing a hard timeout."""
+        cached = self._fresh_enough()
+        if cached is not None:
+            return cached
         directory = str(data_dir)
         if not self._claim():
-            return StorageProbe(False, directory, errno.EBUSY, "EBUSY", 0)
+            # Not cached: a busy answer is about this instant, not about the volume.
+            return StorageProbe(False, directory, errno.EBUSY, "EBUSY", 0, indeterminate=True)
         started = time.monotonic()
+        future = self._executor.submit(_write_probe, data_dir)
+        # The slot is freed by the worker itself, whenever it finishes, including long after
+        # this call has already given up and returned a timeout.
+        future.add_done_callback(lambda _: self._release())
         try:
-            self._executor.submit(_write_probe, data_dir).result(
-                timeout=STORAGE_PROBE_TIMEOUT_SECONDS
-            )
+            future.result(timeout=STORAGE_PROBE_TIMEOUT_SECONDS)
         except FutureTimeout:
-            # The worker is still blocked, so the slot stays claimed until the write returns.
-            # That is deliberate: pretending the slot is free would queue the next probe
-            # behind a thread that may never finish.
             elapsed = int((time.monotonic() - started) * 1000)
             return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
         except OSError as exc:
-            self._release()
             elapsed = int((time.monotonic() - started) * 1000)
             code = exc.errno
             name = errno.errorcode.get(code) if code is not None else None
-            return StorageProbe(False, directory, code, name, elapsed)
-        self._release()
+            return self._remember(StorageProbe(False, directory, code, name, elapsed))
         elapsed = int((time.monotonic() - started) * 1000)
-        return StorageProbe(True, directory, None, None, elapsed)
+        return self._remember(StorageProbe(True, directory, None, None, elapsed))
 
     def shutdown(self) -> None:
         """Release the pool. A blocked worker is not waited on; it would never return."""

@@ -24,12 +24,13 @@ service usually does not:
 uv venv --python 3.12 .venv
 uv pip install --require-hashes -r requirements-dev.txt
 sh scripts/verify.sh                    # the verification loop
-uv run --with-requirements requirements.txt \
-  uvicorn pree.main:app --reload --port 8080
+PREE_ENV=development uv run --with-requirements requirements.txt \
+  uvicorn --factory pree.main:build --reload --port 8080
 ```
 
-With no `PREE_TEAM_TOKEN` set, Pree runs with the auth gate open, which is permitted in
-development only. In production the app refuses to start unless the token and
+`PREE_ENV` defaults to `production`, which is why the quick start sets `development`
+explicitly. With no `PREE_TEAM_TOKEN` set, Pree runs with the auth gate open, which is
+permitted in development only. In production the app refuses to start unless the token and
 `PREE_ALLOWED_ORIGIN` are both set, because the server binds `0.0.0.0` and an open gate there
 would expose the assessment store to anything that can reach the port.
 
@@ -44,6 +45,9 @@ Integration because no Docker daemon is reachable. Exit 2 is not a pass.
 | `GET /`, `/healthz`, `/readyz`, `/livez`, `/ping` | no | liveness; 200, touches nothing |
 | `GET /healthz/storage` | no | proves storage with a real write, races a hard timeout |
 | `GET /diagnostics` | when a token exists | secret-free read-out: booleans and lengths, never values |
+
+`/openapi.json`, `/docs` and `/redoc` are served in development only, never in production.
+Every response carries a locked `Content-Security-Policy` and the usual hardening headers.
 | `POST /v1/assess` | yes | score one candidate against one protected asset |
 | `GET /v1/assessments/{key}` | yes | read a stored assessment, with ETag support |
 

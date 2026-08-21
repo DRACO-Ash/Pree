@@ -32,7 +32,7 @@ Pree fuses orbital geometry, manoeuvre-cadence baselining, and photometric and r
 uv venv --python 3.12 .venv                                install: create the pinned runtime
 uv pip install --require-hashes -r requirements-dev.txt     install: reproducible, hash-locked
 sh scripts/verify.sh                                        the local verification loop
-uv run --with-requirements requirements.txt uvicorn pree.main:app --reload --port 8080   dev
+PREE_ENV=development uv run --with-requirements requirements.txt uvicorn --factory pree.main:build --reload --port 8080   dev
 sh scripts/package-appstore.sh                              build the upload zip
 sh scripts/simulate-pipeline.sh                             simulate the platform pipeline
 docker build -t pree .                                      build the image

@@ -4,7 +4,7 @@ create_app(deps) wires routes, middleware, and injected dependencies and returns
 without listening. main.py owns the listener. This split lets the whole HTTP surface be
 tested in-process with isolated state and a fixed clock.
 
-The request pipeline is, in order: reject an oversize body, then rate limit, then authenticate
+The request pipeline is, in order: rate limit, then reject an oversize body, then authenticate
 on cost-incurring and state-changing routes, then validate the body at the boundary, then the
 handler, then a generic error response with the detail logged server-side.
 
@@ -58,6 +58,24 @@ STORE_UNAVAILABLE_ERROR = "could not store the assessment"
 # Generous for this schema, which is a handful of numbers and two short identifiers, and small
 # enough that an unauthenticated caller cannot exhaust memory before the token gate runs.
 MAX_BODY_BYTES = 32 * 1024
+# The interactive documentation paths. FastAPI serves all three by default, which made the
+# whole route table, every field range and the token header name readable by an unauthenticated
+# caller, and made /docs load a floating-tag CDN script onto the app origin: the same origin
+# CORS trusts with credentials. They are served in development only.
+OPENAPI_PATH = "/openapi.json"
+DOCS_PATH = "/docs"
+REDOC_PATH = "/redoc"
+DOC_PATHS = (OPENAPI_PATH, DOCS_PATH, REDOC_PATH)
+# Nothing this API returns needs a script, a style, a frame, or a form. Locked by default and
+# tightened only, never loosened.
+STRICT_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+SECURITY_HEADERS = {
+    "Content-Security-Policy": STRICT_CSP,
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+}
 _TOKEN_HEADER = "x-pree-token"  # noqa: S105 - a header NAME, not a credential
 _ACTOR_HEADER = "x-pree-actor"
 
@@ -282,7 +300,7 @@ def register_health_routes(
         directory and the exact errno, so a screenshot of it is a full diagnosis.
         """
         probe = probe_now()
-        if not probe.writable:
+        if not probe.writable and not probe.indeterminate:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return probe.as_body()
 
@@ -415,16 +433,20 @@ def create_app(
     # than every probe restating it. A pod the platform later kills still leaves a narrative.
     last_ready: dict[str, bool | None] = {"writable": None}
 
+    serve_docs = not config.is_production
     app = FastAPI(
         title="Pree",
         version=__version__,
         description="Confidence-tiered threat scoring for Protect and Defend operators.",
+        openapi_url=OPENAPI_PATH if serve_docs else None,
+        docs_url=DOCS_PATH if serve_docs else None,
+        redoc_url=REDOC_PATH if serve_docs else None,
     )
 
     def probe_now() -> StorageProbe:
         """Probe storage and log any transition between writable and unwritable."""
         probe = storage.probe(config.data_dir)
-        if last_ready["writable"] != probe.writable:
+        if not probe.indeterminate and last_ready["writable"] != probe.writable:
             state = "ready" if probe.writable else "unready"
             print(
                 f"pree storage {state}: data_dir={probe.data_dir} "
@@ -470,6 +492,23 @@ def create_app(
             allow_methods=["GET", "POST"],
             allow_headers=[_TOKEN_HEADER, _ACTOR_HEADER, "content-type"],
         )
+
+    @app.middleware("http")
+    async def security_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        """Set the hardening headers on every response.
+
+        The development documentation pages are exempt from the Content-Security-Policy only,
+        because they legitimately load their own script and style. They do not exist in
+        production, so the exemption cannot reach a deployed app.
+        """
+        response = await call_next(request)
+        for name, value in SECURITY_HEADERS.items():
+            if name == "Content-Security-Policy" and serve_docs and request.url.path in DOC_PATHS:
+                continue
+            response.headers.setdefault(name, value)
+        return response
 
     register_error_handlers(app, audit_log)
 

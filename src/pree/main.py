@@ -41,4 +41,7 @@ def build() -> FastAPI:
     return create_app(config, store)
 
 
-app = build()
+# No module-level `app = build()`. Booting on import means any import of this module reads the
+# real environment and can raise, so a fail-closed configuration error became an import error:
+# unimportable to a test collector, and to gunicorn a worker that dies before it can log why.
+# The launch command calls the factory explicitly instead, which gunicorn supports.

@@ -43,29 +43,35 @@ class RateLimiter:
             bucket.popleft()
         return bucket
 
-    def _evict_if_needed(self, now: float) -> None:
-        """Bound memory without handing an attacker a way to reset a throttled bucket.
+    def _evict_if_needed(self, now: float, protected: str) -> bool:
+        """Reclaim space without ever letting the limiter stop limiting.
 
-        Insertion-order eviction let a spray of fresh keys pop a key that was currently over
-        its limit, which reopened its window: the very outcome the limiter exists to prevent.
-        Expired buckets go first, then the least recently active, and a key still over its
-        limit is never evicted.
+        Two rules make this fail closed. The key currently being counted is never a
+        candidate: it was the only bucket under its limit once the table filled with
+        saturated ones, so it evicted itself on every request and the caller was admitted
+        without bound. And when nothing is evictable the request is refused rather than
+        admitted, because a limiter that runs out of bookkeeping must deny, not wave through.
         """
         if len(self._hits) <= self._max_keys:
-            return
+            return True
         cutoff = now - self._window
-        for key in [k for k, bucket in self._hits.items() if not bucket or bucket[-1] <= cutoff]:
+        expired = [
+            k for k, b in self._hits.items() if k != protected and (not b or b[-1] <= cutoff)
+        ]
+        for key in expired:
             del self._hits[key]
             if len(self._hits) <= self._max_keys:
-                return
-        evictable = [
-            (bucket[-1], key) for key, bucket in self._hits.items() if len(bucket) < self._limit
-        ]
-        evictable.sort()
+                return True
+        evictable = sorted(
+            (b[-1], k) for k, b in self._hits.items() if k != protected and len(b) < self._limit
+        )
         for _, key in evictable:
             del self._hits[key]
             if len(self._hits) <= self._max_keys:
-                return
+                return True
+        # Every remaining bucket is at its limit and belongs to someone else. Refuse.
+        del self._hits[protected]
+        return False
 
     def allow(self, key: str) -> bool:
         """Record a hit and report whether it is within the limit."""
@@ -74,8 +80,7 @@ class RateLimiter:
         if len(bucket) >= self._limit:
             return False
         bucket.append(now)
-        self._evict_if_needed(now)
-        return True
+        return self._evict_if_needed(now, key)
 
     def retry_after_seconds(self, key: str) -> int:
         """Seconds until the oldest hit in the window expires, for the Retry-After header."""

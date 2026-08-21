@@ -56,7 +56,7 @@ GITLAB_CI=true
 export GITLAB_CI
 ruff format --check src tests
 ruff check src tests
-mypy
+mypy src/pree tests
 coverage erase
 coverage run -m pytest
 coverage report

@@ -53,13 +53,14 @@ which replaces rather than merges, then `apply_env_vars` to make it live.
 | FILE_STORAGE | yes | the assessment store persists at the injected `/data` |
 | POSTGRESQL | no | the snapshot is a single document; concurrent writes are serialised by a file lock (see below) |
 | REDIS | no | rate-limit state is per-process by design (see the security policy) |
+| CLAMAV | no | Pree accepts no file uploads |
 
 On concurrency: the image runs two gunicorn workers, so there **are** concurrent writers. They
 are serialised by an exclusive `flock` held across the whole read, merge and write inside the
-store, which is why the managed database is not needed yet rather than why there is no
-contention. An earlier version of this table declined POSTGRESQL on the stated ground of "no
-concurrent writers", which contradicted the two-worker launch command.
-| CLAMAV | no | Pree accepts no file uploads |
+store, verified against four real worker processes. That is why the managed database is not
+needed yet, rather than there being no contention. An earlier version of this table declined
+POSTGRESQL on the stated ground of "no concurrent writers", which contradicted the launch
+command directly above it.
 
 ## Operations request required
 
@@ -80,16 +81,32 @@ Inside the 8Gi and 6 CPU envelope. Two gunicorn workers with a 60 second timeout
 
 ## Health paths
 
-All of these return HTTP 200, unauthenticated, and touch nothing, so none can hang:
-`/`, `/healthz`, `/readyz`, `/livez`, `/ping`. They are exempt from rate limiting, along with
-`/healthz/storage`, so rejected traffic cannot drive the container HEALTHCHECK red and restart
-the pod.
+The complete list of unauthenticated paths in production, and nothing else answers without
+the token.
+
+| Path | Behaviour |
+|---|---|
+| `/`, `/healthz`, `/readyz`, `/livez`, `/ping` | 200, touch nothing, cannot hang |
+| `/healthz/storage` | the write proof; 200 or 503, see below |
+
+`/openapi.json`, `/docs` and `/redoc` are **not served in production**. They exist in
+development only, because they publish the whole route table and the token header name, and
+`/docs` loads a third-party script from a content delivery network onto the app origin.
+
+The liveness paths and `/healthz/storage` are exempt from rate limiting, so rejected traffic
+cannot drive the container HEALTHCHECK red and restart the pod. Every response, including a
+401, a 413 and a 429, carries `Content-Security-Policy: default-src 'none'`,
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+`Cross-Origin-Opener-Policy: same-origin`.
 
 `GET /` returns 200 and never a 302, because the platform router probes the root.
 
 `/healthz/storage` is the container HEALTHCHECK target and the only path that touches storage.
 It performs a real write, races a 1.5 second timeout shorter than the platform probe, and on
-failure returns 503 naming the resolved directory and the exact errno.
+failure returns 503 naming the resolved directory and the exact errno. A busy probe pool
+returns 200 with `"status": "unknown"` and `errno_name: "EBUSY"`, never 503: a saturated pool
+is not evidence that storage is broken, and treating it as such let a handful of concurrent
+requests restart the pod.
 
 `/diagnostics` is a secret-free read-out: every critical input as a boolean and a length, never
 a value, plus the resolved identity and storage state, with every field present at once. It is

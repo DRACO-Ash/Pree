@@ -96,23 +96,71 @@ def test_an_eacces_mount_is_reported_with_its_errno_regardless_of_uid(
     assert probe.as_body()["data_dir"] == str(tmp_path / "data")
 
 
-def test_a_saturated_probe_pool_is_reported_as_busy_not_as_a_timeout(
+def test_a_slow_but_successful_probe_frees_its_slot_when_the_worker_returns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A hung mount must not make later probes lie about why they failed."""
+    """The regression that mattered most: a healthy volume must not pin the pod unready.
+
+    The slot was released on the success and error paths only, so a write slower than the
+    timeout but which eventually SUCCEEDED never freed its worker. Every later probe then
+    reported EBUSY on completely healthy storage, and the container restarted in a loop.
+    """
+    real = health._write_probe
+
+    def slow(path: Path) -> None:
+        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 0.5)
+        real(path)
+
+    monkeypatch.setattr(health, "_write_probe", slow)
+    pool = StorageProber(max_workers=1, cache_seconds=0.0)
+    try:
+        assert pool.probe(tmp_path / "data").errno_name == "ETIMEDOUT"
+        monkeypatch.setattr(health, "_write_probe", real)
+        time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS + 1.0)
+        recovered = pool.probe(tmp_path / "data")
+    finally:
+        pool.shutdown()
+    assert recovered.writable is True, "the slot was never freed by the finished worker"
+
+
+def test_concurrent_callers_cost_one_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe path is unauthenticated by contract, so it must not be a write amplifier."""
+    calls = {"n": 0}
+    real = health._write_probe
+
+    def counted(path: Path) -> None:
+        calls["n"] += 1
+        real(path)
+
+    monkeypatch.setattr(health, "_write_probe", counted)
+    pool = StorageProber(cache_seconds=5.0)
+    try:
+        results = [pool.probe(tmp_path / "data") for _ in range(10)]
+    finally:
+        pool.shutdown()
+    assert all(p.writable for p in results)
+    assert calls["n"] == 1, f"expected one write for ten callers, got {calls['n']}"
+
+
+def test_a_busy_pool_is_indeterminate_rather_than_unready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saturated pool is not evidence that storage is broken, so it must not read as broken.
+
+    Reporting EBUSY as unready let three concurrent sockets turn the container HEALTHCHECK red.
+    """
 
     def hang(_: Path) -> None:
         time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS * 20)
 
     monkeypatch.setattr(health, "_write_probe", hang)
-    pool = StorageProber(max_workers=1)
+    pool = StorageProber(max_workers=1, cache_seconds=0.0)
     try:
-        first = pool.probe(tmp_path / "data")
-        second = pool.probe(tmp_path / "data")
+        assert pool.probe(tmp_path / "data").errno_name == "ETIMEDOUT"
+        busy = pool.probe(tmp_path / "data")
     finally:
         pool.shutdown()
-    assert first.errno_name == "ETIMEDOUT"
-    # The slot stays claimed while the worker is still blocked, so the next answer is an
-    # honest "no capacity to observe", not a second fabricated timeout.
-    assert second.errno_name == "EBUSY"
-    assert second.duration_ms == 0
+    assert busy.errno_name == "EBUSY"
+    assert busy.indeterminate is True
+    assert busy.status == "unknown"
+    assert busy.as_body()["status"] == "unknown"

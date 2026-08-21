@@ -38,6 +38,8 @@ RUN rm -rf /opt/venv/lib/python3.12/site-packages/pip* \
            /usr/local/lib/python3.12/site-packages/setuptools* \
            /usr/local/lib/python3.12/ensurepip \
            /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.12 \
+ && rm -rf /var/lib/apt /var/cache/apt /etc/apt /usr/bin/apt /usr/bin/apt-* \
+           /usr/bin/dpkg /usr/bin/dpkg-* /usr/sbin/dpkg-* /var/lib/dpkg/info \
  && useradd --uid 10001 --user-group --system --no-create-home \
             --shell /usr/sbin/nologin appuser \
  && chown -R 10001:10001 /app
@@ -62,4 +64,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["/opt/venv/bin/python", "-c", "import os,sys,urllib.request;p=os.environ.get('PORT','8080');sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz/storage',timeout=3).status==200 else 1)"]
 # No ENV PORT and no ENV PREE_DATA_DIR anywhere in this file. The platform injects both and an
 # image-level default would beat the code fallback chain. exec so SIGTERM reaches gunicorn.
-CMD ["sh","-c","exec gunicorn pree.main:app --pythonpath /app/src -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8080} --workers 2 --timeout 60 --access-logfile - --error-logfile -"]
+CMD ["sh","-c","exec gunicorn 'pree.main:build()' --pythonpath /app/src -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8080} --workers 2 --timeout 60 --access-logfile - --error-logfile -"]

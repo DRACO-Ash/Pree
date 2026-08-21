@@ -95,3 +95,25 @@ def test_expired_buckets_are_reclaimed_before_active_ones() -> None:
     limiter.allow("fresh")
     assert "fresh" in limiter._hits
     assert len(limiter._hits) <= 2
+
+
+def test_a_saturated_key_table_fails_closed_rather_than_admitting_everyone() -> None:
+    """The eviction fix had made the limiter fail open.
+
+    "Never evict a key at its limit" left the key currently being counted as the only
+    evictable bucket once the table filled with saturated ones, so it evicted itself on every
+    request and was admitted without bound.
+    """
+    now = [0.0]
+    limiter = RateLimiter(2, 60.0, clock=lambda: now[0], max_keys=8)
+    for index in range(8):
+        assert limiter.allow(f"full-{index}") is True
+        assert limiter.allow(f"full-{index}") is True
+    assert all(len(b) >= 2 for b in limiter._hits.values())
+    assert [limiter.allow("fresh-peer") for _ in range(5)] == [False] * 5
+
+
+def test_ordinary_use_is_unaffected_by_the_fail_closed_eviction() -> None:
+    now = [0.0]
+    limiter = RateLimiter(3, 60.0, clock=lambda: now[0], max_keys=4)
+    assert [limiter.allow("a") for _ in range(5)] == [True, True, True, False, False]

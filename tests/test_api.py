@@ -399,3 +399,85 @@ def test_a_rate_limited_response_still_carries_cors_headers(
         blocked = limited.get("/v1/assessments/a:b", headers={**AUTH, "Origin": origin})
     assert blocked.status_code == 429
     assert blocked.headers["access-control-allow-origin"] == origin
+
+
+def test_the_interactive_docs_are_not_served_in_production(
+    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+) -> None:
+    """They exposed the whole route table, every field range and the token header name to an
+    unauthenticated caller, and /docs loaded a floating-tag CDN script onto the app origin:
+    the same origin CORS trusts with credentials."""
+    config = make_config(
+        tmp_path,
+        PREE_ENV="production",
+        PREE_TEAM_TOKEN=TEST_TOKEN,
+        PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
+    )
+    with build_client(config, quiet_logger, prober) as production:
+        for path in ("/openapi.json", "/docs", "/redoc"):
+            assert production.get(path).status_code == 404, path
+            assert production.get(path, headers=AUTH).status_code == 404, path
+
+
+def test_the_interactive_docs_remain_available_in_development(client: TestClient) -> None:
+    assert client.get("/openapi.json").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("content-security-policy", "default-src 'none'"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        ("cross-origin-opener-policy", "same-origin"),
+    ],
+)
+def test_every_response_carries_the_hardening_headers(
+    client: TestClient, header: str, expected: str
+) -> None:
+    for path in ("/healthz", "/v1/assessments/none:none"):
+        response = client.get(path, headers=AUTH)
+        assert expected in response.headers[header], f"{path} is missing {header}"
+
+
+def test_the_hardening_headers_survive_a_rejection(client: TestClient) -> None:
+    """A 401 and a 413 are responses too, and are exactly where a missing header matters."""
+    rejected = client.post("/v1/assess", json=FULL_BODY)
+    assert rejected.status_code == 401
+    assert "default-src 'none'" in rejected.headers["content-security-policy"]
+
+
+def test_a_real_storage_refusal_returns_503_and_audits_the_action(
+    tmp_path: Path, prober: StorageProber, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented first-deploy state: a root-owned mount refusing every write.
+
+    Injecting at the filesystem rather than stubbing `upsert` is the point. The store used to
+    raise bare OSError from four call sites, so this produced a framework 500 with no audit
+    line, while the security policy claimed a generic error and an audit line for this state.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    store = JsonStore(config.data_dir)
+    store.seed()
+    buffer = io.StringIO()
+    app = create_app(config, store, logger=build_logger(buffer), prober=prober)
+
+    def refuse(*_: object, **__: object) -> object:
+        raise PermissionError(13, "permission denied")
+
+    with TestClient(app, raise_server_exceptions=False) as failing:
+        monkeypatch.setattr(Path, "open", refuse)
+        response = failing.post(
+            "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": "ops.lead"}
+        )
+        monkeypatch.undo()
+    assert response.status_code == 503
+    assert response.json() == {"error": "could not store the assessment"}
+    audits = [
+        json.loads(line)
+        for line in buffer.getvalue().splitlines()
+        if line.startswith("{") and '"kind":"audit"' in line
+    ]
+    assert audits, f"no audit line for a failed privileged action: {buffer.getvalue()!r}"
+    assert audits[-1]["outcome"] == "error"

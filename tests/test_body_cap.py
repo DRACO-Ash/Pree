@@ -93,3 +93,24 @@ async def test_the_body_is_replayed_exactly_once() -> None:
         BodySizeLimit(_echo), _post_scope(), [{"type": "http.request", "body": b"abcdef"}]
     )
     assert sent[1]["body"] == b"6"
+
+
+@pytest.mark.anyio
+async def test_a_second_read_of_the_body_returns_a_disconnect_not_the_body_again() -> None:
+    """The replay-once guard. Without it a second receive() re-delivers the body, which
+    hot-loops any disconnect watcher; the earlier test never read twice, so the guard could be
+    deleted with the whole suite staying green."""
+    seen: list[dict[str, object]] = []
+
+    async def double_reader(scope: object, receive: object, send: object) -> None:
+        seen.append(await receive())  # type: ignore[operator]
+        seen.append(await receive())  # type: ignore[operator]
+        await send({"type": "http.response.start", "status": 200, "headers": []})  # type: ignore[operator]
+        await send({"type": "http.response.body", "body": b""})  # type: ignore[operator]
+
+    await _run(
+        BodySizeLimit(double_reader), _post_scope(), [{"type": "http.request", "body": b"abc"}]
+    )
+    assert seen[0]["type"] == "http.request"
+    assert seen[0]["body"] == b"abc"
+    assert seen[1]["type"] == "http.disconnect"
