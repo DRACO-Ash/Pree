@@ -360,3 +360,42 @@ def test_an_observers_own_delay_is_not_charged_to_the_mount(
     monkeypatch.setattr(pool, "_executor", FastWrite())
     probe = pool.probe(tmp_path / "data")
     assert probe.writable is True, "the observer's own delay was charged to the mount"
+
+
+def test_a_cached_verdict_ages_from_the_probe_start_not_from_when_it_was_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worst-case staleness must be the cache window, not the window plus the write latency.
+
+    Stamping the cache at observation time makes a slow write's verdict live for the window
+    PLUS however long that write took, which is a different and larger number than the one the
+    deployment sheet publishes. The two implementations are told apart by whether the second
+    call re-probes: stamped from the start it does, stamped from observation it serves a stale
+    ready. Mutation testing found this fix had nothing distinguishing it.
+    """
+    submits = {"n": 0}
+
+    class SlowButInBudget:
+        def submit(self, fn: object, *args: object) -> Future[float]:
+            submits["n"] += 1
+            future: Future[float] = Future()
+            future.set_result(1.0)
+            return future
+
+        def shutdown(self, wait: bool = True) -> None:
+            return None
+
+    # The probe starts at 0.0 and its write takes 1.0s. The second call happens at 1.5s, which
+    # is beyond a 1.0s window measured from the START and inside one measured from observation.
+    readings = [0.0, 0.0, 1.5]
+
+    def clock() -> float:
+        return readings.pop(0) if len(readings) > 1 else readings[0]
+
+    pool = StorageProber(cache_seconds=1.0, clock=clock)
+    monkeypatch.setattr(pool, "_executor", SlowButInBudget())
+    assert pool.probe(tmp_path / "data").writable is True
+    pool.probe(tmp_path / "data")
+    assert submits["n"] == 2, (
+        "the second call was served a cached verdict older than the published window"
+    )
