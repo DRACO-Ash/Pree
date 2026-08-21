@@ -226,13 +226,16 @@ def test_a_concurrent_caller_joins_the_probe_rather_than_guessing(
     the grace did, so an unauthenticated flood could hold that window open and restart the pod.
     """
     started = threading.Event()
+    writes = {"n": 0}
 
     def slow_but_fine(path: Path) -> None:
+        writes["n"] += 1
         started.set()
         time.sleep(STORAGE_PROBE_TIMEOUT_SECONDS * 0.5)
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(health, "_write_probe", slow_but_fine)
+    # Caching disabled, so a second write is the only thing that could serve a second caller.
     pool = StorageProber(cache_seconds=0.0)
     results: list[bool] = []
     worker = threading.Thread(target=lambda: results.append(pool.probe(tmp_path / "data").writable))
@@ -245,6 +248,10 @@ def test_a_concurrent_caller_joins_the_probe_rather_than_guessing(
         pool.shutdown()
     assert joiner.writable is True, "the joiner reported a healthy volume as broken"
     assert results == [True]
+    # The property under test is single-flight itself, not merely that the answer was right.
+    # Asserting only the verdict passes just as well when the joiner runs its own write, which
+    # is exactly what let a mutation disabling the join survive the entire suite.
+    assert writes["n"] == 1, f"the joiner started its own write; {writes['n']} writes ran"
 
 
 def test_a_write_that_misses_its_budget_is_never_reported_as_ready(
