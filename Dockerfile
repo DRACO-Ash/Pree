@@ -25,10 +25,9 @@ RUN pip install --require-hashes --no-deps -r requirements.txt
 
 # ---- prep: assemble the runtime filesystem, then sweep suid and sgid bits last ----
 FROM python:3.12-slim@${BASE_DIGEST} AS prep
-RUN apt-get update \
- && apt-get upgrade -y \
- && apt-get purge -y --auto-remove python3-pip \
- && rm -rf /var/lib/apt/lists/*
+# Tolerated step, on its own RUN. Base-package upgrades are best-effort against a mirror that
+# may lag; chaining a mandatory step behind them would let a tolerated miss swallow it.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/venv /opt/venv
 WORKDIR /app
 COPY src ./src

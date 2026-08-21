@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -12,9 +11,11 @@ from fastapi.testclient import TestClient
 
 from pree.app import create_app
 from pree.config import Config, load_config
+from pree.health import StorageProber
 from pree.store import JsonStore
 
 TEST_TOKEN = "test-token-0123456789"
+AUTH = {"x-pree-token": TEST_TOKEN}
 
 
 def make_config(tmp_path: Path, **overrides: object) -> Config:
@@ -38,33 +39,46 @@ def quiet_logger() -> logging.Logger:
 
 
 @pytest.fixture
-def executor() -> Iterator[ThreadPoolExecutor]:
-    pool = ThreadPoolExecutor(max_workers=2)
+def prober() -> Iterator[StorageProber]:
+    pool = StorageProber()
     yield pool
-    pool.shutdown(wait=True)
+    pool.shutdown()
+
+
+def build_client(
+    config: Config,
+    logger: logging.Logger,
+    pool: StorageProber,
+    **deps: object,
+) -> TestClient:
+    """Mount the app in-process through the factory, with the store seeded."""
+    store = JsonStore(config.data_dir)
+    store.seed()
+    app = create_app(config, store, logger=logger, prober=pool, **deps)  # type: ignore[arg-type]
+    return TestClient(app)
 
 
 @pytest.fixture
 def client(
-    tmp_path: Path, quiet_logger: logging.Logger, executor: ThreadPoolExecutor
+    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
 ) -> Iterator[TestClient]:
-    """The app mounted in-process via the factory, with isolated state and auth on."""
+    """The app with a token configured, so the gate is on."""
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    store = JsonStore(config.data_dir)
-    store.seed()
-    app = create_app(config, store, logger=quiet_logger, executor=executor)
-    with TestClient(app) as test_client:
+    with build_client(config, quiet_logger, prober) as test_client:
         yield test_client
 
 
 @pytest.fixture
 def open_client(
-    tmp_path: Path, quiet_logger: logging.Logger, executor: ThreadPoolExecutor
+    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
 ) -> Iterator[TestClient]:
     """The app with no token configured: single-user local mode, auth off by design."""
     config = make_config(tmp_path)
-    store = JsonStore(config.data_dir)
-    store.seed()
-    app = create_app(config, store, logger=quiet_logger, executor=executor)
-    with TestClient(app) as test_client:
+    with build_client(config, quiet_logger, prober) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    """The async tests target asyncio only; anyio would otherwise also try trio."""
+    return "asyncio"

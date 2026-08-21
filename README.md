@@ -28,9 +28,14 @@ uv run --with-requirements requirements.txt \
   uvicorn pree.main:app --reload --port 8080
 ```
 
-With no `PREE_TEAM_TOKEN` set, Pree runs in single-user local mode with authentication off.
-Setting a token turns the gate on; in production the token and `PREE_ALLOWED_ORIGIN` must be set
-together or the app refuses to start.
+With no `PREE_TEAM_TOKEN` set, Pree runs with the auth gate open, which is permitted in
+development only. In production the app refuses to start unless the token and
+`PREE_ALLOWED_ORIGIN` are both set, because the server binds `0.0.0.0` and an open gate there
+would expose the assessment store to anything that can reach the port.
+
+The pipeline simulation (`sh scripts/simulate-pipeline.sh`) exits 0 when every stage including
+the image build is green, and 2 when only the container leg is deferred to Continuous
+Integration because no Docker daemon is reachable. Exit 2 is not a pass.
 
 ## The API
 
@@ -38,7 +43,7 @@ together or the app refuses to start.
 |---|---|---|
 | `GET /`, `/healthz`, `/readyz`, `/livez`, `/ping` | no | liveness; 200, touches nothing |
 | `GET /healthz/storage` | no | proves storage with a real write, races a hard timeout |
-| `GET /diagnostics` | no | secret-free read-out: booleans and lengths, never values |
+| `GET /diagnostics` | when a token exists | secret-free read-out: booleans and lengths, never values |
 | `POST /v1/assess` | yes | score one candidate against one protected asset |
 | `GET /v1/assessments/{key}` | yes | read a stored assessment, with ETag support |
 

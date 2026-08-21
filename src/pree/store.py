@@ -7,15 +7,20 @@ migrated forward additively on read. Merges never shrink the dataset.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import shutil
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
 _SNAPSHOT_NAME = "assessments.json"
 _BACKUP_SUFFIX = ".bak"
+_LOCK_NAME = ".assessments.lock"
 
 
 class StoreError(RuntimeError):
@@ -68,29 +73,72 @@ class JsonStore:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def _backup_path(self) -> Path:
+        return self._path.with_suffix(self._path.suffix + _BACKUP_SUFFIX)
+
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """Hold an exclusive lock across a whole read-modify-write.
+
+        The image runs more than one worker, and the snapshot is a single whole-file document,
+        so two unsynchronised upserts interleave and one loses its record. An advisory lock on
+        a sibling file serialises them. The lock is per-volume, so it holds across workers in
+        the same pod, which is exactly the scope that has the problem.
+        """
+        self._data_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._data_dir / _LOCK_NAME
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def seed(self) -> dict[str, Any]:
-        """Create the snapshot if it is absent. Idempotent on re-run."""
-        if not self._path.exists():
-            self.write(_empty_snapshot())
-        return self.read()
+        """Create the snapshot if it is absent. Idempotent on re-run, and safe under a race."""
+        with self._exclusive():
+            if not self._path.exists() and not self._backup_path.exists():
+                self.write(_empty_snapshot())
+            return self.read()
 
     def read(self) -> dict[str, Any]:
-        """Read and migrate the snapshot. A missing file reads as an empty snapshot."""
-        if not self._path.exists():
-            return _empty_snapshot()
+        """Read and migrate the snapshot.
+
+        A missing primary snapshot falls back to the backup before it reads as empty. Without
+        that fallback an interrupted write would present a populated store as an empty one,
+        the API would answer 404 for records that still exist, and the next successful write
+        would overwrite the backup and make the loss permanent.
+        """
+        source = self._path
+        if not source.exists():
+            if self._backup_path.exists():
+                # Decisive line: a recovery is a fact the operator needs, not an internal detail.
+                print(
+                    f"pree store: primary snapshot absent, recovering from {self._backup_path}",
+                    flush=True,
+                )
+                source = self._backup_path
+            else:
+                return _empty_snapshot()
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            raw = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise StoreError(f"snapshot at {self._path} is unreadable") from exc
+            raise StoreError(f"snapshot at {source} is unreadable") from exc
         if not isinstance(raw, dict):
-            raise StoreError(f"snapshot at {self._path} is not a JSON object")
+            raise StoreError(f"snapshot at {source} is not a JSON object")
         return migrate_forward(raw)
 
     def write(self, snapshot: dict[str, Any]) -> None:
-        """Write the snapshot atomically, backing up any existing file first."""
+        """Write the snapshot atomically, leaving the live file intact until the swap.
+
+        The order matters and is the whole point. The replacement is written and flushed
+        first, the current snapshot is COPIED to the backup second, and only then does the
+        atomic rename take place. Moving the live file aside first, as an earlier version of
+        this method did, means a refused write leaves no snapshot at all: the dataset then
+        reads as empty and the next write destroys the backup too.
+        """
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        if self._path.exists():
-            self._path.replace(self._path.with_suffix(self._path.suffix + _BACKUP_SUFFIX))
         payload = json.dumps(snapshot, indent=2, sort_keys=True)
         handle, tmp_name = tempfile.mkstemp(dir=self._data_dir, suffix=".tmp")
         tmp_path = Path(tmp_name)
@@ -99,16 +147,23 @@ class JsonStore:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
+            if self._path.exists():
+                shutil.copy2(self._path, self._backup_path)
             tmp_path.replace(self._path)
         except OSError as exc:
             tmp_path.unlink(missing_ok=True)
             raise StoreError(f"could not write snapshot to {self._path}") from exc
 
     def upsert(self, key: str, record: dict[str, Any]) -> dict[str, Any]:
-        """Merge one record into the snapshot without shrinking it, then persist."""
-        snapshot = self.read()
-        assessments = dict(snapshot["assessments"])
-        assessments[key] = merge_without_shrinking(assessments.get(key, {}), record)
-        snapshot["assessments"] = assessments
-        self.write(snapshot)
+        """Merge one record into the snapshot without shrinking it, then persist.
+
+        The read, the merge and the write are held under one exclusive lock, so a concurrent
+        worker cannot read the same snapshot and overwrite this record.
+        """
+        with self._exclusive():
+            snapshot = self.read()
+            assessments = dict(snapshot["assessments"])
+            assessments[key] = merge_without_shrinking(assessments.get(key, {}), record)
+            snapshot["assessments"] = assessments
+            self.write(snapshot)
         return snapshot

@@ -15,9 +15,9 @@ OUT="${1:-appstore-package/pree-upload.zip}"
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
 
-INCLUDE="Dockerfile .dockerignore requirements.txt requirements.in requirements-dev.txt \
-requirements-dev.in pyproject.toml sonar-project.properties .python-version .env.example \
-README.md src tests docs scripts"
+INCLUDE="Dockerfile .dockerignore .gitignore requirements.txt requirements.in \
+requirements-dev.txt requirements-dev.in pyproject.toml sonar-project.properties \
+.python-version .env.example README.md src tests docs scripts"
 
 for entry in $INCLUDE; do
   if [ ! -e "$entry" ]; then
@@ -36,8 +36,8 @@ echo "package: wrote $OUT"
 echo "--- archive root ---"
 unzip -l "$OUT" | awk 'NR>3 && $4 !~ /\// {print $4}' | head -20
 
-for banned in .env .git/ .venv/ node_modules/; do
-  if unzip -l "$OUT" | grep -q "$banned"; then
+for banned in .env .git .venv node_modules coverage; do
+  if unzip -Z1 "$OUT" | grep -qE "^(.*/)?${banned}(/|$)"; then
     echo "package: banned entry $banned present in the archive" >&2
     exit 1
   fi

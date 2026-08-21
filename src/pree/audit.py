@@ -15,8 +15,14 @@ _LOGGER_NAME = "pree.audit"
 
 
 def build_logger(stream: Any = None) -> logging.Logger:
-    """Return the audit logger, wired to a single-line formatter exactly once."""
-    logger = logging.getLogger(_LOGGER_NAME)
+    """Return the audit logger, wired to a single-line formatter.
+
+    An explicitly supplied stream gets its own logger, because handlers are cached per logger
+    name: sharing one name meant the first caller's stream won and every later injection was
+    silently ignored.
+    """
+    name = _LOGGER_NAME if stream is None else f"{_LOGGER_NAME}.{id(stream):x}"
+    logger = logging.getLogger(name)
     if not logger.handlers:
         handler = logging.StreamHandler(stream or sys.stdout)
         handler.setFormatter(logging.Formatter("%(message)s"))

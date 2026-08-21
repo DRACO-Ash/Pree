@@ -81,14 +81,24 @@ def _resolve_data_dir(env: dict[str, str]) -> Path:
     return path
 
 
-def _validate_origin_pairing(token: str | None, origin: str | None, environment: str) -> None:
-    """Fail closed on the two unsafe token and origin pairings in production.
+def _validate_production_auth(token: str | None, origin: str | None, environment: str) -> None:
+    """Fail closed on every unsafe production posture.
 
-    A token without an allowed origin, or a token with a wildcard origin, would expose a
-    credentialed endpoint to any caller. Refuse to start rather than serve it.
+    Three postures are refused, not two. The absent token is the most dangerous of them and
+    was the one originally missed: with no token the gate is open, so production would serve
+    read and write of the assessment store to any caller that can reach the ingress. The
+    store reveals what the operator is watching and what they judge dangerous, so an open
+    gate is a disclosure, not a convenience. Development is the only place the open mode is
+    reachable.
     """
-    if environment != "production" or token is None:
+    if environment != "production":
         return
+    if token is None:
+        raise ConfigError(
+            "Refusing to start: PREE_ENV is 'production' with no PREE_TEAM_TOKEN. "
+            "Production must never serve the assessment store unauthenticated. "
+            "Set PREE_TEAM_TOKEN and PREE_ALLOWED_ORIGIN together."
+        )
     if origin is None:
         raise ConfigError(
             "Refusing to start: PREE_TEAM_TOKEN is set with no PREE_ALLOWED_ORIGIN. "
@@ -113,7 +123,7 @@ def load_config(env: dict[str, str] | None = None) -> Config:
 
     token = _read(source, "PREE_TEAM_TOKEN")
     origin = _read(source, "PREE_ALLOWED_ORIGIN")
-    _validate_origin_pairing(token, origin, environment)
+    _validate_production_auth(token, origin, environment)
 
     return Config(
         port=_resolve_port(source),

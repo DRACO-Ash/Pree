@@ -10,7 +10,7 @@ from fastapi import FastAPI
 
 from .app import create_app
 from .config import load_config
-from .store import JsonStore
+from .store import JsonStore, StoreError
 
 
 def build() -> FastAPI:
@@ -24,9 +24,13 @@ def build() -> FastAPI:
     try:
         store.seed()
         storage_state = "accepted"
-    except OSError:
-        # The pod may still serve liveness and diagnostics, which is what makes a storage
-        # fault diagnosable rather than a silent kill. One decisive line records it.
+    except (OSError, StoreError):
+        # StoreError is caught alongside OSError deliberately. The store raises its own
+        # error class for a corrupt or truncated snapshot, which is exactly the state a crash
+        # mid-write or a rollback leaves behind. Catching only OSError let that escape during
+        # module import, so gunicorn could not import the app and the pod never bound: no
+        # liveness path, no diagnostics, just CrashLoopBackOff and one traceback. The pod must
+        # stay up and diagnosable when storage is the thing that is broken.
         storage_state = "refused"
     # One decisive boot line to stdout, which is where the platform collects pod logs.
     print(

@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from tests.conftest import TEST_TOKEN, make_config
 
 from pree.security import MAX_ACTOR_LENGTH, AuthError, authorise, sanitise_actor, token_matches
+from tests.conftest import TEST_TOKEN, make_config
 
 
 def test_token_compare_accepts_the_exact_token_only() -> None:

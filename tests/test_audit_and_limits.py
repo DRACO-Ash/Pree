@@ -73,3 +73,25 @@ def test_tracked_keys_are_bounded_so_a_key_spray_cannot_grow_memory_without_limi
     for index in range(50):
         limiter.allow(f"actor-{index}")
     assert len(limiter._hits) <= 4
+
+
+def test_eviction_never_resets_a_bucket_that_is_over_its_limit() -> None:
+    """Insertion-order eviction let a spray of fresh keys reopen a throttled key's window."""
+    now = [0.0]
+    limiter = RateLimiter(1, 60.0, clock=lambda: now[0], max_keys=3)
+    assert limiter.allow("victim") is True
+    assert limiter.allow("victim") is False
+    for index in range(20):
+        limiter.allow(f"spray-{index}")
+    assert limiter.allow("victim") is False, "the throttled bucket was evicted and reset"
+
+
+def test_expired_buckets_are_reclaimed_before_active_ones() -> None:
+    now = [0.0]
+    limiter = RateLimiter(5, 10.0, clock=lambda: now[0], max_keys=2)
+    limiter.allow("stale-one")
+    limiter.allow("stale-two")
+    now[0] = 100.0
+    limiter.allow("fresh")
+    assert "fresh" in limiter._hits
+    assert len(limiter._hits) <= 2

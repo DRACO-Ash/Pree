@@ -21,7 +21,9 @@ echo "--- lint ---"
 ruff check src tests
 
 echo "--- types ---"
-mypy
+# Both trees. Checking only the package left the tests.* override dead configuration,
+# implying a check that was never happening.
+mypy src/pree tests
 
 echo "--- tests with coverage ---"
 # Cobertura XML at coverage.xml is the artefact the App Store quality gate reads. A bare

@@ -6,7 +6,10 @@ requires-python = "==3.12.*"
 
 [tool.ruff]
 line-length = 100
-src = ["src", "tests"]
+# Both roots, and the project root itself. Without "." the `tests` package resolved as
+# first-party in a cached repository run and third-party in a clean archive checkout, so import
+# order passed locally and failed the platform's check stage on the identical files.
+src = [".", "src"]
 target-version = "py312"
 
 [tool.ruff.lint]
@@ -57,6 +60,7 @@ disallow_untyped_defs = false
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q --strict-markers --strict-config"
+markers = ["anyio: async test driven by the anyio pytest plugin"]
 
 [tool.coverage.run]
 source = ["src/pree"]

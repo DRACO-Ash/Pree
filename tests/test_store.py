@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -125,3 +126,77 @@ def test_a_failed_write_fails_closed_and_leaves_no_temporary_file(
     with pytest.raises(StoreError, match="could not write snapshot"):
         store.write({"schema_version": SCHEMA_VERSION, "assessments": {"a:b": {}}})
     assert not list(data_dir.glob("*.tmp"))
+
+
+def test_a_refused_write_leaves_every_prior_record_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The durability property the earlier no-temporary-file assertion did not cover.
+
+    The previous implementation moved the live snapshot aside before writing its replacement,
+    so a refused write left no snapshot at all: the dataset then read as empty, the API
+    answered 404 for records that still existed, and the next write destroyed the backup too.
+    """
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    store.upsert("keep:one", {"score": 1.0})
+    store.upsert("keep:two", {"score": 2.0})
+
+    def refuse(_: int) -> None:
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(os, "fsync", refuse)
+    with pytest.raises(StoreError):
+        store.upsert("new:three", {"score": 3.0})
+    monkeypatch.undo()
+
+    surviving = store.read()["assessments"]
+    assert sorted(surviving) == ["keep:one", "keep:two"]
+    assert surviving["keep:one"]["score"] == 1.0
+    # And the dataset must not shrink on the next successful write.
+    after = store.upsert("new:four", {"score": 4.0})
+    assert sorted(after["assessments"]) == ["keep:one", "keep:two", "new:four"]
+
+
+def test_a_missing_primary_snapshot_recovers_from_the_backup(tmp_path: Path) -> None:
+    """An interrupted write must not present a populated store as an empty one."""
+    data_dir = tmp_path / "data"
+    store = JsonStore(data_dir)
+    store.seed()
+    store.upsert("keep:one", {"score": 1.0})
+    store.upsert("keep:two", {"score": 2.0})
+    (data_dir / "assessments.json").unlink()
+    recovered = store.read()["assessments"]
+    assert "keep:one" in recovered
+
+
+def test_two_concurrent_upserts_both_survive(tmp_path: Path) -> None:
+    """The image runs more than one worker over one whole-file snapshot.
+
+    Without a lock across the read, the merge and the write, two workers interleave and one
+    assessment is silently lost under ordinary load, not under attack.
+    """
+    data_dir = tmp_path / "data"
+    JsonStore(data_dir).seed()
+    errors: list[BaseException] = []
+
+    def upsert(name: str) -> None:
+        try:
+            for index in range(15):
+                JsonStore(data_dir).upsert(f"{name}:cand-{index}", {"score": float(index)})
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=upsert, args=("worker-a",)),
+        threading.Thread(target=upsert, args=("worker-b",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors, errors
+    keys = JsonStore(data_dir).read()["assessments"]
+    assert len([k for k in keys if k.startswith("worker-a:")]) == 15
+    assert len([k for k in keys if k.startswith("worker-b:")]) == 15

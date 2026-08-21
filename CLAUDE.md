@@ -38,7 +38,12 @@ sh scripts/simulate-pipeline.sh                             simulate the platfor
 docker build -t pree .                                      build the image
 ```
 
-The loop runs `ruff format --check`, `ruff check`, `mypy`, `coverage run -m pytest` with a
+
+`scripts/simulate-pipeline.sh` exits 0 only when every stage including the image build is
+green, and 2 when every stage except containerize is green and the container leg is deferred
+to Continuous Integration for want of a Docker daemon. Exit 2 is not a pass.
+
+The loop runs `ruff format --check`, `ruff check`, `mypy` over the source and the tests, `coverage run -m pytest` with a
 Cobertura report at `coverage.xml`, and `pip-audit`. Coverage must be at least 80%; the gate
 reads the report artefact, not the suite.
 

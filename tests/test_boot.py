@@ -48,3 +48,26 @@ def test_boot_fails_closed_on_an_unsafe_environment(monkeypatch: pytest.MonkeyPa
     monkeypatch.delenv("PREE_ALLOWED_ORIGIN", raising=False)
     with pytest.raises(ConfigError, match="no PREE_ALLOWED_ORIGIN"):
         build()
+
+
+def test_a_corrupt_snapshot_still_leaves_a_live_diagnosable_pod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The state a crash mid-write or a rollback leaves behind must not kill the pod.
+
+    The store raises its own StoreError for a corrupt snapshot, which an OSError-only handler
+    did not catch. It escaped during module import, so gunicorn could not import the app and
+    the pod never bound: no liveness path, no diagnostics, just CrashLoopBackOff.
+    """
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "assessments.json").write_text("{not json at all", encoding="utf-8")
+    monkeypatch.setenv("PREE_DATA_DIR", str(data_dir))
+    monkeypatch.delenv("PREE_TEAM_TOKEN", raising=False)
+    app = build()
+    assert "storage=refused" in capsys.readouterr().out
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200
+        assert client.get("/").status_code == 200
+        # The read-out is reachable, which is what makes the fault diagnosable at all.
+        assert client.get("/diagnostics").status_code == 200

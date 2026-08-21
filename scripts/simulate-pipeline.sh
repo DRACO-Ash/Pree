@@ -24,8 +24,29 @@ unzip -q "$WORK/upload.zip" -d "$WORK/checkout"
 printf 'stages:\n  - generated-by-the-platform\n' > "$WORK/checkout/.gitlab-ci.yml"
 
 echo "=== stage: install ==="
-python3 -m venv "$WORK/venv"
-"$WORK/venv/bin/pip" install --quiet --require-hashes -r "$WORK/checkout/requirements-dev.txt"
+# Use the PINNED interpreter, not whatever python3 happens to be. Validating against an
+# interpreter the image will never run is the opposite of a high-fidelity simulation.
+# uv is preferred where present because it resolves the pin itself; a bare python3.12 on PATH
+# may be a distribution build with ensurepip split out, which cannot create a usable venv.
+PYV=$(cat "$ROOT/.python-version")
+if command -v uv >/dev/null 2>&1; then
+  uv venv --python "$PYV" "$WORK/venv" >/dev/null
+  uv pip install --python "$WORK/venv/bin/python" --quiet \
+    --require-hashes -r "$WORK/checkout/requirements-dev.txt"
+elif command -v "python$PYV" >/dev/null 2>&1; then
+  "python$PYV" -m venv "$WORK/venv"
+  "$WORK/venv/bin/pip" install --quiet --require-hashes \
+    -r "$WORK/checkout/requirements-dev.txt"
+else
+  echo "simulate: python$PYV is required (pinned in .python-version)" >&2
+  exit 1
+fi
+RESOLVED=$("$WORK/venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+if [ "$RESOLVED" != "$PYV" ]; then
+  echo "simulate: resolved python $RESOLVED does not match the pinned $PYV" >&2
+  exit 1
+fi
+echo "install: python $RESOLVED from the hash-locked requirements"
 
 echo "=== stage: check and test (GITLAB_CI=true, at the archive root) ==="
 cd "$WORK/checkout"

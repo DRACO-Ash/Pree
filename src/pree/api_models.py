@@ -1,7 +1,15 @@
 """Request and response models. Boundary validation happens here, before any handler runs.
 
 Every field carries an explicit range. An out-of-range or unknown field is rejected with 422
-by the framework rather than coerced, which is the fail-closed reading of untrusted input.
+rather than coerced, which is the fail-closed reading of untrusted input. Two settings make
+that claim true rather than aspirational:
+
+* ``strict=True``. Without it the validator runs in lax mode and quietly coerces, so the
+  string ``"5"`` was accepted as ``5.0`` and scored, while the docstring claimed otherwise.
+* ``allow_inf_nan=False``. ``Infinity``, ``-Infinity``, ``NaN`` and an overflowing literal
+  such as ``1e400`` are non-standard JSON that Python's parser accepts. Left permitted, the
+  value reached the framework's default error handler, which cannot serialise a non-finite
+  float, so a boundary rejection became a 500.
 """
 
 from __future__ import annotations
@@ -19,20 +27,24 @@ class IndicatorPayload(BaseModel):
     An omitted field means not observed, and is excluded from the score rather than defaulted.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
-    closest_approach_km: float | None = Field(default=None, ge=0.0, le=1_000_000.0)
-    relative_velocity_kms: float | None = Field(default=None, ge=0.0, le=100.0)
+    closest_approach_km: float | None = Field(
+        default=None, ge=0.0, le=1_000_000.0, allow_inf_nan=False
+    )
+    relative_velocity_kms: float | None = Field(default=None, ge=0.0, le=100.0, allow_inf_nan=False)
     manoeuvres_in_window: int | None = Field(default=None, ge=0, le=10_000)
-    baseline_manoeuvres: float | None = Field(default=None, ge=0.0, le=10_000.0)
-    photometric_sigma: float | None = Field(default=None, ge=-100.0, le=100.0)
+    baseline_manoeuvres: float | None = Field(
+        default=None, ge=0.0, le=10_000.0, allow_inf_nan=False
+    )
+    photometric_sigma: float | None = Field(default=None, ge=-100.0, le=100.0, allow_inf_nan=False)
     rf_emissions_detected: bool | None = None
 
 
 class AssessRequest(BaseModel):
     """One assessment request: a protected asset, a candidate, and the evidence."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     protected_asset_id: str = Field(min_length=1, max_length=MAX_ID_LENGTH, pattern=ID_PATTERN)
     candidate_id: str = Field(min_length=1, max_length=MAX_ID_LENGTH, pattern=ID_PATTERN)

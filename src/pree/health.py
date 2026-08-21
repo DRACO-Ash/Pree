@@ -8,7 +8,8 @@ Three probe shapes, deliberately distinct:
 * Storage proof. A separate path performs a real WRITE, not an existence check, because an
   existence check passes on a read-only or root-owned mount. It races a hard timeout
   strictly shorter than the platform probe, and its 503 body names the resolved directory
-  and the exact errno so a screenshot is a full diagnosis.
+  and the exact errno so a screenshot is a full diagnosis. A saturated probe pool is itself
+  reported, as EBUSY, rather than being mistaken for a timeout.
 * Diagnostics. A secret-free read-out with every plausible field present at once, reporting
   each critical input as a boolean and a length, never a value.
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import errno
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -63,26 +65,64 @@ def _write_probe(data_dir: Path) -> None:
     target.unlink(missing_ok=True)
 
 
-def probe_storage(data_dir: Path, executor: ThreadPoolExecutor) -> StorageProbe:
-    """Prove storage with a real write, racing a hard timeout.
+class StorageProber:
+    """Runs the storage probe on a bounded pool, and never blocks on a saturated one.
 
-    The write runs on a worker thread so a hung mount cannot block the event loop. A timeout
-    is reported as ETIMEDOUT, which is the honest reading: the mount neither accepted nor
-    refused the write.
+    A hung mount leaves its worker thread blocked forever. With a plain shared pool, later
+    probes then queue behind the dead ones and every answer becomes a timeout produced by
+    queue starvation rather than by a fresh observation, so the diagnostics read-out stops
+    reporting the storage state it exists to report. Tracking in-flight probes lets a
+    saturated pool be reported as exactly that, immediately and honestly, as EBUSY.
     """
-    started = time.monotonic()
-    directory = str(data_dir)
-    try:
-        executor.submit(_write_probe, data_dir).result(timeout=STORAGE_PROBE_TIMEOUT_SECONDS)
-    except FutureTimeout:
+
+    def __init__(self, max_workers: int = 2) -> None:
+        self._max_workers = max_workers
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="storage-probe"
+        )
+        self._guard = threading.Lock()
+        self._in_flight = 0
+
+    def _claim(self) -> bool:
+        with self._guard:
+            if self._in_flight >= self._max_workers:
+                return False
+            self._in_flight += 1
+            return True
+
+    def _release(self) -> None:
+        with self._guard:
+            self._in_flight -= 1
+
+    def probe(self, data_dir: Path) -> StorageProbe:
+        """Prove storage with a real write, racing a hard timeout."""
+        directory = str(data_dir)
+        if not self._claim():
+            return StorageProbe(False, directory, errno.EBUSY, "EBUSY", 0)
+        started = time.monotonic()
+        try:
+            self._executor.submit(_write_probe, data_dir).result(
+                timeout=STORAGE_PROBE_TIMEOUT_SECONDS
+            )
+        except FutureTimeout:
+            # The worker is still blocked, so the slot stays claimed until the write returns.
+            # That is deliberate: pretending the slot is free would queue the next probe
+            # behind a thread that may never finish.
+            elapsed = int((time.monotonic() - started) * 1000)
+            return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
+        except OSError as exc:
+            self._release()
+            elapsed = int((time.monotonic() - started) * 1000)
+            code = exc.errno
+            name = errno.errorcode.get(code) if code is not None else None
+            return StorageProbe(False, directory, code, name, elapsed)
+        self._release()
         elapsed = int((time.monotonic() - started) * 1000)
-        return StorageProbe(False, directory, errno.ETIMEDOUT, "ETIMEDOUT", elapsed)
-    except OSError as exc:
-        elapsed = int((time.monotonic() - started) * 1000)
-        code = exc.errno
-        name = errno.errorcode.get(code) if code is not None else None
-        return StorageProbe(False, directory, code, name, elapsed)
-    return StorageProbe(True, directory, None, None, int((time.monotonic() - started) * 1000))
+        return StorageProbe(True, directory, None, None, elapsed)
+
+    def shutdown(self) -> None:
+        """Release the pool. A blocked worker is not waited on; it would never return."""
+        self._executor.shutdown(wait=False)
 
 
 def diagnostics(config: Config, probe: StorageProbe) -> dict[str, Any]:

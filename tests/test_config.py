@@ -102,3 +102,31 @@ def test_unknown_environment_name_is_rejected(tmp_path: Path) -> None:
 
 def test_build_id_falls_back_to_unknown_rather_than_a_guess(tmp_path: Path) -> None:
     assert load_config({"PREE_DATA_DIR": str(tmp_path)}).build_id == "unknown"
+
+
+def test_production_refuses_to_start_with_no_token_at_all(tmp_path: Path) -> None:
+    """The absent token was the posture originally missed.
+
+    The pairing check returned early whenever the token was None, so it caught a token with a
+    bad origin and waved through no token at all. That left production serving read and write
+    of the assessment store to any caller reaching the ingress.
+    """
+    with pytest.raises(ConfigError, match="no PREE_TEAM_TOKEN"):
+        load_config({"PREE_ENV": "production", "PREE_DATA_DIR": str(tmp_path)})
+
+
+def test_production_refuses_a_wildcard_origin_even_with_no_token(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="no PREE_TEAM_TOKEN"):
+        load_config(
+            {
+                "PREE_ENV": "production",
+                "PREE_ALLOWED_ORIGIN": "*",
+                "PREE_DATA_DIR": str(tmp_path),
+            }
+        )
+
+
+def test_development_is_the_only_place_the_open_mode_is_reachable(tmp_path: Path) -> None:
+    config = load_config({"PREE_DATA_DIR": str(tmp_path)})
+    assert config.auth_enabled is False
+    assert config.is_production is False
