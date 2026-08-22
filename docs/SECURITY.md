@@ -106,6 +106,8 @@ the assessment store.
 | Only vetted RUN commands may touch an executable directory | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
 | The base image is pinned to the vetted digest in both stages | `Dockerfile` | `test_every_base_image_is_pinned_by_digest` |
 | The probe exemption is per path and per method | `src/pree/app.py` | `test_the_probe_exemption_is_per_path_and_per_method` |
+| The Dockerfile parser follows BuildKit's continuation rule | `tests/test_boot_contract.py` | `test_the_parser_follows_buildkit_continuation_semantics` |
+| The sentence splitter does not break at an abbreviation | `tests/test_boot_contract.py` | `test_the_sentence_splitter_does_not_break_at_an_abbreviation` |
 | Production refuses a cleartext allowed origin | `src/pree/config.py` | `test_production_refuses_a_cleartext_allowed_origin` |
 | The access log redacts a query string | `src/pree/audit.py` | `test_the_access_log_filter_redacts_a_query_string` |
 | A malformed store key is refused at the boundary | `src/pree/app.py` | `test_a_malformed_store_key_is_refused_at_the_boundary` |
@@ -906,15 +908,8 @@ first time the wrong result was written into this document as a completed fix. T
 the plain substring, with the false positives that implies, and the paragraph is corrected in
 place rather than quietly reworded.
 
-Five minors, and one of them I could not reproduce. The review reported that the suppressed 405
-on a probe path dropped `exc.headers`, leaving those six paths without an `Allow` header, which
-RFC 9110 makes a MUST. Measured with and without that argument, on HEAD, DELETE and PUT against
-`/healthz/storage`, `/healthz` and `/diagnostics`, every response carried `allow: GET`, because
-Starlette's router sets the header on the outgoing response rather than only on the exception it
-raises. The argument is passed through anyway, because it is right in general and free: if that
-branch ever handles a 429, dropping `Retry-After` would tell a compliant client to retry in a
-tight loop. It is recorded here as a non-reproduction rather than as a fix, and the test that
-asserts the header says in its own docstring that it will not fail if the argument is removed.
+Five minors. Four are below; the fifth I recorded as a non-reproduction and I was wrong about
+it, which the next review proved. That correction is in the twentieth-round entry.
 `HEAD` was exempted on `/healthz/storage`, which serves only GET, so a 405 that can never be a
 platform probe was unmetered: 600 of 600 admitted, 33,000 bytes of access log in 0.62 seconds.
 The exemption is now per path and per method, which is what "the exemption is for the probe, not
@@ -933,6 +928,64 @@ this repository immediately, "a verdict is cached for two seconds" among them. A
 wolf gets relaxed rather than obeyed, so the pairing is not done and the boundary is written into
 the test's own docstring. Widening this guard has now cost more than it bought twice running,
 which is the point at which the right answer is to stop widening it and say where it ends.
+
+Twentieth review: one blocker, three majors, three minors. And the most important item is not a
+defect in the app: it is that the previous round's write-up recorded a real finding as a
+non-reproduction, and a maintainer reading it would have deleted a load-bearing argument.
+
+The nineteenth review reported that the audit-suppressed 405 dropped the `Allow` header. I
+reported that I could not reproduce it, in four places: the code comment, the test docstring,
+this policy and the changelog. All four were wrong. Starlette raises the 405 with `Allow` on the
+EXCEPTION and sets nothing on the response, so removing `headers=exc.headers` from the suppressed
+branch drops the header on all six probe paths and turns the test red. My measurement had removed
+the argument from the OTHER branch, the one that serves `/diagnostics`, and then measured the
+probe paths, which the suppressed branch serves. The mutation was adjacent to the control rather
+than on it, which is precisely the shape of the contaminated-directory error one round earlier.
+Two rounds running, a measurement of mine was wrong in the direction of reporting a control
+sound, and the second time it licensed deleting one. The four places are corrected, and the test
+now asserts the exact `Allow` set rather than a substring.
+
+The blocker was a Dockerfile parser defect, and it is the fourth distinct one in this file.
+BuildKit's continuation rule is `([^\\])\\[ \t]*$`: a line ending in an ESCAPED backslash is not
+a continuation. This parser treated any trailing backslash as one, so
+`LABEL org.opencontainers.image.title=pree\\` followed by `USER root` swallowed the USER into
+the LABEL and it vanished from every assertion, while docker resolved the shipped stage's user to
+root with the boot contract green. The joiner was wrong in the same place: BuildKit concatenates
+continuation lines with nothing and this inserted a space, so `/usr/bi` + backslash + newline +
+`n/find` read as `/app/n/find` here and as `/usr/bin/find` to docker. Both are now BuildKit's own
+rule, taken from its parser source rather than approximated, and four fabrications turn them red.
+
+The third major was the RUN branch reading literals only while the COPY branch has refused `$`
+since round sixteen on the stated reasoning that chasing substitution forms is a losing game.
+Three forms walked through: `/usr/b?n/find` as a glob, `D=/usr/b; … ${D}in/find`, and a command
+substitution. The RUN branch now refuses `$`, a backtick, `?` and brackets, which the five vetted
+RUNs contain none of.
+
+Three minors. Splitting GET and HEAD into two routes to fix the duplicate-operation-id warning
+broke something quieter: Starlette builds a 405's `Allow` from the matched route's own methods, so
+a liveness path advertised `GET` alone while the resource serves HEAD, and the test could not see
+it because it asserted a substring. One route carries both methods now and the liveness paths are
+out of the development schema entirely, which is a trade stated in the code: FastAPI gives every
+method on one route the same operation id however that id is chosen, so a two-method route in the
+schema is always a duplicate. A correct `Allow` beats a dev-only schema entry for a path whose
+whole contract is "200, touches nothing", and the deployment sheet documents those five paths with
+a test pinning them.
+
+The sentence splitter cut at `e.g.`, `i.e.` and `min.`, so a floor written "e.g. 16 random
+characters" lost its subject to the previous half and passed; abbreviations are shielded now. A
+sentence introducing a table was never paired with the row carrying the number; it is now, but
+only when it ends in a colon, because pairing every trailing sentence flagged a true statement
+immediately. And `register_cors` carried a parameter it never called, which read as though the
+CORS layer consulted the metered-path exemption and was invisible to the coverage figure.
+
+One structural change came out of this round rather than out of a finding. Mutating the parser's
+continuation rule, its joiner and the abbreviation shielding each left all 289 tests green: the
+guards were load-bearing against the shipped Dockerfile and the parser underneath them was
+load-bearing against nothing. Every defect this file has had was a parser defect, and four of them
+were found by a reviewer rather than by the suite for exactly that reason. The parser now takes its
+text as a parameter and is tested directly on synthetic input, so the continuation rule, the
+joiner and the splitter each have a test that fails when they change. That is the difference
+between a guard and a guard that can be trusted, and it should have been there fifteen rounds ago.
 
 Each of these now has a named regression test in the control table above.
 

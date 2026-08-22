@@ -913,24 +913,32 @@ def test_every_liveness_path_answers_head_as_well_as_get(client: TestClient) -> 
 
 
 def test_every_method_not_allowed_names_the_methods_that_are(client: TestClient) -> None:
-    """RFC 9110 makes Allow a MUST on a 405, and this asserts it across every shape.
+    """RFC 9110 makes Allow a MUST on a 405, and this asserts the EXACT set on every shape.
 
-    A review reported that the audit-suppressed 405 on a probe path dropped the Allow header. I
-    could not reproduce that: Starlette's router sets Allow on the outgoing response, not only on
-    the exception it raises, so the header survives whether or not the handler forwards
-    `exc.headers`. This test therefore asserts a property the framework provides rather than one
-    this code provides, and it is recorded as such: it will not fail if that argument is removed.
-    It is worth keeping anyway, because the property is part of the app's HTTP contract and a
-    future handler that builds its own 405 would break it.
+    This test is load-bearing, and a previous version of its docstring said it was not. Starlette
+    raises the 405 with Allow on the EXCEPTION, so removing `headers=exc.headers` from the
+    audit-suppressed branch drops the header on all six probe paths and turns this red. The
+    docstring claimed a non-reproduction because the measurement removed the argument from the
+    other branch, which serves /diagnostics, and then measured the probe paths.
+
+    The exact set, not a substring: asserting `"GET" in allowed` could not see that splitting GET
+    and HEAD into two routes made a liveness path advertise `GET` alone while the resource also
+    serves HEAD, because Starlette builds Allow from the matched route's own methods.
     """
     for path in ("/healthz", "/", STORAGE_PROBE_PATH, "/diagnostics", "/v1/assess"):
         response = client.request("DELETE", path, headers=AUTH)
         assert response.status_code == 405, f"{path} gave {response.status_code}"
         allowed = response.headers.get("allow")
         assert allowed, f"405 on {path} carries no Allow header"
-        # The method the route actually serves, which is POST for the scoring path.
-        expected = "POST" if path == "/v1/assess" else "GET"
-        assert expected in allowed, f"405 on {path} allows {allowed!r}, not {expected}"
+        advertised = {method.strip() for method in allowed.split(",")}
+        expected = {
+            "/v1/assess": {"POST"},
+            STORAGE_PROBE_PATH: {"GET"},
+            "/diagnostics": {"GET"},
+        }.get(path, {"GET", "HEAD"})
+        assert advertised == expected, (
+            f"405 on {path} advertises {sorted(advertised)}; the resource serves {sorted(expected)}"
+        )
 
 
 def test_the_probe_exemption_is_per_path_and_per_method(tmp_path: Path) -> None:

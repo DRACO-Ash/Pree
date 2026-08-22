@@ -472,11 +472,10 @@ Nineteenth security review, two majors:
   `sshkeygen.sh`. My verification had reported that path refused because a leftover directory
   from the previous test iteration made a different net fire. The rule is the plain substring
   now, and the paragraph is corrected in place rather than reworded.
-● Reported and NOT reproduced: the suppressed 405 dropping `Allow`. Measured with and without
-  the argument, on three methods and three paths, every response carried `allow: GET`,
-  because Starlette's router sets it on the response rather than only on the exception. The
-  argument is forwarded anyway, since it is right in general, and recorded as a
-  non-reproduction rather than a fix.
+● The suppressed 405 dropped `Allow`, which RFC 9110 makes a MUST. The nineteenth-round entry
+  recorded this as a non-reproduction and that was WRONG: the measurement removed the argument
+  from the other branch, which serves `/diagnostics`, and then measured the probe paths. See the
+  twentieth-round entry.
 ● HEAD was exempt on `/healthz/storage`, which serves only GET, so an unmetered 405 that can
   never be a platform probe: 600 of 600 admitted. The exemption is per path and per method now.
 ● GET and HEAD on one route gave both the same OpenAPI operation id, so the development document
@@ -486,3 +485,22 @@ Nineteenth security review, two majors:
 ● The token guard's unit builder used adjacent-line pairs and lost to a three-line split. It
   builds sentences now, and the remaining pronoun-split residual is documented rather than
   chased, because pairing sentences flagged three true statements.
+
+Twentieth security review, one blocker and three majors:
+
+● **A recorded non-reproduction was wrong.** The suppressed 405 DOES drop `Allow` without
+  `headers=exc.headers`, on all six probe paths, and the test does turn red. My measurement had
+  mutated the adjacent branch. Corrected in the code comment, the test docstring, the policy and
+  this file; the test now asserts the exact `Allow` set.
+● BLOCKER: BuildKit treats a line ending in an ESCAPED backslash as complete, this parser treated
+  any trailing backslash as a continuation, so `LABEL …=pree\` followed by `USER root` swallowed
+  the USER and the container ran as root with the suite green. The rule is BuildKit's own now.
+● Continuation lines were joined with a space where BuildKit joins with nothing, so a path split
+  mid-token across a continuation resolved harmlessly here and to the real target for docker.
+● The RUN branch read literals only, so a glob, a shell variable and a command substitution each
+  reached `/usr/bin/find`. It refuses `$`, backticks, `?` and brackets now.
+● Splitting GET and HEAD into two routes made a liveness path advertise `Allow: GET` while the
+  resource serves HEAD. One route with both methods, out of the development schema.
+● The sentence splitter cut at `e.g.`; abbreviations are shielded. A sentence introducing a table
+  now pairs with the row carrying the number, when it ends in a colon.
+● `register_cors` carried a parameter it never called.

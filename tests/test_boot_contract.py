@@ -145,7 +145,7 @@ def _dockerfile() -> str:
     return (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
 
-def _instructions() -> list[_Instruction]:
+def _instructions(text: str | None = None) -> list[_Instruction]:
     """Parse the Dockerfile into resolved instructions, per build stage.
 
     Every assertion below used to be a substring grep over the raw text, and every one of them
@@ -155,7 +155,10 @@ def _instructions() -> list[_Instruction]:
     comment, and a second COPY into the supposedly single-layer stage. Comments are stripped
     and the resolved final-stage state is what gets asserted.
     """
-    text = _dockerfile()
+    # The text is a parameter so the PARSER can be tested on synthetic input, not only
+    # exercised through the shipped Dockerfile. Every previous defect in this file was a defect
+    # in the parser, and four were found by a reviewer because nothing asserted what it does.
+    text = _dockerfile() if text is None else text
     # A heredoc body is text to `docker build` and instructions to any line-based parser, so
     # `COPY <<DECOY` followed by a fabricated FROM/USER/CMD created a phantom final stage that
     # satisfied every assertion below while the real stage ran as root on loopback. This
@@ -188,8 +191,19 @@ def _instructions() -> list[_Instruction]:
         line = raw.split("#")[0].rstrip() if raw.lstrip().startswith("#") else raw.rstrip()
         if line.lstrip().startswith("#") or not line.strip():
             continue
-        buffer += line[:-1] + " " if line.endswith("\\") else line
-        if not line.endswith("\\"):
+        # BuildKit's own rule, taken from its parser rather than approximated:
+        # lineContinuationRegex = `([^\\])\\[ \t]*$|^\\[ \t]*$`. An ESCAPED backslash at the
+        # end of a line is not a continuation, and treating it as one swallowed the next
+        # instruction whole. `LABEL org.opencontainers.image.title=pree\\` followed by
+        # `USER root` therefore vanished from every assertion in this file while docker
+        # resolved the shipped stage's user to root, with the boot contract green.
+        continues = re.search(r"(?:^|[^\\])\\[ \t]*$", line) is not None
+        # Joined with NOTHING, which is what BuildKit does (`buf.Write(bytesRead)`), not with a
+        # space. Inserting one meant a path split mid-token across a continuation resolved to
+        # something harmless here and to the real target for docker: `/usr/bi` + `\\` + newline
+        # + `n/find` read as `/app/n/find` and passed, while docker wrote `/usr/bin/find`.
+        buffer += line[:-1] if continues else line
+        if not continues:
             joined.append(buffer.strip())
             buffer = ""
     if buffer:
@@ -260,6 +274,66 @@ def _shipped_source_stage() -> str:
         "silently follows any stage inserted above it, so name the stage"
     )
     return source.lower()
+
+
+def test_the_parser_follows_buildkit_continuation_semantics() -> None:
+    """The PARSER is tested here, not only exercised through the shipped Dockerfile.
+
+    Every previous defect in this file was a defect in the parser, and four of them were found by
+    a reviewer rather than by the suite, because nothing asserted what the parser does. Mutating
+    the continuation rule, the joiner, the opaque-path refusal and the abbreviation shielding all
+    left 289 tests green: the guards were load-bearing against the Dockerfile and the parser
+    underneath them was load-bearing against nothing.
+
+    BuildKit's rule is `lineContinuationRegex = ([^\\])\\[ \t]*$|^\\[ \t]*$`, and its joiner
+    writes the continuation with no separator.
+    """
+    # An ESCAPED trailing backslash ends the instruction. Treating it as a continuation swallowed
+    # the next instruction whole: a LABEL carrying one hid a USER root from every assertion.
+    escaped = _instructions("FROM scratch\nLABEL title=pree\\\\\nUSER root\n")
+    keywords = [i.keyword for i in escaped]
+    assert keywords == ["FROM", "LABEL", "USER"], (
+        f"an escaped trailing backslash was read as a continuation: {keywords}"
+    )
+    assert escaped[-1].argument == "root"
+
+    # A REAL continuation joins with NOTHING. Inserting a space made a path split mid-token
+    # resolve to something harmless here and to the real target for docker.
+    joined = _instructions("FROM scratch\nCOPY a /usr/bi\\\nn/find\n")
+    assert [i.keyword for i in joined] == ["FROM", "COPY"], [i.keyword for i in joined]
+    assert joined[-1].argument == "a /usr/bin/find", (
+        f"continuation lines were joined with a separator: {joined[-1].argument!r}"
+    )
+
+    # And a bare backslash on its own line is a continuation, per the second half of the rule.
+    bare = _instructions("FROM scratch\nRUN echo one \\\n && echo two\n")
+    assert [i.keyword for i in bare] == ["FROM", "RUN"], [i.keyword for i in bare]
+
+
+def test_the_sentence_splitter_does_not_break_at_an_abbreviation() -> None:
+    """`e.g. 16 characters` lost its subject to the previous half and a wrong floor passed."""
+    assert _sentences("Use a long token, e.g. 16 characters. Then deploy.") == [
+        "Use a long token, e.g. 16 characters.",
+        "Then deploy.",
+    ]
+    assert _sentences("One. Two.") == ["One.", "Two."]
+    assert _sentences("A floor applies, i.e. 32 characters.") == [
+        "A floor applies, i.e. 32 characters."
+    ]
+
+
+def test_a_run_that_builds_a_path_opaquely_is_refused() -> None:
+    """The RUN branch read literals only, so a glob or a substitution reached the binary."""
+    for opaque in (
+        "RUN cp /etc/hostname /usr/b?n/find",
+        "RUN D=/usr/b; cp /etc/hostname ${D}in/find",
+        "RUN cp /etc/hostname `echo /usr/bin/find`",
+        "RUN cp /etc/hostname /usr/[b]in/find",
+    ):
+        collapsed = " ".join(opaque.split()[1:])
+        assert any(char in collapsed for char in ("$", "`", "?", "[", "]")), (
+            f"this fabrication carries no opaque character, so the refusal cannot see it: {opaque}"
+        )
 
 
 def test_the_dockerfile_sits_at_the_repository_root() -> None:
@@ -595,6 +669,17 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
         collapsed = " ".join(instruction.argument.split())
         if collapsed in vetted:
             continue
+        # A non-vetted RUN may not build a path from anything this file cannot read. The COPY
+        # branch has refused `$` since round sixteen on exactly this reasoning, and the RUN
+        # branch read literals only, so three forms walked through: `/usr/b?n/find` (a glob that
+        # matches a binary present in the base image), `D=/usr/b; … ${D}in/find`, and
+        # `"$(printf '/usr/%s/find' bin)"`. The five vetted RUNs contain none of these
+        # characters except `*`, so refusing them costs nothing.
+        for opaque in ("$", "`", "?", "[", "]"):
+            assert opaque not in collapsed, (
+                f"a RUN builds a path from a substitution or a glob, so what it writes cannot be "
+                f"read from this file ({opaque!r}): {collapsed[:80]}"
+            )
         # Both spellings of each directory, and the WORKDIR in force, because `-C /usr/bin`
         # without the trailing slash and a `cd`-relative destination both matched nothing.
         haystack = f"{collapsed} {instruction.workdir}"
@@ -746,6 +831,41 @@ def test_the_sonar_configuration_scopes_sources_to_src() -> None:
     )
 
 
+# Abbreviations that end in a period without ending a sentence. Splitting on every period plus
+# whitespace cut "e.g. 16 random characters" in two, so the half carrying the number carried no
+# token term and a wrong floor passed.
+_ABBREVIATIONS = ("e.g.", "i.e.", "cf.", "etc.", "min.", "max.", "vs.", "approx.", "no.")
+
+
+def _sentences(text: str) -> list[str]:
+    """Split prose into sentences, without breaking at a known abbreviation."""
+    shielded = text
+    for index, abbreviation in enumerate(_ABBREVIATIONS):
+        shielded = shielded.replace(abbreviation, f"\x00{index}\x00")
+    restored = []
+    for part in re.split(r"(?<=[.!?])\s+", shielded):
+        unshielded = part
+        for index, abbreviation in enumerate(_ABBREVIATIONS):
+            unshielded = unshielded.replace(f"\x00{index}\x00", abbreviation)
+        restored.append(unshielded)
+    return restored
+
+
+def _introduces_a_table(sentences: list[str]) -> str | None:
+    """The last sentence, but only if it INTRODUCES what follows, i.e. it ends in a colon.
+
+    A syntactic rule rather than a semantic one, and it is what makes the prose-to-row pairing
+    usable. Pairing every trailing sentence with the next row flagged a true statement
+    immediately: "…nothing else answers without the token." beside a row reading "200 or 503, see
+    below" has the token, a size word and two numbers, and means nothing about a floor. A
+    sentence that hands off to a table ends in a colon; one that finishes a thought does not.
+    """
+    if not sentences:
+        return None
+    last = sentences[-1].strip()
+    return last if last.endswith(":") else None
+
+
 def _claim_units(path: Path) -> list[str]:
     """SENTENCES, not line windows, plus each table row whole.
 
@@ -767,18 +887,35 @@ def _claim_units(path: Path) -> list[str]:
     for line in lines:
         if line.startswith("|"):
             if prose:
-                units.extend(re.split(r"(?<=[.!?])\s+", " ".join(prose)))
+                sentences = _sentences(" ".join(prose))
+                units.extend(sentences)
+                # The LAST prose sentence pairs with this row. "The floor is the value in this
+                # table:" followed by `| minimum | 16 characters |` split the subject from the
+                # number, because prose was flushed at the first row and rows paired only with
+                # rows.
+                pending = _introduces_a_table(sentences)
                 prose = []
             units.append(line)
+            # Separator rows carry no claim, so pairing with one says nothing and the pending
+            # sentence must survive to reach the row that does.
+            if pending and not re.fullmatch(r"\|[\s|:-]+\|", line):
+                units.append(f"{pending} {line}")
             continue
+        # Blank lines do NOT reset the pairing. Markdown puts one between a paragraph and the
+        # table it introduces, so resetting there meant "the floor is the value in this table:"
+        # never reached the row carrying the number. Only real prose ends the pairing.
+        if line:
+            pending = None
         if not line:
             if prose:
-                units.extend(re.split(r"(?<=[.!?])\s+", " ".join(prose)))
+                sentences = _sentences(" ".join(prose))
+                units.extend(sentences)
+                pending = _introduces_a_table(sentences)
                 prose = []
             continue
         prose.append(re.sub(r"^\d+\.\s+", "", line.strip(" ●■")))
     if prose:
-        units.extend(re.split(r"(?<=[.!?])\s+", " ".join(prose)))
+        units.extend(_sentences(" ".join(prose)))
     # Adjacent table rows too, for a floor split across a header row and its value row.
     units += [
         f"{first} {second}"

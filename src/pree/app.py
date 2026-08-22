@@ -467,15 +467,15 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         # request is metered now so the flood is bounded either way. Every other rejection,
         # including a 405 on a real route, is still audited.
         if _unaudited_rejection(request, exc.status_code):
-            # exc.headers is passed through, and this is correctness by construction rather
-            # than a repair. A review reported that suppressing the audit line here also
-            # dropped the Allow header, which RFC 9110 makes a MUST on a 405. I could not
-            # reproduce it: measured with and without this argument, on HEAD, DELETE and PUT
-            # against /healthz/storage, /healthz and /diagnostics, every response carried
-            # `allow: GET`, because Starlette's router sets it on the outgoing response and not
-            # only on the exception. The argument stays because it is right in general: if this
-            # branch ever handles a 429, dropping Retry-After would tell a compliant client to
-            # retry in a tight loop. It is not, however, the fix for a defect I could observe.
+            # exc.headers is LOAD-BEARING here, and a previous version of this comment said it
+            # was not. Starlette raises the 405 with Allow on the EXCEPTION; nothing sets it on
+            # the response. Remove this argument and the six probe paths answer 405 with no
+            # Allow, which RFC 9110 makes a MUST, and the test that covers it turns red.
+            #
+            # The comment claimed a non-reproduction because the measurement removed the
+            # argument from the OTHER branch below, which serves /diagnostics, and then measured
+            # the probe paths, which this branch serves. Same class of error as the contaminated
+            # directory one round earlier: the mutation was adjacent to the control, not on it.
             return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
         audit_log.warning(
             json.dumps(
@@ -539,24 +539,31 @@ def register_health_routes(
 
     for path in LIVENESS_PATHS:
         # The storage proof lives on its own path below, where a hard timeout bounds it.
+        # ONE route carrying both methods, with an explicit operation id.
+        #
+        # FastAPI does not add HEAD for a GET route, so `HEAD /healthz` was a 405: wrong for a
+        # liveness path a probe may be configured to HEAD, and the cheapest way into the
+        # unmetered-405 amplification. Registering both on one route without an explicit id made
+        # FastAPI derive one id from an arbitrary member of the method set, so the development
+        # OpenAPI document gave GET and HEAD the same id and the verify loop carried a
+        # duplicate-operation-id warning on every run. Splitting them into two routes fixed the
+        # warning and broke something quieter: Starlette builds a 405's Allow header from the
+        # matched route's own methods, so `DELETE /healthz` advertised `GET` alone while the
+        # resource also serves HEAD. RFC 9110 wants the methods the RESOURCE supports. One route
+        # with a pinned id gives a correct Allow and a valid document at once.
         app.add_api_route(
             path,
             liveness,
-            methods=["GET"],
+            methods=["GET", "HEAD"],
             status_code=status.HTTP_200_OK,
-            include_in_schema=path == "/healthz",
-        )
-        # HEAD as its OWN route. FastAPI does not add HEAD for a GET route, so `HEAD /healthz`
-        # was a 405: wrong for a liveness path a probe may be configured to HEAD, and the
-        # cheapest way into the unmetered-405 amplification. Registering both methods on one
-        # route instead made FastAPI derive a single operation id from an arbitrary member of the
-        # method set, so the development OpenAPI document gave GET and HEAD the same id and
-        # emitted a duplicate-operation-id warning on every verify run. Two routes, one id each.
-        app.add_api_route(
-            path,
-            liveness,
-            methods=["HEAD"],
-            status_code=status.HTTP_200_OK,
+            # Out of the schema entirely, and that is a trade rather than an oversight. FastAPI
+            # generates one operation per METHOD from one route and gives them all the route's
+            # single operation id, so a two-method route in the schema is a duplicate id however
+            # the id is chosen: explicitly here, or derived. The alternatives were two routes,
+            # which made Allow advertise GET alone on a resource that serves HEAD, or leaving the
+            # document invalid. A correct Allow beats a dev-only schema entry for a path whose
+            # whole contract is "200, touches nothing", and the deployment sheet documents these
+            # five paths with a test pinning them to the code.
             include_in_schema=False,
         )
 
@@ -709,7 +716,6 @@ def register_cors(
     app: FastAPI,
     config: Config,
     audit_log: logging.Logger,
-    refuse_over_limit: Callable[[Request], Response | None],
     meter_preflight: Callable[[Request], Response | None],
 ) -> None:
     """Register CORS and the layer that normalises and meters what CORS answers itself.
@@ -923,7 +929,7 @@ def create_app(
     # hardening headers are registered after this and are therefore outermost. ---
     # Fail-closed by construction: only the configured origin, and load_config refuses to
     # start on a wildcard origin with a token, so by here the origin is absent or safe.
-    register_cors(app, config, audit_log, _refuse_over_limit, _meter_preflight)
+    register_cors(app, config, audit_log, _meter_preflight)
 
     # --- second-outermost: the framing guard. It has to be above CORS, because Starlette
     # answers a preflight inside the CORS middleware without calling down, so a preflight
