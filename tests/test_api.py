@@ -401,12 +401,25 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
     config = make_config(tmp_path)
     with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
         payload: dict[str, Any] = {"protected_asset_id": 1, "candidate_id": 2}
-        # Two shapes at once, because each defeats a different bound. Five 5,000-character
-        # keys sit under the 32 KiB body cap, so truncation and not the cap is what stops
-        # them; and MANY tiny keys exceed MAX_VALIDATION_ERRORS_LOGGED, so the cap is what
-        # stops those. The first version of this test sent only the five, which left the cap
-        # unasserted: deleting it wrote a 142,290-byte record with the suite green.
+        # THREE shapes at once, because each defeats a different bound, and body ORDER is
+        # load-bearing: pydantic reports errors in body order and only the first
+        # MAX_VALIDATION_ERRORS_LOGGED reach the record, so a shape appended after the tiny
+        # flood is outside the logged window and asserts nothing. All three sit inside it.
+        #
+        # Astral field NAMES are the shape this test did not have, and the omission cost a
+        # major: with `sanitise_log_part` reverted to the Unicode charset in ONE line, twelve
+        # of them wrote a 6,684-byte record against 548 shipped, and all 316 tests stayed
+        # green. The astral probe existed, but only in `_drive_every_error_shape`, which feeds
+        # no byte or charset assertion, and the `loc` rule is derived from the shipped scrub so
+        # it moves with the mutation. I recorded in three places that "astral inputs are in both
+        # bound tests"; they were in one.
+        payload.update({(chr(0x1D400) * 70) + str(index): 1 for index in range(5)})
+        # Five 5,000-character keys sit under the 32 KiB body cap, so truncation and not the
+        # cap is what stops them.
         payload.update({f"k{index}{'x' * 5_000}": 1 for index in range(5)})
+        # And MANY tiny keys exceed MAX_VALIDATION_ERRORS_LOGGED, so the cap is what stops
+        # those. The first version of this test sent only the long keys, which left the cap
+        # unasserted: deleting it wrote a 142,290-byte record with the suite green.
         payload.update({f"t{index}": 1 for index in range(MAX_VALIDATION_ERRORS_LOGGED * 20)})
         assert bounded.post("/v1/assess", json=payload, headers=AUTH).status_code == 422
 
@@ -424,6 +437,14 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
         for item in record["errors"]:
             for part in item["loc"]:
                 assert len(part) <= MAX_ACTOR_LENGTH
+                # The PROPERTY, not the byte arithmetic. A length bound in characters says
+                # nothing about bytes, and a whole-line ceiling depends on how many of the
+                # logged slots this payload happens to fill; this assertion fires on the first
+                # non-ASCII part whatever the slot count, which is what makes it robust to the
+                # one-line charset reversion rather than incidentally sensitive to it.
+                assert part.isascii() and part.isprintable(), (
+                    f"a non-ASCII or control character survived into a logged field name: {part!r}"
+                )
 
 
 def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path) -> None:
@@ -2438,7 +2459,11 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     # wider one admitted characters the scrub removes, so a reader concluded the separator was
     # preserved when it was being deleted, and a slash-preserving change to the scrub was
     # invisible in both directions.
-    "path": _Pattern(r"^[\w./%@:\- ]{1,160}$"),
+    # `(?a:` because `\w` in a str pattern is Unicode-aware, so this pin accepted every astral
+    # letter the scrub exists to strip and could not have caught the charset regression that
+    # `test_a_long_request_path_cannot_write_an_unbounded_audit_line` did. A pin wider than what
+    # the application can emit is not a pin.
+    "path": _Pattern(r"^(?a:[\w./%@:\- ]{1,160})$"),
     "reason": _Pattern(r"^[ -~]{0,512}$"),
     # Inside `validation_reject.errors`, which the flat scan never reached. `loc` echoes a
     # caller-supplied field name and the application scrubs each part, so the same derivation
@@ -2455,6 +2480,13 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
 # secret and reports its true duration inflates the correlated ceiling to fit; this one it cannot
 # reach. Measured in-process at 0 to 2 ms per call.
 ABSOLUTE_DURATION_CEILING_MS = 50
+# The smallest JSON a rejected field can be inside an object: `"a":1,` is six bytes, so a body
+# under MAX_BODY_BYTES cannot produce more than this many validation errors. Derived rather than
+# measured, because a measurement is a floor and a bound needs a ceiling; the honest maximum the
+# security gate could actually drive was 4,402, so this is loose by about a quarter rather than by
+# the six-fold factor MAX_BODY_BYTES gave it.
+MIN_BYTES_PER_REJECTED_FIELD = 6
+MAX_VALIDATION_ERROR_COUNT = MAX_BODY_BYTES // MIN_BYTES_PER_REJECTED_FIELD
 
 AUDIT_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     # Correlated at the call site, not bounded here: see the `bounds` override in the test.
@@ -2463,9 +2495,13 @@ AUDIT_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     # The TRUE total, not the logged cap. `error_count` is `len(exc.errors())` while the `errors`
     # list is truncated to MAX_VALIDATION_ERRORS_LOGGED, which is the point of reporting both: an
     # operator sees that more were rejected than are shown. Bounding it by the cap was wrong, and
-    # a body of twelve unknown fields proved it. The ceiling is the field count a body can carry
-    # under the size limit, which is what bounds the record.
-    "error_count": (0, MAX_BODY_BYTES),
+    # a body of twelve unknown fields proved it.
+    #
+    # Then MAX_BODY_BYTES was wrong the other way, and the comment here called it "the field count
+    # a body can carry" when it is a BYTE count. `len(exc.errors()) + 20000` passed. The ceiling is
+    # DERIVED below and the arithmetic is in the open, so the next reader can check it rather than
+    # trust it.
+    "error_count": (0, MAX_VALIDATION_ERROR_COUNT),
     "score": (0.0, 100.0),
     "evidence_coverage": (0.0, 1.0),
 }
@@ -2983,9 +3019,11 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
         f"application is using the actor scrub, whose empty case is the anonymous sentinel: "
         f"{sorted(set(scrubbed))}"
     )
-    # DISTINCT paths must stay distinct. The actor charset applied to a path deleted the separator,
-    # so `/v1/assess` and `/v1assess` produced an identical record and the field stopped
-    # identifying its subject. Both are driven by the exercise above.
+    # The separator survives, which is what these two assertions check and ALL they check. The
+    # comment here used to say "DISTINCT paths must stay distinct", which the assertions below do
+    # not test at all: they check that one probe path appears verbatim and that some path starts
+    # `/v1/`. Injectivity is asserted where it can be, as a property over colliding inputs, in
+    # tests/test_security.py::test_the_path_scrub_maps_distinct_paths_to_distinct_records.
     logged_paths = {found["path"] for found in emitted if "path" in found}
     assert "/nowhere-at-all" in logged_paths, (
         f"the 404 probe's path is not in the trail as written: {sorted(logged_paths)}"

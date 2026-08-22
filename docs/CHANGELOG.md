@@ -891,7 +891,8 @@ Security re-review, four majors and three minors, and the round's own correction
   operator's name may legitimately be non-Latin and the 64-character cap bounds it; caller-supplied
   data is ASCII-only. A single Unicode charset let `%F0%9D%90%80` (U+1D400, an astral LETTER that
   `\w` keeps) through, at twelve bytes each as a surrogate escape: a 160-character path wrote 1,802
-  bytes where the test asserted 416. Astral inputs are now in both bound tests.
+  bytes where the test asserted 416. Astral inputs were added to the path bound test; the claim
+  made here that they reached both was false, and the next review is recorded below.
 ● `error_count` was bounded by MAX_VALIDATION_ERRORS_LOGGED, and the application reports the TRUE
   total while capping only the `errors` list. The bound was wrong, not the application.
 ● The ENV allowlist is pinned as an exact literal frozenset, which closes the
@@ -909,3 +910,29 @@ Security re-review, four majors and three minors, and the round's own correction
   pre-release round: V0.1 is unreleased, every round hardens the same undelivered artefact, and
   `0.1.1` would assert a patch to a release that never happened. That reading is recorded in the
   test rather than left implicit. The stamp moves on delivery; the changelog row moves every round.
+
+Security re-review of the round above, one major and three minors:
+
+● The astral hole was closed in the CODE and asserted in only one of the two places it appeared.
+  Reverting `sanitise_log_part` to the Unicode charset, one line, wrote a 6,684-byte audit record
+  against 548 shipped with the whole suite green: the astral probe reached the body path only
+  through a helper feeding no byte or charset assertion, and the `loc` rule is derived from the
+  shipped scrub so it moves with any mutation of it. The astral shape is now first in body order,
+  because only the first ten errors reach a record, and each logged field name is asserted ASCII and
+  printable. The property, not a byte count, so it fires whatever the payload's slot arithmetic.
+● The path scrub DELETED refused characters, which is not injective, and the collisions landed on
+  legitimate routes: `GET /v1/,assess` was audited as `/v1/assess` and `GET /v1/assessments/a:b,c`
+  as `/v1/assessments/a:bc`, so an unauthenticated caller could put a route or a store key they
+  never requested into the audit trail. Refused characters are now percent-escaped, `%` is the
+  introducer and no longer passes through, and injectivity is asserted as a property over the
+  colliding inputs. Honest limit stated rather than implied: truncation cannot be injective, so the
+  guarantee holds up to the cap and no further.
+● `error_count` was bounded by MAX_BODY_BYTES, a BYTE count used as if it were a field count, so
+  `len(exc.errors()) + 20000` passed. The ceiling is now derived, `MAX_BODY_BYTES // 6`, with the
+  six-byte minimum field and the arithmetic in the open. The `path` value pin was Unicode-aware for
+  the same reason and is now ASCII, so it could catch the charset regression rather than admit it.
+● The suid sweep property pinned which predicates appear and nothing about their ARGUMENTS, so
+  `\( -type l -o -type l \)` with both literal copies brought into line left every test green while
+  the sweep cleared nothing: a symlink cannot carry a setuid bit. The argument to each `-type` is
+  pinned as `["f", "d"]`. The register's claim that the property "catches a change that keeps the
+  text plausible" was an over-claim about exactly this change, and is corrected where it was made.

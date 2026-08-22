@@ -1967,10 +1967,18 @@ all of which the then-current denylist missed.
 
 The property and the literals are **complementary, not ranked**. The literals catch anything that
 changes the command's text; the property catches a change that keeps the text plausible. Both are
-kept. The property now pins the start path as `["/usr/bin/find", "/"]` and the predicate set as
-exactly `{-xdev, -perm, -type, -o, -exec}`, rather than checking absence from a denylist, because
+kept. The property pins the start path as `["/usr/bin/find", "/"]` and the predicate set as exactly
+`{-xdev, -perm, -type, -o, -exec}`, rather than checking absence from a denylist, because
 enumerating what is refused will always be one short. With the start path pinned, the single-edit
-neutering turns four tests red. Verified in
+neutering turns four tests red.
+
+**And the sentence above about what the property catches was itself an over-claim, found by the
+next review.** The predicate set constrains which predicates appear and says nothing about their
+ARGUMENTS, so `\( -type l -o -type l \)` with both literal copies brought into line - three edits -
+left every test green while the sweep cleared nothing, because a symlink cannot carry a setuid bit.
+That is exactly "a change that keeps the text plausible", which the property was said to catch and
+did not. The argument to each `-type` is now pinned as `["f", "d"]`, and the three-edit attack turns
+the property red. Verified in
 `tests/test_boot_contract.py::test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits`.
 
 ### Security re-review after the engineering round: four majors, and the sentence the deploy needs
@@ -1986,8 +1994,16 @@ because the pattern is now the finding.
   deliberately, because an operator's name may legitimately be non-Latin and the 64-character cap
   bounds the cost. `_UNSAFE_ASCII_CHARS` and `_UNSAFE_PATH_CHARS` are `re.ASCII`, because that data
   is caller-supplied. Reverting the path charset to Unicode turns
-  `test_a_long_request_path_cannot_write_an_unbounded_audit_line` red; astral inputs are in both
-  bound tests, and the per-record assertion is `path.isascii() and path.isprintable()`.
+  `test_a_long_request_path_cannot_write_an_unbounded_audit_line` red, and the per-record assertion
+  is `path.isascii() and path.isprintable()`. **The claim that followed here, "astral inputs are in
+  both bound tests", was FALSE**, and the next review found it: they were in one. The astral probe
+  reached the body path only through `_drive_every_error_shape`, which feeds no byte or charset
+  assertion, and the `loc` rule is derived from the shipped scrub so it moves with any mutation of
+  it. Reverting `sanitise_log_part` in one line wrote a 6,684-byte record against 548 shipped with
+  all 316 tests green. Corrected: the astral shape is now FIRST in body order in
+  `test_a_rejected_body_cannot_write_an_unbounded_audit_line`, because pydantic reports in body
+  order and only the first ten errors reach the record, and each logged field name is asserted
+  `isascii() and isprintable()`.
 ● **A bound I wrote was wrong about the application, not the reverse.** `error_count` was bounded by
   `MAX_VALIDATION_ERRORS_LOGGED`. The handler reports the TRUE total and truncates only the `errors`
   list, which is the correct behaviour; the bound is now `MAX_BODY_BYTES`.

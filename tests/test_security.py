@@ -13,6 +13,7 @@ from pree.security import (
     AuthError,
     authorise,
     sanitise_actor,
+    sanitise_log_path,
     token_matches,
 )
 from tests.conftest import TEST_TOKEN, make_config
@@ -119,3 +120,67 @@ def test_actor_sanitisation_strips_log_forging_characters() -> None:
 
 def test_actor_sanitisation_caps_the_length() -> None:
     assert len(sanitise_actor("a" * 500)) == MAX_ACTOR_LENGTH
+
+
+def test_the_path_scrub_maps_distinct_paths_to_distinct_records() -> None:
+    """Deleting a refused character is not injective, and the collisions landed on real routes.
+
+    Measured by the security gate: `GET /v1/,assess` was audited as `path:"/v1/assess"` and
+    `GET /v1/assessments/a:b,c` as `path:"/v1/assessments/a:bc"`. Both name a route the caller
+    never requested, needing no token, so an unauthenticated caller could put a chosen route into
+    the audit trail and an analyst reading it would be misled. Escaping restores injectivity.
+
+    This asserts the PROPERTY over a set of inputs that collided, not a table of expected strings:
+    a table would be satisfied by editing the table, and the defect was a mapping, not a value.
+    """
+    # Each pair is a colliding input and the legitimate path it used to be recorded as. Every
+    # refused ASCII character in the charset appears at least once.
+    colliding = [
+        "/v1/,assess",
+        "/v1/assess",
+        "/v1/assessments/a:b,c",
+        "/v1/assessments/a:bc",
+        "/diagnostics;",
+        "/diagnostics",
+        "/health<z>",
+        "/healthz",
+        "/ping&",
+        "/ping",
+        "/v1/ass+ess",
+        "/v1/assess" + "\\",
+        "/v1/" + chr(0x1D400) + "assess",
+        "/v1/" + chr(0x1D401) + "assess",
+    ]
+    scrubbed = [sanitise_log_path(path, 160) for path in colliding]
+    assert len(set(scrubbed)) == len(colliding), (
+        "two distinct paths produced one audit record: "
+        f"{sorted({out for out in scrubbed if scrubbed.count(out) > 1})}"
+    )
+    for path, out in zip(colliding, scrubbed, strict=True):
+        assert out.isascii() and out.isprintable(), f"{path!r} scrubbed to {out!r}"
+        assert len(out) <= 160
+
+
+def test_the_path_scrub_escapes_a_literal_percent_so_the_escape_is_unambiguous() -> None:
+    """`%` is the introducer, so it cannot also pass through, or the mapping is ambiguous again.
+
+    Starlette hands over an already-decoded path, so a literal `%` can only have arrived as `%25`
+    and is written back as exactly that. No route this app serves contains one, so nothing
+    legitimate is affected; what this closes is `/v1/%2Cassess` being indistinguishable from the
+    escape of `/v1/,assess`.
+    """
+    assert sanitise_log_path("/v1/%2Cassess", 160) == "/v1/%252Cassess"
+    assert sanitise_log_path("/v1/,assess", 160) == "/v1/%2Cassess"
+    assert sanitise_log_path("/v1/%2Cassess", 160) != sanitise_log_path("/v1/,assess", 160)
+
+
+def test_the_path_scrub_is_not_claimed_injective_above_its_cap() -> None:
+    """The honest limit, asserted so it is not rediscovered as a surprise.
+
+    Truncation cannot be injective. Two paths agreeing on their first `limit` characters after
+    escaping still produce one record, and the docstring says so rather than implying a property
+    the function does not have.
+    """
+    first = "/v1/" + "a" * 200 + "one"
+    second = "/v1/" + "a" * 200 + "two"
+    assert sanitise_log_path(first, 160) == sanitise_log_path(second, 160)

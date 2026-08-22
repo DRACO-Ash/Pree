@@ -1101,6 +1101,23 @@ def test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits() -> None:
         f"the sweep must clear both bits for all three classes with an absolute chmod: "
         f"{collapsed[:80]}"
     )
+    # The ARGUMENT to each `-type`, which the predicate set above does not constrain at all. The
+    # security gate neutered the sweep with `\( -type l -o -type l \)` plus the two literals, three
+    # edits, and every test stayed green while the sweep cleared nothing: a symlink cannot carry a
+    # setuid bit. `-type` was in the vetted predicate set either way, so the vetted set said
+    # nothing about it. This is also the correction to the register's claim that the property
+    # "catches a change that keeps the text plausible": `f` to `l` is precisely such a change, and
+    # until this assertion existed the property caught none of it.
+    selectors = [
+        arguments[index + 1]
+        for index, word in enumerate(arguments)
+        if word == "-type" and index + 1 < len(arguments)
+    ]
+    assert selectors == ["f", "d"], (
+        f"the sweep must select regular files and directories and nothing else; a symlink cannot "
+        f"carry a setuid bit, so a `-type l` sweep clears nothing while reading correctly: "
+        f"{selectors}"
+    )
 
 
 def test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit() -> None:

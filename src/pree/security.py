@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hmac
 import re
+from collections.abc import Callable
 
 from .config import Config
 
@@ -27,10 +28,17 @@ _UNSAFE_LOG_CHARS = re.compile(r"[^\w.@:\- ]")
 # CALLER-SUPPLIED data is ASCII-only, and the difference matters. `\w` keeps astral letters, so
 # `%F0%9D%90%80` (U+1D400, category Lu) survived the scrub and each one cost twelve bytes as a
 # surrogate escape: a 160-character path wrote 1,802 bytes where the test asserted 416, and twelve
-# astral field names wrote 6,516 against an assertion of 4,096. The amplification this scrub was
-# said to remove was still there for every letter outside ASCII. Nothing legitimate is lost: a
-# store key is `[A-Za-z0-9._-]`, a route path is ASCII by construction, and a rejected field name
-# is only ever echoed for diagnosis.
+# astral field names wrote 6,684 against 548 shipped. The amplification this scrub was said to
+# remove was still there for every letter outside ASCII. Nothing legitimate is lost: a store key is
+# `[A-Za-z0-9._-]`, a route path is ASCII by construction, and a rejected field name is only ever
+# echoed for diagnosis.
+#
+# The field-name half of that was UNASSERTED for a whole round. The 4,096-byte ceiling this comment
+# once cited belongs to a test whose payload carried no astral name at all, so reverting this line
+# alone left all 316 tests green. Both halves are now asserted, and the assertion is the PROPERTY
+# rather than a byte count: `part.isascii() and part.isprintable()` per logged field name in
+# tests/test_api.py::test_a_rejected_body_cannot_write_an_unbounded_audit_line, which fires on the
+# first non-ASCII part regardless of how many of the ten logged slots the payload fills.
 _UNSAFE_ASCII_CHARS = re.compile(r"[^\w.@:\- ]", re.ASCII)
 
 
@@ -74,22 +82,54 @@ def sanitise_actor(value: str | None) -> str:
 
 
 # A path's separator is not a log-injection risk and IS its meaning. The actor charset was written
-# for a label and deletes `/` and `%`, so applied to a path it turned `/v1/assess` into `v1assess`
-# and made two different requests produce an identical audit record: the field stopped identifying
-# its subject, in the records that exist for diagnosis. Neither character can forge a log line, and
-# both survive `jq -r` intact, so removing them bought nothing at all.
-_UNSAFE_PATH_CHARS = re.compile(r"[^\w./%@:\- ]", re.ASCII)
+# for a label and deletes `/`, so applied to a path it turned `/v1/assess` into `v1assess` and made
+# two different requests produce an identical audit record: the field stopped identifying its
+# subject, in the records that exist for diagnosis.
+#
+# `%` is NOT in this set, and that is the whole point of the escape below. Deleting a refused
+# character is not injective, and the collisions land on LEGITIMATE routes: `GET /v1/,assess` was
+# audited as `path:"/v1/assess"` and `GET /v1/assessments/a:b,c` as `path:"/v1/assessments/a:bc"`,
+# so an unauthenticated caller could write records naming a route or a store key they never
+# requested, and an analyst reading the stream would be misled by design rather than by accident.
+# Escaping instead of deleting restores injectivity: `%` never appears in the output except as an
+# introducer, and Starlette hands over an already-decoded path, so a literal `%` in it can only
+# have arrived as `%25` and is escaped back to exactly that. No path this app serves contains one:
+# every route is `[A-Za-z0-9./_-]` and a store key is `[A-Za-z0-9._-]` either side of a colon.
+_UNSAFE_PATH_CHARS = re.compile(r"[^\w./@:\- ]", re.ASCII)
+
+
+def _percent_escape(match: re.Match[str]) -> str:
+    """Render one refused character as its UTF-8 bytes in percent-hex, so the scrub is injective.
+
+    Uppercase hex and one escape per BYTE, which is what a percent-encoded path looks like
+    everywhere else, so an analyst reads `%2C` without needing to know this function exists. The
+    output is ASCII by construction, so the byte-amplification the charset closes stays closed: an
+    escape costs three ASCII characters, all of which json.dumps spends one byte on.
+    """
+    return "".join(f"%{byte:02X}" for byte in match.group().encode("utf-8"))
 
 
 def sanitise_log_path(value: str, limit: int) -> str:
-    """The same scrub for a request path, at the path's own length bound.
+    """The same scrub for a request path, at the path's own length bound, and ESCAPED not deleted.
 
     A separate cap because the two differ and the difference matters: the longest LEGITIMATE path
     this app serves is `/v1/assessments/` plus a 129-character store key, so capping a path at the
     actor's 64 would truncate a real key out of every rejection record and destroy the diagnosis
     those records exist to give.
+
+    Injective UP TO the cap, and only up to it. Truncation cannot be injective, and pretending
+    otherwise would be the same class of claim this function exists to correct: two paths agreeing
+    on their first `limit` characters after escaping still produce one record. What the escape buys
+    is that a path SHORTER than the cap can no longer be made to read as a different one, which is
+    the case an unauthenticated caller controls.
     """
-    return _scrub(value, empty=UNPRINTABLE_MARKER, limit=limit, unsafe=_UNSAFE_PATH_CHARS)
+    return _scrub(
+        value,
+        empty=UNPRINTABLE_MARKER,
+        limit=limit,
+        unsafe=_UNSAFE_PATH_CHARS,
+        replacement=_percent_escape,
+    )
 
 
 def sanitise_log_part(value: str) -> str:
@@ -105,8 +145,18 @@ def sanitise_log_part(value: str) -> str:
     )
 
 
-def _scrub(value: str, *, empty: str, limit: int, unsafe: re.Pattern[str] | None = None) -> str:
-    cleaned = (unsafe or _UNSAFE_LOG_CHARS).sub("", value).strip()
+def _scrub(
+    value: str,
+    *,
+    empty: str,
+    limit: int,
+    unsafe: re.Pattern[str] | None = None,
+    replacement: Callable[[re.Match[str]], str] | str = "",
+) -> str:
+    # The default is DELETION, which stays right for the two label fields: an operator's name and a
+    # rejected field name are read by a human, and `O%27Brien` costs that reader more than the
+    # aliasing costs anyone. Only the path claims to name a route, so only the path is escaped.
+    cleaned = (unsafe or _UNSAFE_LOG_CHARS).sub(replacement, value).strip()
     if not cleaned:
         return empty
     return cleaned[:limit]
