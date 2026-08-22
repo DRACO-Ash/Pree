@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 
+from pree import __version__
 from pree import app as app_module
 from pree.app import (
     DOC_PATHS,
@@ -1825,31 +1826,172 @@ def test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set
             )
 
 
+# The header names a response may carry. The hardening set plus what the framework adds. Pinned
+# because NO test in this repository read `response.headers` until this one: every token-disclosure
+# assertion read a body or a log stream, so one line in `security_headers`,
+# `response.headers.setdefault("x-pree-build-token", config.team_token)`, served the production
+# token to an unauthenticated caller on all six exempt paths with the whole loop green and the leak
+# confirmed over the wire. `Set-Cookie` and `Location` are the same channel.
+#
+# This project's own docstring already named a header leak as a known attack and closed it by
+# pinning `app.router.dependencies == []`: the wiring, never the property. That is the fourth
+# consecutive round of exactly that error.
+EXPECTED_RESPONSE_HEADERS = frozenset(
+    {
+        "content-security-policy",
+        "x-content-type-options",
+        "x-frame-options",
+        "referrer-policy",
+        "cross-origin-opener-policy",
+        "content-type",
+        "content-length",
+        "date",
+        "server",
+        "vary",
+        "allow",
+        "retry-after",
+        "access-control-allow-origin",
+        "access-control-allow-credentials",
+        "access-control-expose-headers",
+    }
+)
+
+
+def _header_findings(response: Any, secret: str, where: str) -> list[str]:
+    """Every complaint about a response's headers: an unpinned name, or the secret in a value."""
+    findings = [
+        f"{where}: unexpected header {name!r}"
+        for name in response.headers
+        if name.lower() not in EXPECTED_RESPONSE_HEADERS
+    ]
+    findings += [
+        f"{where}: header {name!r} carries the credential"
+        for name, value in response.headers.items()
+        if secret in value
+    ]
+    return findings
+
+
 def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Path) -> None:
     """The behavioural half for the paths that ANSWER without a token, which had none.
 
     Every route walk skips these paths, so the pinned inventory was the only control on them, and
-    all four of the fabrications that beat it sat here: they needed no gate bypass because these
-    paths are meant to answer. Asking is what a label cannot fake. The liveness body is pinned to
-    its exact key set, because a handler that adds a field is a handler that can add a credential.
+    four fabrications that beat that inventory sat here: they needed no gate bypass because these
+    paths are meant to answer. Asking is what a label cannot fake.
+
+    The body is pinned EXACTLY, not by key set. Pinning the keys and grepping the text for the raw
+    token let `service = "pree-" + base64(token)` disclose the credential on all five liveness
+    paths with the suite green: a value inside a pinned key is invisible to a key-set assertion and
+    to a substring search at once. An exact body is the only form that holds, and it is also the
+    control that makes the identity and provenance checks above worth having, since a forged
+    `co_filename` satisfied those five assertions simultaneously.
+
+    Redirects are NOT followed. `TestClient` follows by default, so a 307 out of a liveness handler
+    with the token in `Location` reported as a 200 and passed, the only tell being two uncovered
+    statements against an 80% floor.
     """
     for env in ("development", "production"):
-        with _listener(env, tmp_path) as app, TestClient(app) as probe:
-            for path in sorted(UNAUTHENTICATED_PATHS):
-                if path not in {str(getattr(r, "path", "")) for r in app.routes}:
-                    continue
-                response = probe.get(path)
-                assert response.status_code in {200, 503}, (
-                    f"{env}: GET {path} gave {response.status_code}"
-                )
-                assert PRODUCTION_TOKEN not in response.text, (
-                    f"{env}: the unauthenticated body of {path} carries the team token"
-                )
-                if path in EXPECTED_LIVENESS_PATHS:
-                    assert set(response.json()) == {"status", "service", "version"}, (
-                        f"{env}: the liveness body of {path} is "
-                        f"{sorted(response.json())}, not the pinned three keys"
+        with _listener(env, tmp_path) as app:
+            complaints: list[str] = []
+            with TestClient(app) as probe:
+                served = {str(getattr(route, "path", "")) for route in app.routes}
+                # The PROBE paths, whose bodies are JSON and pinned. The documentation paths are
+                # also unauthenticated, and they serve HTML, so they are checked separately below
+                # for the header channel and for token absence but not for a body shape.
+                for path in sorted(EXPECTED_UNMETERED_PATHS & served):
+                    methods = ("GET", "HEAD") if path in EXPECTED_LIVENESS_PATHS else ("GET",)
+                    for method in methods:
+                        where = f"{env}: {method} {path}"
+                        response = probe.request(method, path, follow_redirects=False)
+                        assert response.status_code == 200, (
+                            f"{where} gave {response.status_code}; an unauthenticated probe path "
+                            "answers 200 and does not redirect"
+                        )
+                        assert "location" not in response.headers, (
+                            f"{where} carries a Location header, which is a disclosure channel a "
+                            "followed redirect hides"
+                        )
+                        complaints += _header_findings(response, PRODUCTION_TOKEN, where)
+                        if method == "HEAD":
+                            assert response.content == b"", f"{where} carried a body"
+                            continue
+                        if path in EXPECTED_LIVENESS_PATHS:
+                            assert response.json() == {
+                                "status": "ok",
+                                "service": "pree",
+                                "version": __version__,
+                            }, f"{where} body is {response.json()}"
+                        else:
+                            assert set(response.json()) == {
+                                "status",
+                                "storage_writable",
+                                "errno",
+                                "errno_name",
+                                "probe_duration_ms",
+                                "probe_timeout_ms",
+                            }, f"{where} body keys are {sorted(response.json())}"
+                        assert PRODUCTION_TOKEN not in response.text, (
+                            f"{where} body carries the team token"
+                        )
+                # The documentation pages, which exist only in development. HTML by design, so no
+                # body shape is pinned; the header channel and the credential are.
+                for path in sorted(EXPECTED_DOC_PATHS & served):
+                    where = f"{env}: GET {path}"
+                    response = probe.get(path, follow_redirects=False)
+                    assert response.status_code == 200, f"{where} gave {response.status_code}"
+                    complaints += _header_findings(response, PRODUCTION_TOKEN, where)
+                    assert PRODUCTION_TOKEN not in response.text, (
+                        f"{where} body carries the team token"
                     )
+            assert not complaints, f"header findings: {complaints}"
+
+
+def test_the_storage_failure_body_discloses_the_errno_and_nothing_else(tmp_path: Path) -> None:
+    """The 503 branch, which no test had ever reached.
+
+    Storage is writable under test, so `/healthz/storage` was only ever seen at 200 and the failure
+    branch of `as_body()` was an unasserted disclosure surface on an unauthenticated path: one added
+    key returned the raw token to any caller with the suite green and zero statement misses. The
+    directory appears here deliberately, because a screenshot of this 503 is meant to be a complete
+    diagnosis, so the key set is pinned WITH `data_dir` rather than against it.
+    """
+    unwritable = tmp_path / "sealed"
+    unwritable.mkdir()
+    blocker = unwritable / "data"
+    blocker.write_text("not a directory\n", encoding="utf-8")
+    previous = dict(os.environ)
+    os.environ.update(
+        {
+            "PREE_ENV": "production",
+            "PREE_DATA_DIR": str(blocker / "nested"),
+            "PREE_BUILD_ID": "storage-failure",
+            "PREE_TEAM_TOKEN": PRODUCTION_TOKEN,
+            "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
+        }
+    )
+    try:
+        app = build()
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+    with TestClient(app) as probe:
+        response = probe.get(STORAGE_PROBE_PATH, follow_redirects=False)
+    assert response.status_code == 503, (
+        f"a data directory under a regular file answered {response.status_code}; the failure "
+        "branch of the storage body is unreachable and therefore unasserted"
+    )
+    assert set(response.json()) == {
+        "status",
+        "storage_writable",
+        "errno",
+        "errno_name",
+        "probe_duration_ms",
+        "probe_timeout_ms",
+        "data_dir",
+    }, f"the 503 body keys are {sorted(response.json())}"
+    assert response.json()["storage_writable"] is False
+    assert PRODUCTION_TOKEN not in response.text, "the 503 body carries the team token"
+    assert not _header_findings(response, PRODUCTION_TOKEN, "storage 503")
 
 
 def test_every_request_handling_surface_of_the_built_app_is_pinned(
@@ -2004,6 +2146,7 @@ def test_the_team_token_reaches_no_response_body_and_no_log_record(
     logger = build_logger(stream)
     with build_client(config, logger, prober) as probe:
         bodies: list[str] = []
+        leaked_headers: list[str] = []
         for route in _all_routes(probe.app):
             target = getattr(route, "path", "").replace("{key}", "probe:key")
             methods = (getattr(route, "methods", None) or set()) - {"HEAD", "OPTIONS"}
@@ -2017,4 +2160,5 @@ def test_the_team_token_reaches_no_response_body_and_no_log_record(
         bodies.append(probe.get(f"/healthz?token={TEST_TOKEN}").text)
     leaked = [body for body in bodies if TEST_TOKEN in body]
     assert not leaked, f"a response body carried the team token: {leaked}"
+    assert not leaked_headers, f"a response header carried the team token: {leaked_headers}"
     assert TEST_TOKEN not in stream.getvalue(), "the audit log carried the team token"

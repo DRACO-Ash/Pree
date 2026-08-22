@@ -674,3 +674,24 @@ Twenty-seventh security review, one blocker and two minors:
 ● The hook's credential rule required the term to end the name, so `ENV TEAM_TOKEN_VALUE=` and
   `ENV PREE_TOKEN_2=` walked past, and its eight-character value floor let `abc123` through. The
   term may sit anywhere now and the floor is four, measured to cost no false positive.
+
+Twenty-eighth security review, three blockers and one major:
+
+● BLOCKER: no test in the repository read `response.headers`. One `setdefault` in the hardening
+  middleware served the production token to an unauthenticated caller on all six exempt paths with
+  the whole loop green. Header names are pinned to a list now and no header value may carry the
+  credential, on every path and in the authenticated, wrong-token and no-token cases.
+● BLOCKER: a pinned key set is not a pinned body. `service = "pree-" + base64(token)` disclosed the
+  credential on all five liveness paths, invisible to a key-set check and to a raw substring search
+  at once. The liveness body is pinned exactly. This also settles the worth of the identity and
+  provenance checks: a leak compiled with a forged `co_filename` satisfied five assertions at once,
+  so the comment now says `co_filename` is a `compile()` argument rather than provenance.
+● BLOCKER: the storage 503 branch had never been reached, because storage is writable under test,
+  so one added key returned the token to any unauthenticated caller with zero statement misses. A
+  second listener is built over an unwritable directory and the 503 body is pinned exactly.
+● MAJOR: both credential nets were name denylists, so `ENV PREE_AUTH=<value>` was allowed by both.
+  Seventh time a term table here has been one entry short. The check is an allowlist of the five
+  environment names this image sets, failing closed on anything else.
+● Every probe now uses `follow_redirects=False` and asserts no Location header, because
+  `TestClient` follows by default and a 307 carrying the token in Location read as a 200; and both
+  GET and HEAD are asked, since HEAD is served on all five liveness paths.

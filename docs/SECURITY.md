@@ -136,7 +136,10 @@ the assessment store.
 | The LISTENER's route table matches the pinned order, types, endpoints and gate | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
 | The LISTENER executes each route's own endpoint, by identity and by source file | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
 | The LISTENER refuses every unauthenticated caller outside the probe set | `src/pree/main.py` | `test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set` |
-| The LISTENER's unauthenticated paths disclose no token and hold their body shape | `src/pree/main.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
+| The LISTENER's unauthenticated paths hold their EXACT body and no unpinned header | `src/pree/main.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
+| No response header is unpinned, and none carries the token | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
+| The storage 503 body discloses the errno and the directory, nothing else | `src/pree/health.py` | `test_the_storage_failure_body_discloses_the_errno_and_nothing_else` |
+| Every ENV and ARG name is on an allowlist, so no credential can be baked under any name | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | No credential is baked into an ENV or ARG assignment | `Dockerfile` | `test_no_credential_is_baked_into_an_env_assignment` |
 | No platform-injected variable has an image-level default, PREE_ENV included | `Dockerfile` | `test_no_stage_bakes_the_port_or_the_data_directory` |
 
@@ -1388,6 +1391,54 @@ new rule required the term to END the name, so `ENV TEAM_TOKEN_VALUE=`, `ENV PRE
 across every tracked file at the wider setting: no new match, so the widening costs nothing.
 
 The running application was probed again and holds. Six rounds now with no finding in it.
+
+### Twenty-eighth review: three blockers, one major
+
+One line explains all three blockers. **No test in this repository read `response.headers`.** Every
+token-disclosure assertion in the suite read a response body or a log stream, so one
+`response.headers.setdefault("x-pree-build-token", config.team_token)` in the hardening middleware
+served the production credential to an unauthenticated caller on all six exempt paths, with the
+whole loop green and the leak confirmed over the wire. `Set-Cookie` and `Location` are the same
+channel. This file's own docstring already named a header leak as a known attack and closed it by
+pinning `app.router.dependencies == []`: the wiring, never the property. That is the fourth
+consecutive round of exactly that error, and it is now asserted rather than described - every
+response header name must be on a pinned list and no header value may contain the credential.
+
+The second blocker is that a pinned KEY SET is not a pinned body. The liveness assertion checked
+`set(response.json()) == {"status", "service", "version"}` and grepped the text for the raw token,
+so `service = "pree-" + base64(token)` disclosed the credential on all five liveness paths with the
+suite green: a value inside a permitted key is invisible to a key-set check and to a substring
+search at the same time. The body is pinned exactly now. That also settles what the identity and
+provenance checks added last round are worth: a leak compiled with `co_filename` forged to
+`app.py`'s path, with `__qualname__` and `__module__` assigned and installed as both `endpoint` and
+`dependant.call`, satisfied the ordered inventory, the identity check, the provenance check, the
+`route.app` check and the production doc-path check simultaneously. `co_filename` is a string handed
+to `compile()`. The comment now says so, and the exact body is the control that actually holds.
+
+The third is a branch no test had ever reached. Storage is writable under test, so
+`/healthz/storage` was only ever seen at 200 and the failure branch of `as_body()` was an
+unasserted disclosure surface on an unauthenticated path: one added key returned the token to any
+caller with the suite green and zero statement misses. A second listener is built over a data
+directory nested under a regular file, which makes the 503 reachable, and its exact key set is
+pinned with `data_dir` rather than against it, because a screenshot of that 503 is meant to be a
+complete diagnosis.
+
+The major ends a loop rather than iterating it. Both credential nets were name DENYLISTS, and
+`ENV PREE_AUTH=Ab3-Cd6...` in the shipped stage was allowed by both: the hook exited 0 and the
+suite exited 0, with a credential frozen into a layer against a hard rule. That is the seventh time
+a term table in this project has been one entry short. Adding "auth" would have been the eighth.
+The check is an ALLOWLIST of the five environment names this image sets, failing closed on anything
+else, so no credential can be baked under any name at all.
+
+A minor worth its own line, because it is a measurement trap rather than a coding slip:
+`TestClient` follows redirects by default, so a 307 out of a liveness handler carrying the token in
+`Location` reported as a 200 and passed the status assertion, the only tell being two uncovered
+statements against an 80% floor. Every probe in these tests now uses `follow_redirects=False` and
+asserts no `Location` header. The same round's probe also asked GET only, while HEAD is served on
+all five liveness paths, so a header leak there was doubly invisible; both verbs are asked now.
+
+The running application was probed again and holds. Seven rounds with no finding in it, against
+seven rounds of findings in the layer built to prove it holds.
 
 ## Not accepted, and why it is not a risk here
 

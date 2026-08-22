@@ -525,6 +525,48 @@ _PLATFORM_INJECTED = frozenset(
 )
 
 
+# The ENV and ARG names this Dockerfile is allowed to set. An ALLOWLIST, because the denylist it
+# replaces was one entry short for the seventh time: `ENV PREE_AUTH=<value>` carries a credential,
+# reads like a credential to a human, and matches no term in any list either net held. Widening a
+# term table is a loop this project has now run seven times and lost seven times.
+#
+# Inverted, the burden lands where it belongs: this image needs four environment variables, so a
+# fifth is a decision somebody makes and a reviewer sees in the diff. A credential cannot be baked
+# under ANY name, because no new name is permitted at all.
+_ALLOWED_ENV_NAMES = frozenset(
+    {
+        "PYTHONDONTWRITEBYTECODE",
+        "PIP_NO_CACHE_DIR",
+        "PIP_DISABLE_PIP_VERSION_CHECK",
+        "PATH",
+        "PYTHONUNBUFFERED",
+    }
+)
+
+
+def test_no_stage_sets_an_environment_variable_outside_the_allowlist() -> None:
+    """FAIL CLOSED on an unknown name, rather than recognising a growing list of bad ones.
+
+    The credential nets were two name denylists, and `ENV PREE_AUTH=Ab3-Cd6...` in the shipped
+    stage was allowed by both: the pre-write hook exited 0 and the suite exited 0, with a
+    credential frozen into a layer against a hard rule in CLAUDE.md. Adding "auth" to the term
+    tables would be the eighth iteration of the same loop. Naming what is permitted ends it.
+    """
+    unexpected: list[str] = []
+    for instruction in _instructions():
+        if instruction.keyword not in {"ENV", "ARG"}:
+            continue
+        for name, _value in _env_assignments(instruction.argument):
+            if name not in _ALLOWED_ENV_NAMES:
+                unexpected.append(f"{instruction.keyword} {name}")
+    assert not unexpected, (
+        f"these environment names are set in the image and are not on the allowlist: "
+        f"{unexpected}. An image-level value beats the platform's injection and can freeze a "
+        f"credential into a layer, so a new name is a deliberate decision: add it to "
+        f"_ALLOWED_ENV_NAMES with a reason"
+    )
+
+
 def test_no_credential_is_baked_into_an_env_assignment() -> None:
     """The second net under the pre-write hook, which the unquoted form walked past.
 
