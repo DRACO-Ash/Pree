@@ -992,3 +992,26 @@ Fourth security review of the audit layer, one major and three minors:
   only, and the `isinstance(raw, bytes)` guard is load-bearing rather than defensive: weakening it
   to `raw is not None` left the whole suite green while a `str` would make every audited rejection a
   500. Three cases now: absent, `str`, `bytearray`.
+
+Fourth security review of the audit layer, one major and five minors:
+
+● The previous round's fix reintroduced the defect it cited. `had_query` was added to five record
+  kinds, its value pinned on ONE, and a comment written claiming it was asserted on every kind
+  across the two-token axis. The value scan returns after checking a boolean's name, so
+  `bool(config.team_token and ord(config.team_token[0]) & 1)` at the CORS site left the whole suite
+  green while handing an unauthenticated caller one token bit per refused preflight. Now asserted on
+  every kind, both directions, two tokens.
+● Three places named TypeError where the scrub raises ValueError. The consequence was right, the
+  mechanism was not.
+● `GET /path?` records `had_query=false`, since an empty query is indistinguishable from none in the
+  ASGI scope. The bit is described as a NON-EMPTY query string.
+● `_raw_path` now partitions on `?` itself. The exclusion held under h11, httptools and the
+  TestClient, but it rested on their convention, and a server placing the full target in `raw_path`
+  would write query values into the field that once held the team token in cleartext.
+● The truncation claims had no canary: the test probed permitted bytes only, which truncate 1:1, so
+  the wrong unit could be restored with nothing red. The 54-byte threshold and
+  `MAX_LOGGED_PATH > 16 + STORE_KEY_MAX_LENGTH` are asserted, the second being what keeps truncation
+  aliasing a diagnosis cost rather than a forgery.
+● The `confidence` pin permitted `medium`, which the enum has never had, and omitted `moderate` and
+  `insufficient`, which the application emits. A meta-assertion now checks the literal pin and the
+  enum agree, so the literal can stay a literal.

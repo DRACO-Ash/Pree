@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from pree.app import MAX_LOGGED_PATH, STORE_KEY_MAX_LENGTH
 from pree.security import (
     _PERMITTED_PATH_BYTES,
     MAX_ACTOR_LENGTH,
@@ -213,10 +214,40 @@ def test_the_path_scrub_is_not_claimed_injective_above_its_cap() -> None:
     Truncation cannot be injective. Two targets agreeing on their first `limit` characters after
     escaping still produce one record, and the docstring says so rather than implying a property
     the function does not have.
+
+    BOTH units, because the 3:1 expansion is the part that was stated wrongly. This test used to
+    probe with permitted bytes only, which truncate 1:1, so the docstring could be reverted to
+    "a target shorter than the cap" and nothing turned red. An all-escaping target truncates at 54
+    RAW bytes, not 160.
     """
     first = b"/v1/" + b"a" * 200 + b"one"
     second = b"/v1/" + b"a" * 200 + b"two"
     assert sanitise_log_path(first, 160) == sanitise_log_path(second, 160)
+    # 54 raw bytes, all escaping: 53 gives 159 characters and 54 gives 162, so this pair is the
+    # first collision an all-escaping target can produce and it is nowhere near the cap.
+    escaping = b"/" + b"\xff" * 53
+    assert sanitise_log_path(escaping + b"\x01", 160) == sanitise_log_path(escaping + b"\x02", 160)
+    assert len(sanitise_log_path(b"\xff" * 53, 160)) == 159
+    assert len(sanitise_log_path(b"\xff" * 54, 160)) == 160
+
+
+def test_no_truncated_path_record_can_read_as_a_route_this_app_serves() -> None:
+    """Why the truncation aliasing is a diagnosis cost and not a forgery.
+
+    A truncated record is exactly `limit` characters. The longest path this application serves is
+    `/v1/assessments/` plus a 129-character store key, which is 145, so no truncated record can
+    equal a real route's length and the collisions above cannot be aimed at one. That reasoning
+    holds only while the cap exceeds the longest legitimate path, which is a relation between two
+    constants that nothing asserted: raising MAX_LOGGED_PATH is a change to the code, but LOWERING
+    the gap until they meet is the one that turns a diagnosis cost into a forgery.
+    """
+    longest_legitimate = len("/v1/assessments/") + STORE_KEY_MAX_LENGTH
+    assert longest_legitimate < MAX_LOGGED_PATH, (
+        f"the audit cap ({MAX_LOGGED_PATH}) is not above the longest legitimate path "
+        f"({longest_legitimate}), so a truncated record can be made to read as a real route"
+    )
+    truncated = sanitise_log_path(b"/" + b"\xff" * 200, MAX_LOGGED_PATH)
+    assert len(truncated) == MAX_LOGGED_PATH != longest_legitimate
 
 
 def test_the_path_scrub_marks_an_empty_target_rather_than_logging_nothing() -> None:

@@ -2068,7 +2068,7 @@ one of them.
 permitted ASCII set. Where an ASGI server omits `raw_path`, or supplies it as something other than
 bytes, one accessor falls back to the decoded path, which loses injectivity and not safety; all
 three cases are exercised, and the `isinstance` check is load-bearing rather than defensive, because
-a `str` reaching the scrub's `f"%{byte:02X}"` is a TypeError and therefore a 500 on every audited
+a `str` reaching the scrub's `f"%{byte:02X}"` raises `ValueError` and therefore a 500 on every audited
 rejection.
 
 **This paragraph said "the request target as bytes off the wire", and that was FALSE.** The next
@@ -2134,6 +2134,61 @@ Four minors closed alongside:
   are read by a human and `O%27Brien` costs that reader more than the aliasing costs anyone. Neither
   names a route, which is what made the path's aliasing a finding and leaves these two a documented
   limit.
+
+### Fourth security review of the audit layer: the fix that reintroduced the defect it cited
+
+The previous round added `had_query` to five record kinds, pinned its value on ONE, and wrote a
+comment claiming it was "asserted in both directions on every kind that emits it" across "the
+two-token axis". Neither half was true, and the comment was written in the same commit that failed to
+make it true. `_check_audit_value` returns after checking a boolean's NAME, so on the other four
+kinds the field was unpinned by value, and
+
+    "had_query": bool(config.team_token and ord(config.team_token[0]) & 1)
+
+at the CORS site left the whole suite green while handing an unauthenticated caller one bit of the
+team token per refused preflight. That is the `origin_allowed` defect this register already records,
+reintroduced by the fix for a different finding, and it is the clearest example in this project of
+why a comment asserting a security property must name the test that asserts it or be deleted.
+
+Closed by `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it`: every kind
+that emits the field, both directions, two distinct tokens. The two-token axis is decisive rather
+than decorative, because any token-derived expression changes when the token changes while the
+request does not, so the matrix refuses the class instead of the member. A single-token version of
+the same test passes against the leaking expression.
+
+Five minors closed with it:
+
+● Three places said a `str` reaching the scrub's format spec "is a TypeError". It raises
+  `ValueError: Unknown format code 'X' for object of type 'str'`. The consequence stated - a 500 on
+  every audited rejection - was right; the mechanism named was not.
+● `GET /path?` arrives with `query_string == b""`, indistinguishable in the ASGI scope from no query,
+  so it records `false`. The docstring said "carried a query string" without the qualifier, which
+  overstated by exactly that case. The bit is now described as a NON-EMPTY query string.
+● The query exclusion rested entirely on a dependency's convention. h11, httptools and Starlette's
+  TestClient all partition the target before the scope exists, so the exclusion held, but a server or
+  middleware that placed the full target in `raw_path` would write query values into the one field
+  this policy records as having held the team token in cleartext. `_raw_path` now partitions on `?`
+  itself: no behaviour change under the shipped stack, and the control no longer depends on a
+  dependency for a property this policy asserts.
+● The corrected truncation claims had no canary. The truncation test probed with permitted bytes
+  only, which truncate 1:1, so the wrong unit could be restored with nothing red. Both the 54-byte
+  all-escaping threshold and the relation `MAX_LOGGED_PATH > 16 + STORE_KEY_MAX_LENGTH` are now
+  asserted; the second is what makes the truncation aliasing a diagnosis cost rather than a forgery,
+  and lowering the gap until the two constants meet was the change nothing would have caught.
+● The `confidence` pin was wrong in BOTH directions and the review found one of them. It permitted
+  `medium`, which `ConfidenceTier` has never had, and omitted `moderate` and `insufficient`, both of
+  which the application emits. The exercise drives only two tiers, so neither error failed. The pin
+  stays a literal, because a derived pin moves with any mutation of the enum, and a meta-assertion
+  now checks the literal and the enum agree.
+
+**And the register guard's own limits, since it caught the stale citation this round rather than my
+reading of the diff.** `test_every_control_row_cites_a_test_that_exists` checks EXISTENCE, not
+aboutness: a row citing a real test that asserts something narrower than the row claims passes, which
+is precisely the shape of this round's major. It covers one markdown table in one file, so the
+narrative in this same document, the changelog rows, and code comments are all unguarded - and this
+round's false claim lived in a code comment, where no guard of that kind can reach. The countermeasure
+there is not another guard; it is the rule this register already carries, that a comment asserting a
+security property names the test that asserts it or is deleted.
 
 ## Not accepted, and why it is not a risk here
 

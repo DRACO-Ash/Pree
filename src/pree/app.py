@@ -358,18 +358,30 @@ def _raw_path(request: Request) -> bytes:
     Falling back to it is a loss of injectivity, not of safety, because `sanitise_log_path` escapes
     whatever it is given; the record is then as good as the decoded path allows and no worse than
     every version of this field before this one. The `isinstance` check is load-bearing rather than
-    defensive: a `str` reaching the scrub's `f"%{byte:02X}"` is a TypeError, so a server supplying
+    defensive: a `str` reaching the scrub's `f"%{byte:02X}"` raises `ValueError: Unknown format
+    code 'X' for object of type 'str'`, so a server supplying
     one would turn every audited rejection into a 500. Encoded UTF-8 so the fallback and the normal
     path hand the scrub the same type.
     """
     raw = request.scope.get("raw_path")
     if isinstance(raw, bytes):
-        return raw
-    return request.url.path.encode("utf-8", "surrogatepass")
+        # The partition is DEFENSIVE and deliberate, not redundant. h11, httptools and Starlette's
+        # TestClient all strip the query before the scope exists, so this cuts nothing today; but
+        # the whole exclusion currently rests on that convention, and a server or middleware that
+        # put the full target in `raw_path` would write query values straight into the one field
+        # `audit.py` records as having held the team token in cleartext. One line, no behaviour
+        # change under the shipped stack, and the control stops depending on a dependency.
+        return raw.partition(b"?")[0]
+    return request.url.path.encode("utf-8", "surrogatepass").partition(b"?")[0]
 
 
 def _had_query(request: Request) -> bool:
-    """Whether the request carried a query string, without recording what it carried.
+    """Whether the request carried a NON-EMPTY query string, without recording what it carried.
+
+    Non-empty, and the qualifier is the honest part: `GET /path?` arrives with
+    `query_string == b""`, indistinguishable in the ASGI scope from no query at all, so that one
+    request records `false`. An earlier docstring said "carried a query string" without the
+    qualifier, which overstated by exactly that case.
 
     One bit, and it exists because `raw_path` excludes the query: without it, two requests
     differing only in their query are indistinguishable in the trail, and an analyst cannot even

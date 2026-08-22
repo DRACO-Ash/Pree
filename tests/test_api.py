@@ -45,6 +45,7 @@ from pree.audit import build_logger
 from pree.health import StorageProber
 from pree.main import build
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
+from pree.scoring import ConfidenceTier
 from pree.security import (
     MAX_ACTOR_LENGTH,
     UNPRINTABLE_MARKER,
@@ -521,6 +522,82 @@ def test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_
         assert path.isascii() and path.isprintable(), f"the logged path is not ASCII: {path!r}"
 
 
+def test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it(
+    tmp_path: Path,
+) -> None:
+    """A boolean is a one-bit channel, and a NAME pin cannot see inside one.
+
+    This is the `origin_allowed` defect, reintroduced by me and caught by the gate: I added
+    `had_query` to five record kinds, pinned its value on ONE, and wrote a comment claiming it was
+    "asserted in both directions on every kind that emits it" across "the two-token axis". Neither
+    was true. `_check_audit_value` returns after checking a boolean's name, so on the other four
+    kinds the field was unpinned, and
+
+        "had_query": bool(config.team_token and ord(config.team_token[0]) & 1)
+
+    left the whole suite green while handing an unauthenticated caller one bit of the team token
+    per refused preflight.
+
+    So: EVERY kind, BOTH directions, and TWO TOKENS. The two-token axis is the decisive one and not
+    a flourish: any token-derived expression changes when the token changes while the request does
+    not, so the matrix catches the class rather than the member. A single-token version of this
+    test passes against the leaking expression above.
+    """
+    for token in (TEST_TOKEN, PRODUCTION_TOKEN):
+        for query, expected in (("?x=1", True), ("", False)):
+            observed = _every_kind_with(tmp_path / f"{len(token)}{expected}", token, query)
+            assert set(observed) == set(EXPECTED_AUDIT_KEYS) - {"audit"}, (
+                f"the exercise did not produce every rejection kind, so the kinds it missed are "
+                f"unpinned by value: {sorted(set(EXPECTED_AUDIT_KEYS) - {'audit'} - set(observed))}"
+            )
+            for kind, bit in observed.items():
+                assert bit is expected, (
+                    f"{kind} recorded had_query={bit!r} for query {query!r} under a token of "
+                    f"length {len(token)}; expected {expected}. A boolean whose value tracks "
+                    f"anything but the request is a channel, not a fact about the request"
+                )
+
+
+def _every_kind_with(directory: Path, token: str, query: str) -> dict[str, bool]:
+    """Drive one request per rejection kind, and return each kind's `had_query` bit.
+
+    One helper rather than five copies, because five copies of the drive are five places for a
+    kind to be quietly dropped and read as "not emitted" instead of "not asserted".
+    """
+    stream = io.StringIO()
+    config = make_config(
+        directory, PREE_TEAM_TOKEN=token, PREE_ALLOWED_ORIGIN="https://pree.example"
+    )
+    auth = {"x-pree-token": token}
+    with build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0)) as probe:
+        # auth_reject: a gated route with the wrong token, which needs no token at all.
+        probe.get(f"/v1/assessments/a:b{query}", headers={"x-pree-token": "wrong"})
+        # validation_reject: authenticated, body refused at the boundary.
+        probe.post(f"/v1/assess{query}", headers=auth, json={"bad": 1})
+        # http_reject: a route that does not exist.
+        probe.get(f"/nowhere-at-all{query}", headers=auth)
+        # cors_reject: a preflight from a disallowed origin.
+        probe.options(
+            f"/v1/assess{query}",
+            headers={
+                "Origin": "https://evil.test",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        # store_error: a corrupt snapshot AND a corrupt backup, so the real 503 path runs.
+        (config.data_dir / "assessments.json").write_text("{ not json", encoding="utf-8")
+        (config.data_dir / "assessments.json.bak").write_text("nor this", encoding="utf-8")
+        probe.get(f"/v1/assessments/a:b{query}", headers=auth)
+
+    observed: dict[str, bool] = {}
+    for line in stream.getvalue().splitlines():
+        if '"had_query"' not in line:
+            continue
+        record = json.loads(line)
+        observed[record["kind"]] = record["had_query"]
+    return observed
+
+
 def test_the_query_string_aliases_and_the_record_says_a_query_was_present(
     tmp_path: Path,
 ) -> None:
@@ -575,8 +652,8 @@ def test_the_audited_path_falls_back_when_no_usable_raw_path_is_supplied(
 
     THREE cases, because the first version of this test popped the key and nothing else, so it
     covered one of the accessor's two guards. The `isinstance(raw, bytes)` check is load-bearing
-    and not defensive: a `str` reaching the scrub's `f"%{byte:02X}"` is a TypeError, so a server
-    supplying one would turn every audited rejection into a 500, and weakening the check to
+    and not defensive: a `str` reaching the scrub's `f"%{byte:02X}"` raises `ValueError`, so a
+    server supplying one would turn every audited rejection into a 500, and weakening the check to
     `raw is not None` left the whole suite green. A `bytearray` is the same shape of surprise from
     the other direction: it iterates to ints and would work, but it is not what the guard admits,
     so pinning the behaviour stops the guard being loosened to "anything iterable".
@@ -2622,7 +2699,14 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     # The five outcomes the application actually emits. "created" and "refused" were here and
     # produced by nothing, which is a standing exemption rather than a pin.
     "outcome": _OneOf("ok", "error", "disclosed", "not_modified", "not_found"),
-    "confidence": _OneOf("low", "medium", "high"),
+    # A LITERAL set, checked against the enum by a meta-assertion below rather than derived from
+    # it: derived would move with any mutation of the enum, and a literal alone drifts silently.
+    # This pin was wrong in two directions at once. It permitted `medium`, which
+    # `ConfidenceTier` has never had, so that was a standing exemption for a value nothing emits;
+    # and it omitted `moderate` and `insufficient`, both of which the application does emit, the
+    # second observably from `POST /v1/assess` with `"indicators": {}`. The review found the
+    # omission; the phantom entry was beside it.
+    "confidence": _OneOf("high", "moderate", "low", "insufficient"),
     # The APPLICATION's own pattern. A hand-written charset admitted roughly 113 characters of
     # appended hex, so the token's hex appended to the audit key passed. STORE_KEY_PATTERN requires
     # exactly one colon with each half at most 64 characters, so an appended encoding overflows it.
@@ -3001,6 +3085,36 @@ AUDIT_RULE_CANARIES: dict[str, str] = {
     "loc": "body\r\ninjected",
     "type": "NotLowercase",
 }
+
+
+def test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit() -> None:
+    """The meta-assertion that makes a literal pin safe to keep as a literal.
+
+    The pin was wrong in both directions and the suite could not see either: it permitted `medium`,
+    which `ConfidenceTier` has never had, so that entry was a standing exemption for a value
+    nothing emits; and it omitted `moderate` and `insufficient`, both of which the application
+    emits, the second from `POST /v1/assess` with an empty indicator set. The exercise happens to
+    drive only two tiers, so neither error showed up as a failure.
+
+    A DERIVED pin would have avoided this and bought a worse problem: it moves with any mutation of
+    the enum, so adding a tier that carries caller data would satisfy the rule that exists to
+    refuse it. The literal stays, and this asserts the literal and the enum agree, which turns
+    drift into a named failure instead of a silent widening.
+    """
+    pinned = AUDIT_STRING_VALUES["confidence"]
+    emitted = {tier.value for tier in ConfidenceTier}
+    for value in emitted:
+        assert not pinned.rejects(value), (
+            f"the application can emit confidence={value!r} and the pin refuses it, so a real "
+            f"record would fail the shape check: {pinned.description}"
+        )
+    for phantom in ("medium", "certain", "none", ""):
+        if phantom in emitted:
+            continue
+        assert pinned.rejects(phantom), (
+            f"the pin permits confidence={phantom!r}, which ConfidenceTier cannot produce; a "
+            f"permitted value nothing emits is a standing exemption: {pinned.description}"
+        )
 
 
 def test_the_log_part_scrub_marks_an_unprintable_name_distinctly() -> None:
