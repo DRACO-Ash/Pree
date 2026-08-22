@@ -442,18 +442,23 @@ def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path
     # json.dumps renders it as a 12-byte surrogate pair. The first version of this test tried
     # only %01 and asserted a 1,024-byte ceiling that the emoji input already exceeded, so the
     # bound held and the assertion about it did not.
-    # THREE inputs now, because the path is scrubbed as well as truncated and the two bound
+    # FOUR inputs now, because the path is scrubbed as well as truncated and the two bound
     # different things. The escapes used to be the whole test: %01 rendered as six JSON bytes and
     # an emoji as a 12-byte surrogate pair, so 160 characters could cost nearly 2 KB a record. The
     # scrub strips both classes outright, which removes the amplification rather than bounding it,
     # so a legitimate-character path is now the case that exercises the truncation.
     with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
-        for escaped in ("%01", "%F0%9F%98%80", "a"):
+        # `%F0%9D%90%80` is U+1D400, an astral LETTER, and it is the input that distinguishes the
+        # two charsets: `\w` in a str pattern keeps it, so it survived the scrub and cost twelve
+        # bytes each as a surrogate escape. 160 characters wrote 1,802 bytes against the 416 this
+        # test asserts. The emoji is not a letter and was always stripped, which is why choosing
+        # it hid the hole rather than finding it.
+        for escaped in ("%01", "%F0%9F%98%80", "%F0%9D%90%80", "a"):
             path = "/v1/assessments/" + escaped * 4_000
             assert bounded.get(path, headers={"x-pree-token": "wrong"}).status_code == 401
 
     lines = [line for line in stream.getvalue().splitlines() if "auth_reject" in line]
-    assert len(lines) == 3, f"expected one audit line per rejection, got {len(lines)}"
+    assert len(lines) == 4, f"expected one audit line per rejection, got {len(lines)}"
     paths = [json.loads(line)["path"] for line in lines]
     for line, path in zip(lines, paths, strict=True):
         assert len(path) <= MAX_LOGGED_PATH, f"the logged path is {len(path)} characters"
@@ -462,8 +467,8 @@ def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path
         assert len(line) <= MAX_LOGGED_PATH + 256, (
             f"audit line is {len(line)} bytes, above the bound the scrub and truncation imply"
         )
-        assert all(character.isprintable() for character in path), (
-            f"a control or astral character survived into the logged path: {path!r}"
+        assert path.isascii() and path.isprintable(), (
+            f"a non-ASCII or control character survived into the logged path: {path!r}"
         )
     # The legitimate-character case must actually reach the cap, or nothing exercised truncation.
     assert max(len(path) for path in paths) == MAX_LOGGED_PATH, (
@@ -721,36 +726,49 @@ def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path
     assert refused.status_code == 400
     assert refused.json() == {"error": "request rejected"}, refused.text
     assert "Disallowed" not in refused.text
-    # The RECORD's own field, not merely the presence of a record. `origin_allowed` was in the
-    # field list and in nothing else, and the value scan returned early on every boolean, so
-    # `origin_allowed = bool(token[0] & 1)` shipped a one-bit-per-record channel on an event any
-    # unauthenticated caller triggers at will. The field also once misstated the event, reporting
-    # false for every 400 including one raised for the ALLOWED origin by a different control, and
-    # that repair was untested until now.
-    records = [json.loads(line) for line in stream.getvalue().splitlines() if "cors_reject" in line]
-    assert len(records) == 1, f"a refused preflight left {len(records)} audit lines"
-    assert records[0]["origin_allowed"] is False, (
-        f"a preflight from a disallowed origin recorded origin_allowed={records[0]!r}"
-    )
-    # And a 400 raised for the ALLOWED origin by a different control must record TRUE, which is
-    # the distinction the field exists to draw and the reason it was repaired.
-    stream.truncate(0)
-    stream.seek(0)
-    allowed_but_refused = client.options(
-        "/v1/assess",
-        headers={
-            "Origin": "https://pree.example",
-            "Access-Control-Request-Method": "POST",
-            "Access-Control-Request-Headers": "x-not-permitted",
-        },
-    )
-    if allowed_but_refused.status_code == 400:
-        refusals = [
-            json.loads(line) for line in stream.getvalue().splitlines() if "cors_reject" in line
-        ]
-        assert refusals and refusals[0]["origin_allowed"] is True, (
-            f"a 400 raised for the ALLOWED origin recorded origin_allowed false: {refusals}"
-        )
+    # The field's VALUE against an independent recomputation, across a matrix. Naming the field in
+    # `AUDIT_BOOLEAN_FIELDS` closes nothing on its own, and asserting one direction each was
+    # satisfiable by a leaking expression: `(origin == allowed) and bool(token[len(acrh)+1] & 1)`
+    # short-circuits to False for a disallowed origin and reports True for the allowed one, so it
+    # passed both directions while handing an unauthenticated caller one attacker-indexed bit of
+    # the team token per preflight.
+    #
+    # The decisive axis is TWO DISTINCT TOKENS. Any token-derived expression changes when the token
+    # changes while the origin does not, so the matrix catches the class rather than the member.
+    # This is the same correlate-do-not-name reasoning the project already applied to duration_ms.
+    for token in (TEST_TOKEN, PRODUCTION_TOKEN):
+        for origin, allowed in (("https://pree.example", True), ("https://evil.test", False)):
+            for extra in ({}, {"Access-Control-Request-Headers": "x-not-permitted"}):
+                probe_stream = io.StringIO()
+                probe_config = make_config(
+                    tmp_path,
+                    PREE_TEAM_TOKEN=token,
+                    PREE_ALLOWED_ORIGIN="https://pree.example",
+                )
+                with build_client(
+                    probe_config, build_logger(probe_stream), StorageProber(cache_seconds=0.0)
+                ) as probe:
+                    answer = probe.options(
+                        "/v1/assess",
+                        headers={
+                            "Origin": origin,
+                            "Access-Control-Request-Method": "POST",
+                            **extra,
+                        },
+                    )
+                if answer.status_code != 400:
+                    continue
+                refusals = [
+                    json.loads(line)
+                    for line in probe_stream.getvalue().splitlines()
+                    if "cors_reject" in line
+                ]
+                assert len(refusals) == 1, f"{origin} left {len(refusals)} cors_reject lines"
+                assert refusals[0]["origin_allowed"] is allowed, (
+                    f"origin {origin!r} with token of length {len(token)} recorded "
+                    f"origin_allowed={refusals[0]['origin_allowed']!r}, expected {allowed}; a "
+                    f"value that changes with the token is a channel, not a fact about the origin"
+                )
     # And the allowed origin still works, which is the whole point of the middleware.
     allowed = client.options(
         "/v1/assess",
@@ -2442,7 +2460,12 @@ AUDIT_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     # Correlated at the call site, not bounded here: see the `bounds` override in the test.
     "duration_ms": (0, 0),
     "status": (400, 599),
-    "error_count": (0, MAX_VALIDATION_ERRORS_LOGGED),
+    # The TRUE total, not the logged cap. `error_count` is `len(exc.errors())` while the `errors`
+    # list is truncated to MAX_VALIDATION_ERRORS_LOGGED, which is the point of reporting both: an
+    # operator sees that more were rejected than are shown. Bounding it by the cap was wrong, and
+    # a body of twelve unknown fields proved it. The ceiling is the field count a body can carry
+    # under the size limit, which is what bounds the record.
+    "error_count": (0, MAX_BODY_BYTES),
     "score": (0.0, 100.0),
     "evidence_coverage": (0.0, 1.0),
 }
@@ -2508,6 +2531,17 @@ def _drive_every_error_shape(probe: TestClient, record: _Recorder) -> None:
     )
     # A field name that scrubs to EMPTY, which is the one input `sanitise_log_part` exists for.
     record(probe.post("/v1/assess", headers=AUTH, json={"*": 1}), "422 unprintable field name")
+    # ASTRAL LETTER field names, twelve of them. `\w` kept every one and each cost twelve bytes as
+    # a surrogate escape, so this body wrote a 6,516-byte record against an assertion of 4,096.
+    # Authenticated, so inside the shared-token exception, and the assertion was still false.
+    record(
+        probe.post(
+            "/v1/assess",
+            headers=AUTH,
+            json={chr(0x1D400) * 70 + str(index): 1 for index in range(12)},
+        ),
+        "422 astral field names",
+    )
     record(probe.get(f"/healthz?token={TEST_TOKEN}"), "query string")
     record(probe.request("DELETE", "/v1/assess", headers=AUTH), "405")
     record(probe.get("/nowhere-at-all", headers=AUTH), "404")
@@ -2805,8 +2839,21 @@ def test_every_audit_value_rule_can_actually_reject_something() -> None:
     assert set(AUDIT_PATTERN_NEWLINE_CANARIES) == {
         field for field, rule in AUDIT_STRING_VALUES.items() if isinstance(rule, _Pattern)
     }, "every pattern rule needs a trailing-newline canary"
+    # And EVERY fail-closed arm, because four of the five could be deleted with the suite green, in
+    # the commit whose whole thesis is that a claim without a canary is a fact nobody asserts.
+    for field, value, expected in (
+        ("no_such_field", "anything", "is a string no rule pins"),
+        ("no_such_number", 1, "is a number no bound pins"),
+        ("no_such_flag", True, "is a boolean no rule pins"),
+        ("path", object(), "which no rule pins"),
+    ):
+        complaints: list[str] = []
+        _check_audit_value(field, value, f"canary.{field}", {}, complaints)
+        assert complaints and expected in complaints[0], (
+            f"the fail-closed arm for {field!r} did not fire: {complaints}"
+        )
     # And the dispatch itself must refuse a rule it cannot evaluate, rather than passing the value.
-    complaints: list[str] = []
+    complaints = []
     _check_audit_value("actor", "anything", "canary.actor", {}, complaints)
     assert not complaints, complaints
     unknown: dict[str, Any] = {"actor": object()}

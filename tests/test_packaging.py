@@ -123,3 +123,44 @@ def test_the_archive_is_flat_and_carries_the_files_the_platform_builds_from(
     assert any(name.startswith("tests/") for name in listing), (
         "the platform runs the suite against the archive root, so the tests must ship"
     )
+
+
+def test_the_two_version_stamps_agree_and_the_changelog_names_the_release() -> None:
+    """CLAUDE.md says the two stamps "must agree", and until now nothing checked that they did.
+
+    That is the defect class this whole range has been about: a rule asserted in prose, with no
+    data asserting it. The stamps can drift in one edit, and the drift is invisible until the
+    platform builds a wheel version that does not match what the archive name claims.
+
+    The stamp is NOT bumped per pre-release round, and that reading is recorded here rather than
+    left implicit, because a reviewer reasonably reads "bump on every change" as per-commit. V0.1
+    is unreleased: every round so far hardens the same undelivered artefact, so `0.1.0` is still
+    the version that will ship as V0.1, and a bump to `0.1.1` would assert a patch to a release
+    that never happened. The stamp moves on DELIVERY. The changelog row moves every round.
+    """
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    declared = [
+        line.split("=", 1)[1].strip().strip('"')
+        for line in pyproject.splitlines()
+        if line.startswith("version =")
+    ]
+    assert len(declared) == 1, f"pyproject.toml declares {len(declared)} versions: {declared}"
+    package = (REPO_ROOT / "src" / "pree" / "__init__.py").read_text(encoding="utf-8")
+    stamps = [
+        line.split("=", 1)[1].strip().strip('"')
+        for line in package.splitlines()
+        if line.startswith("__version__")
+    ]
+    assert stamps == declared, (
+        f"the two version stamps disagree: pyproject.toml says {declared}, "
+        f"src/pree/__init__.py says {stamps}"
+    )
+    # And the release the changelog names has to be the one the stamp will ship as. `0.1.0` is
+    # V0.1; a stamp of `0.2.0` with a changelog still headed V0.1 is a delivery-name defect that
+    # only shows up in the archive filename, which is the rollback source.
+    major, minor, _ = declared[0].split(".")
+    changelog = (REPO_ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
+    expected = f"## V{major}.{minor}"
+    assert expected in changelog, (
+        f"the stamp {declared[0]} ships as {expected}, and the changelog has no such heading"
+    )

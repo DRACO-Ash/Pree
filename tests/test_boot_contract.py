@@ -549,6 +549,26 @@ def test_the_environment_allowlist_cannot_admit_a_platform_or_credential_name() 
         f"these names are on the allowlist and read like a credential, so a value could be frozen "
         f"into a layer under one: {credential}"
     )
+    # And the allowlist itself, as an EXACT literal, the way SUID_SWEEP is pinned. Disjointness and
+    # term-absence are two properties, and a dangerous name can satisfy both:
+    # `ENV PYTHONPATH=/app/plugins` is neither platform-injected nor credential-shaped and is
+    # arbitrary code execution in the shipped image through any module on that path. So are
+    # PYTHONOPTIMIZE, PYTHONSTARTUP, LD_PRELOAD, SSL_CERT_FILE and HTTPS_PROXY. Enumerating that
+    # class is the losing game this project has already lost seven times over a term table; naming
+    # the permitted set closes it without enumerating anything.
+    permitted = frozenset(
+        {
+            "PYTHONDONTWRITEBYTECODE",
+            "PIP_NO_CACHE_DIR",
+            "PIP_DISABLE_PIP_VERSION_CHECK",
+            "PYTHONUNBUFFERED",
+            "PATH",
+        }
+    )
+    assert permitted == _ALLOWED_ENV_NAMES, (
+        f"the environment allowlist is {sorted(_ALLOWED_ENV_NAMES)}. Adding a name means changing "
+        f"this literal, which is a decision a reviewer sees in the diff"
+    )
 
 
 def test_no_stage_sets_an_environment_variable_outside_the_allowlist() -> None:
@@ -1011,9 +1031,17 @@ def test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits() -> None:
     """A PROPERTY the sweep must have, not a literal it must equal.
 
     The two exact-text copies raise the cost of neutering the sweep from one coordinated edit to
-    two, which is real but finite: a property is not satisfiable by any number of coordinated
-    edits, because there is no literal to bring into line. This is the control that should
-    eventually replace them.
+    two. An earlier version of this docstring said a property "is not satisfiable by any number of
+    coordinated edits", and that was FALSE and dangerous, because it was an argument for deleting
+    the literals: the first version of this test asserted predicates and not the start path, so
+    `find /opt/venv -xdev -perm /6000 ...` satisfied it in ONE edit and cleared nothing. Nine
+    neutering forms satisfied it, confirmed against a fixture carrying 4755, 2755 and 6755 files.
+
+    The property and the literals are COMPLEMENTARY, not ranked. The literals catch anything that
+    changes the command's text; the property catches a change that keeps the text plausible. Both
+    are kept, and this test now pins the start path and the predicate set exactly rather than
+    checking absence from a denylist, because enumerating what is refused will always be one
+    short.
 
     What a neutered sweep looks like, from four rounds of trying: a predicate that narrows the set
     `find` visits (`-uid`, `-user`, `-group`, `-newer`, `-regex`, `-name`, `-path`, `-mtime`) or a
@@ -1022,6 +1050,22 @@ def test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits() -> None:
     """
     sweep = next(i for i in _instructions() if "-perm" in i.argument and "chmod" in i.argument)
     collapsed = " ".join(sweep.argument.split())
+    # The START PATH, which the property did not assert at all: `find /opt/venv -xdev -perm /6000`
+    # satisfies every predicate check below and clears nothing outside the venv, in a SINGLE edit.
+    # That is what makes the claim "a property is not satisfiable by any number of coordinated
+    # edits" false, and it is corrected in the docstring above.
+    arguments = collapsed.split()
+    assert arguments[:2] == ["/usr/bin/find", "/"], (
+        f"the sweep must start at / with the absolute binary; it starts {arguments[:2]}"
+    )
+    # The predicate set EXACTLY, not an absence from a denylist. Nine forms defeated the denylist
+    # against a real fixture, among them `-fstype`, `-type l`, `-quit`, `-false`, `-prune`,
+    # `-mindepth` and a second `-perm`, and enumerating what is refused will always be one short.
+    predicates = {word for word in arguments if word.startswith("-") and not word[1:].isdigit()}
+    assert predicates == {"-xdev", "-perm", "-type", "-o", "-exec"}, (
+        f"the sweep carries predicates outside the vetted set, so it may visit fewer files than "
+        f"it appears to: {sorted(predicates)}"
+    )
     narrowing = [
         predicate
         for predicate in (

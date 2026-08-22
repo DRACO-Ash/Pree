@@ -872,11 +872,40 @@ Engineering review after the security PASS, three majors and six minors:
 ● The path scrub used the actor charset, which deletes `/` and `%`, so `/v1/assess` became
   `v1assess` and two requests produced an identical record. There is a path charset, the pin matches
   what the application can emit, and the separator is asserted present.
-● The suid sweep now also has a PROPERTY test, which the engineering gate named as stronger than
-  duplication: no narrowing predicate, and the /6000 mask that is both bits. The three-edit attack
-  that defeats both literal copies turns it red.
+● The suid sweep property test is strengthened and the claim recorded for it withdrawn. It asserted
+  the predicate set and not the START PATH, so `find /opt/venv -xdev -perm /6000` satisfied it in
+  ONE edit and cleared nothing outside the virtual environment; nine forms satisfied it against a
+  fixture of 4755, 2755 and 6755 files. It now pins the start path and the exact predicate set, and
+  the single-edit neutering turns four tests red. The claim that a property "is not satisfiable by
+  any number of coordinated edits" was false and was an argument for deleting the literal copies;
+  property and literals are complementary, and both are kept.
 ● Minors: a stale byte-cost comment in app.py that cited a test now asserting the opposite; an
   orphaned comment fragment; one incident narrated four times and one channel three times, cut to
   the telling nearest each assertion; sixteen stale test-count literals replaced with "the whole
   suite green", which the changelog already said was the rule; and the `record` seam typed with a
   Protocol so a caller that drops `docs=` is a type error.
+
+Security re-review, four majors and three minors, and the round's own corrections:
+
+● The audit scrub is split by data PROVENANCE. The actor label stays Unicode-aware, because an
+  operator's name may legitimately be non-Latin and the 64-character cap bounds it; caller-supplied
+  data is ASCII-only. A single Unicode charset let `%F0%9D%90%80` (U+1D400, an astral LETTER that
+  `\w` keeps) through, at twelve bytes each as a surrogate escape: a 160-character path wrote 1,802
+  bytes where the test asserted 416. Astral inputs are now in both bound tests.
+● `error_count` was bounded by MAX_VALIDATION_ERRORS_LOGGED, and the application reports the TRUE
+  total while capping only the `errors` list. The bound was wrong, not the application.
+● The ENV allowlist is pinned as an exact literal frozenset, which closes the
+  `ENV PYTHONPATH=/app/plugins` class without enumerating it.
+● All four fail-closed arms of the audit value check are canaried: unpinned string, unbounded
+  number, unnamed boolean, unhandled type. Four of the five could be deleted with the suite green.
+● Three claims of mine are corrected in place rather than reworded, because they are the sentences a
+  human would rely on: the app.py comment claiming the test asserts one byte per character (it
+  asserts `isascii() and isprintable()` plus a whole-line ceiling, and the ratio is a consequence of
+  those two); the security register's "not satisfiable by any number of coordinated edits", which
+  was false and was an argument for deleting the literals; and the single neutering-cost figure
+  quoted for every container rule, which varies by rule.
+● The two version stamps "must agree" per CLAUDE.md, and nothing checked that they did. There is now
+  a test, and it also pins the changelog heading the stamp will ship as. The stamp does NOT move per
+  pre-release round: V0.1 is unreleased, every round hardens the same undelivered artefact, and
+  `0.1.1` would assert a patch to a release that never happened. That reading is recorded in the
+  test rather than left implicit. The stamp moves on delivery; the changelog row moves every round.

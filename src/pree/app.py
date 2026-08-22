@@ -108,8 +108,12 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 #
 # The bound is on CHARACTERS and the cost WAS in bytes: the path arrives percent-decoded, and
 # json.dumps rendered one astral code point as a 12-byte surrogate escape, so 160 characters could
-# cost nearly 2 KB. The scrub below removes that amplification rather than bounding it, since every
-# character costing more than one is now stripped, and the test asserts one byte per character.
+# cost nearly 2 KB. sanitise_log_path removes that amplification rather than bounding it: its
+# charset is re.ASCII, so nothing multi-byte survives. What is ASSERTED, in
+# test_a_long_request_path_cannot_write_an_unbounded_audit_line, is `path.isascii() and
+# path.isprintable()` per record plus a whole-line ceiling of MAX_LOGGED_PATH + 256 bytes; one
+# byte per character is the consequence of those two, not a separate assertion. An earlier
+# version of this comment claimed the test asserted the byte ratio directly, and it did not.
 MAX_LOGGED_PATH = 160
 # The store key's shape, enforced at the boundary rather than assumed. Two identifiers of at
 # most 64 characters and the colon between them.

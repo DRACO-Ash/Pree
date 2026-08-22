@@ -1715,8 +1715,10 @@ in place rather than reworded.
 The remaining risk is in the VERIFICATION, not in the application, and the single largest gap is
 named plainly: **the container hardening rules have never been checked against a real image.** No
 setuid or setgid bits, the non-root numeric user, the absence of pip and the single flattened layer
-are each a hard rule, and each is currently verified only by text that three coordinated edits can
-neuter - measured, not hypothesised. `scripts/simulate-pipeline.sh` exits 2 and says so. Exit 2 is
+are each a hard rule, and each is currently verified only by reading the Dockerfile TEXT. No number
+of text assertions is evidence about a built image, and the cost of neutering one varies by rule
+rather than being the single figure this paragraph used to quote. `scripts/simulate-pipeline.sh`
+exits 2 and says so. Exit 2 is
 not a pass. The containerize leg should be a required gate on a runner with a Docker daemon before
 the first production deploy.
 
@@ -1952,11 +1954,75 @@ not generalise to duplicated logic over the same input: the control-table parse 
 read the same file twice and derived the same conclusion, so a second copy added edit cost and
 nothing a reviewer would not see in the diff, and drift between them is its own defect source.
 
-And it named the stronger move, which is now implemented. Two literal copies raise the cost of
-neutering the sweep from one coordinated edit to two, which is real but finite. A PROPERTY is not
-satisfiable by any number of coordinated edits, because there is no literal to bring into line. So
-the sweep is now also asserted to carry no narrowing predicate and to test the `/6000` mask that is
-both bits: the three-edit attack that defeats both literals turns the property red.
+And it named a second move, which is now implemented, though the sentence recorded here about it
+was wrong and is corrected. Two literal copies raise the cost of neutering the sweep from one
+coordinated edit to two. This register previously said a PROPERTY "is not satisfiable by any number
+of coordinated edits, because there is no literal to bring into line", and asserted that a
+three-edit attack defeating both literals would turn it red. Both claims were **false**, and worse,
+the first is an argument for deleting the literals: the property as first written asserted the
+predicate set and not the START PATH, so `find /opt/venv -xdev -perm /6000 ...` satisfied it in ONE
+edit and cleared nothing outside the virtual environment. Nine neutering forms satisfied it against
+a fixture carrying 4755, 2755 and 6755 files, among them `-fstype`, `-type l`, `-quit` and `-false`,
+all of which the then-current denylist missed.
+
+The property and the literals are **complementary, not ranked**. The literals catch anything that
+changes the command's text; the property catches a change that keeps the text plausible. Both are
+kept. The property now pins the start path as `["/usr/bin/find", "/"]` and the predicate set as
+exactly `{-xdev, -perm, -type, -o, -exec}`, rather than checking absence from a denylist, because
+enumerating what is refused will always be one short. With the start path pinned, the single-edit
+neutering turns four tests red. Verified in
+`tests/test_boot_contract.py::test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits`.
+
+### Security re-review after the engineering round: four majors, and the sentence the deploy needs
+
+Four majors and three minors, all in the verification layer, none in the application. Recorded
+because the pattern is now the finding.
+
+● **The scrub was one charset for two kinds of data.** `\w` in a Python str pattern is
+  Unicode-aware, so `%F0%9D%90%80` (U+1D400, category Lu, an astral LETTER) survived it and cost
+  twelve bytes each as a surrogate escape. A 160-character path wrote 1,802 bytes against the 416
+  the test asserted: the bound held and the assertion about it did not. Split by PROVENANCE, which
+  is the distinction that was missing. `_UNSAFE_LOG_CHARS` stays Unicode for the actor label,
+  deliberately, because an operator's name may legitimately be non-Latin and the 64-character cap
+  bounds the cost. `_UNSAFE_ASCII_CHARS` and `_UNSAFE_PATH_CHARS` are `re.ASCII`, because that data
+  is caller-supplied. Reverting the path charset to Unicode turns
+  `test_a_long_request_path_cannot_write_an_unbounded_audit_line` red; astral inputs are in both
+  bound tests, and the per-record assertion is `path.isascii() and path.isprintable()`.
+● **A bound I wrote was wrong about the application, not the reverse.** `error_count` was bounded by
+  `MAX_VALIDATION_ERRORS_LOGGED`. The handler reports the TRUE total and truncates only the `errors`
+  list, which is the correct behaviour; the bound is now `MAX_BODY_BYTES`.
+● **The ENV allowlist is pinned as an exact literal frozenset.** A denylist of environment names was
+  one entry short seven times running. Pinning the permitted set closes `ENV PYTHONPATH=/app/plugins`
+  and its whole class without enumerating anything.
+● **Four of the five fail-closed arms could be deleted with the suite green.** All four are now
+  canaried on synthetic input with a known outcome: unpinned string, unbounded number, unnamed
+  boolean, unhandled type. A rule that never fires pins nothing, and that applies to the refusal
+  arms as much as to the rules they back.
+
+Three claims of my own are corrected in place, and one control that existed only in prose is now
+data:
+
+● The comment at `src/pree/app.py` claiming "the test asserts one byte per character". The test
+  asserts `isascii() and isprintable()` per record plus a whole-line ceiling of
+  `MAX_LOGGED_PATH + 256`; one byte per character follows from those two and is not itself asserted.
+  The comment now names the test and states what it actually checks.
+● The property claim, corrected above.
+● The single neutering-cost figure quoted for every container rule. The cost varies by rule, and no
+  number of text assertions is evidence about a built image, which is the point that paragraph
+  exists to make.
+● CLAUDE.md requires the two version stamps to agree, and nothing checked that they did: a rule in
+  prose with no data behind it, which is the defect class of this entire range.
+  `tests/test_packaging.py::test_the_two_version_stamps_agree_and_the_changelog_names_the_release`
+  now asserts both stamps and the changelog heading the stamp will ship as; both arms are canaried.
+  It also records why the stamp does not move per pre-release round, so the next reviewer does not
+  read the static stamp as a missed bump.
+
+**The sentence the deploy decision needs, and it is not "PASS".** The shipped application's boundary
+behaviour is sound, and it has held under every probe for many rounds. Every failure in this range
+is in the layer that is supposed to prove it, and most are in the previous round's fix. None of it
+is exploitable by an internet client against the tree as it stands today. All of it lowers the cost
+of the next regression to roughly one line. Those are different statements from a pass, and the
+second is the one that should govern how much a reader trusts a green loop here.
 
 ## Not accepted, and why it is not a risk here
 
