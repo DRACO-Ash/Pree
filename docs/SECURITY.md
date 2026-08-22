@@ -42,7 +42,7 @@ the assessment store.
 | A snapshot too deep to parse fails closed, not into an unhandled 500 | `src/pree/store.py` | `test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing` |
 | The liveness handlers never occupy the shared request threadpool | `src/pree/app.py` | `test_the_liveness_routes_never_occupy_the_shared_request_threadpool` |
 | The five documented liveness paths exist and stay unmetered | `src/pree/app.py` | `test_the_liveness_contract_is_exactly_the_five_documented_paths`, `test_every_documented_liveness_path_is_exempt_from_rate_limiting` |
-| Production refuses a short or low-variety team token | `src/pree/config.py` | `test_production_refuses_a_short_or_guessable_token`, `test_production_refuses_a_token_with_too_little_variety` |
+| Production refuses a short or wholly repeated team token | `src/pree/config.py` | `test_production_refuses_a_short_token`, `test_production_refuses_a_token_built_entirely_from_repetition` |
 | The security policy has exactly one controls section | `docs/SECURITY.md` | `test_the_security_policy_has_exactly_one_controls_section` |
 | The documented liveness paths match the pinned literals | `docs/DEPLOYMENT.md` | `test_the_documented_liveness_paths_match_the_paths_the_code_pins` |
 | Every control row here cites a test that exists | `docs/SECURITY.md` | `test_every_control_row_cites_a_test_that_exists`, `test_the_where_column_of_every_control_row_points_at_a_real_file` |

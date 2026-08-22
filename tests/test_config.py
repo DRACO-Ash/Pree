@@ -7,6 +7,7 @@ collide with another process or leave state behind.
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from pree.config import (
     DEFAULT_PORT,
     MAX_PORT,
     MIN_PORT,
+    MIN_PRODUCTION_TOKEN_LENGTH,
     ConfigError,
     load_config,
 )
@@ -244,15 +246,17 @@ def test_a_control_character_in_a_value_is_refused(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.parametrize("weak", ["a", "changeme", "pree", "x" * 23])
-def test_production_refuses_a_short_or_guessable_token(tmp_path: Path, weak: str) -> None:
+@pytest.mark.parametrize("weak", ["a", "changeme", "pree", "aB3-dE6_fG9.hJ2~kL5mN8pQ"])
+def test_production_refuses_a_short_token(tmp_path: Path, weak: str) -> None:
     """The single credential guarding the whole store deserves a fail-closed boot check.
 
     Wrong-token attempts are rate limited per address, but the coarse tier allows 240 a minute
     per address per worker, which puts a dictionary of common choices well inside an hour from
     one address and far less across several. A one-character token started production happily.
     """
-    with pytest.raises(ConfigError, match="below the"):
+    # The last case clears the repetition rule and fails only on length, so this test pins
+    # the length floor specifically rather than passing because some other floor fired.
+    with pytest.raises(ConfigError, match=f"below the {MIN_PRODUCTION_TOKEN_LENGTH}"):
         load_config(
             {
                 "PREE_ENV": "production",
@@ -284,18 +288,26 @@ def test_development_does_not_impose_the_length_floor(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "repetitive", ["passwordpasswordpassword", "a" * 30, "abababababababababababab"]
+    "repetitive",
+    [
+        "passwordpasswordpasswordpassword",
+        "a" * 40,
+        "ab" * 20,
+        "Bluestaq2026!Bluestaq2026!Bluestaq2026!Bluestaq2026!",
+    ],
 )
-def test_production_refuses_a_token_with_too_little_variety(
+def test_production_refuses_a_token_built_entirely_from_repetition(
     tmp_path: Path, repetitive: str
 ) -> None:
-    """The claim said "short or guessable" while a repeated dictionary word booted.
+    """A repeated word cleared the length floor while the claim said "guessable".
 
-    Either the wording narrows or the control ships. Shipping it: a token from the named
-    generation command has far more character variety than this floor, so it costs a real
-    credential nothing and refuses the shapes a person actually chooses by hand.
+    A distinct-character count was tried first and was worse than nothing: it refused a real
+    secrets.token_hex(16) about 1.7% of the time, which teaches an operator to weaken a
+    credential until the checker stops complaining, while still admitting a doubled project
+    name. Repetition is a property of the string, so it is checked directly.
     """
-    with pytest.raises(ConfigError, match="distinct characters"):
+    assert len(repetitive) >= MIN_PRODUCTION_TOKEN_LENGTH, "this case must fail on repetition"
+    with pytest.raises(ConfigError, match="repetitions of"):
         load_config(
             {
                 "PREE_ENV": "production",
@@ -306,9 +318,18 @@ def test_production_refuses_a_token_with_too_little_variety(
         )
 
 
-def test_a_generated_token_clears_both_production_floors(tmp_path: Path) -> None:
-    """Guard the floors against being set somewhere a real token cannot reach."""
-    generated = secrets.token_urlsafe(32)
+@pytest.mark.parametrize(
+    "generator", [lambda: secrets.token_urlsafe(32), lambda: secrets.token_hex(16)]
+)
+def test_a_generated_token_clears_both_production_floors(
+    tmp_path: Path, generator: Callable[[], str]
+) -> None:
+    """Guard the floors against being set somewhere a standard generator cannot reach.
+
+    token_hex(16) is included deliberately: it is a 128-bit credential and the shape
+    `openssl rand -hex 16` produces, and the floor this replaced refused it 1.7% of the time.
+    """
+    generated = generator()
     config = load_config(
         {
             "PREE_ENV": "production",

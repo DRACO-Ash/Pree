@@ -16,6 +16,7 @@ from pree.app import LIVENESS_PATHS, MAX_BODY_BYTES, STORAGE_PROBE_PATH, create_
 from pree.audit import build_logger
 from pree.health import StorageProber
 from pree.ratelimit import RateLimiter
+from pree.security import MAX_ACTOR_LENGTH, sanitise_actor
 from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, TEST_TOKEN, build_client, make_config
 
@@ -23,6 +24,10 @@ from tests.conftest import AUTH, TEST_TOKEN, build_client, make_config
 # contract in CLAUDE.md and in the deployment sheet; a test that reads them from the constant
 # it is checking cannot notice the constant shrinking.
 EXPECTED_LIVENESS_PATHS = frozenset({"/", "/healthz", "/readyz", "/livez", "/ping"})
+
+# A label that sanitisation visibly changes: newline, braces, quotes and over-length. Using
+# an actor that survives sanitisation unchanged is what let the enforcement point go unpinned.
+FORGING_ACTOR = 'ops\n{"kind":"audit","actor":"root"}' + "Z" * 500
 
 FULL_BODY = {
     "protected_asset_id": "asset-01",
@@ -358,7 +363,7 @@ def test_a_failing_store_returns_a_generic_503_and_still_audits_the_action(
     app = create_app(config, store, logger=build_logger(buffer), prober=prober)
     with TestClient(app, raise_server_exceptions=False) as failing:
         response = failing.post(
-            "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": "ops.lead"}
+            "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": FORGING_ACTOR}
         )
     captured = buffer.getvalue()
     assert response.status_code == 503
@@ -370,7 +375,11 @@ def test_a_failing_store_returns_a_generic_503_and_still_audits_the_action(
     ]
     assert audit_lines, f"expected an audit line, got: {captured!r}"
     assert audit_lines[-1]["outcome"] == "error"
-    assert audit_lines[-1]["actor"] == "ops.lead"
+    # The SANITISED label, not one that survives sanitisation unchanged. Asserting "ops.lead"
+    # here left the handler's sanitise_actor call unpinned: removing it kept the suite green.
+    assert audit_lines[-1]["actor"] == sanitise_actor(FORGING_ACTOR)
+    assert "\n" not in audit_lines[-1]["actor"]
+    assert len(audit_lines[-1]["actor"]) == MAX_ACTOR_LENGTH
 
 
 def test_cors_allows_only_the_configured_origin(
@@ -483,7 +492,7 @@ def test_a_real_storage_refusal_returns_503_and_audits_the_action(
     with TestClient(app, raise_server_exceptions=False) as failing:
         monkeypatch.setattr(Path, "open", refuse)
         response = failing.post(
-            "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": "ops.lead"}
+            "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": FORGING_ACTOR}
         )
         monkeypatch.undo()
     assert response.status_code == 503
@@ -495,6 +504,10 @@ def test_a_real_storage_refusal_returns_503_and_audits_the_action(
     ]
     assert audits, f"no audit line for a failed privileged action: {buffer.getvalue()!r}"
     assert audits[-1]["outcome"] == "error"
+    # Asserting the SANITISED value, not a value sanitisation happens to leave alone. The
+    # earlier version used "ops.lead", which passes through unchanged, so removing the
+    # sanitiser call from the handler left the whole suite green.
+    assert audits[-1]["actor"] == sanitise_actor(FORGING_ACTOR)
 
 
 def test_the_storage_state_is_logged_once_per_transition_not_once_per_probe(

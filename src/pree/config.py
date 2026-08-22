@@ -22,11 +22,13 @@ _CONTROL_CHARS = frozenset(chr(code) for code in [*range(0, 32), 127])
 # limited per address, but 240 a minute per address per worker puts a dictionary of common
 # choices well inside an hour, so a short or guessable token gets the same fail-closed boot
 # treatment as an unsafe origin rather than a warning nobody reads.
-MIN_PRODUCTION_TOKEN_LENGTH = 24
-# A 24-character repetition of one dictionary word cleared the length floor while the
-# control was described as rejecting a guessable token. secrets.token_urlsafe(32) yields 43
-# characters with far more variety than this, so the floor costs a real token nothing.
-MIN_PRODUCTION_TOKEN_VARIETY = 12
+MIN_PRODUCTION_TOKEN_LENGTH = 32
+# A repeated word cleared the length floor, so repetition is refused directly. A count of
+# distinct characters was tried first and was worse than nothing: it refused a real
+# secrets.token_hex(16) about 1.7% of the time, which teaches an operator to weaken a
+# credential until the checker stops complaining, while still admitting
+# "Bluestaq2026!Bluestaq2026". These two rules are properties of the string, not guesses
+# about its entropy, and a 32-character floor clears token_hex(16) and token_urlsafe(24).
 _ORIGIN_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
 
 DEFAULT_PORT = 8080
@@ -116,6 +118,18 @@ def _resolve_data_dir(env: dict[str, str]) -> Path:
     return path
 
 
+def _smallest_repeating_unit(value: str) -> str:
+    """The shortest prefix whose repetition reproduces the whole string.
+
+    Returns the value itself when it is not an exact repetition, so a token that merely
+    contains a repeated fragment is not refused; only one built entirely from repetition is.
+    """
+    for size in range(1, len(value) // 2 + 1):
+        if len(value) % size == 0 and value[:size] * (len(value) // size) == value:
+            return value[:size]
+    return value
+
+
 def _validate_origin_shape(origin: str | None) -> None:
     """Reject an origin that is not a real origin, in every environment.
 
@@ -162,12 +176,12 @@ def _validate_production_auth(token: str | None, origin: str | None, environment
             f"{MIN_PRODUCTION_TOKEN_LENGTH} required in production. Generate one with "
             f'python -c "import secrets; print(secrets.token_urlsafe(32))".'
         )
-    if len(set(token)) < MIN_PRODUCTION_TOKEN_VARIETY:
+    unit = _smallest_repeating_unit(token)
+    if len(unit) * 2 <= len(token):
         raise ConfigError(
-            f"Refusing to start: PREE_TEAM_TOKEN uses only {len(set(token))} distinct "
-            f"characters, below the {MIN_PRODUCTION_TOKEN_VARIETY} required in production. "
-            f'Generate one with python -c "import secrets; '
-            f'print(secrets.token_urlsafe(32))".'
+            f"Refusing to start: PREE_TEAM_TOKEN is {len(token) // len(unit)} repetitions of "
+            f"a {len(unit)}-character sequence. Generate one with "
+            f'python -c "import secrets; print(secrets.token_urlsafe(32))".'
         )
     if origin is None:
         raise ConfigError(

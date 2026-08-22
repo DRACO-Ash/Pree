@@ -10,9 +10,10 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import shutil
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-
-import pytest
 
 from pree.health import StorageProbe
 from tests.test_api import EXPECTED_LIVENESS_PATHS
@@ -21,8 +22,66 @@ ON_PLATFORM_RUNNER = os.environ.get("GITLAB_CI") == "true"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+@dataclass(frozen=True)
+class _Instruction:
+    """One resolved Dockerfile instruction, with comments and continuations removed."""
+
+    stage: int
+    stage_name: str
+    keyword: str
+    argument: str
+    index: int
+
+
 def _dockerfile() -> str:
     return (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+
+def _instructions() -> list[_Instruction]:
+    """Parse the Dockerfile into resolved instructions, per build stage.
+
+    Every assertion below used to be a substring grep over the raw text, and every one of them
+    was defeatable: `USER root` appended after the numeric user, a `chmod u+s` after the suid
+    sweep, `ENV PORT 9999` in the legacy space-separated form, a bind to loopback with the
+    0.0.0.0 string left behind in a comment, a non-exec CMD with "exec gunicorn" left in a
+    comment, and a second COPY into the supposedly single-layer stage. Comments are stripped
+    and the resolved final-stage state is what gets asserted.
+    """
+    text = _dockerfile()
+    joined: list[str] = []
+    buffer = ""
+    for raw in text.splitlines():
+        line = raw.split("#")[0].rstrip() if raw.lstrip().startswith("#") else raw.rstrip()
+        if line.lstrip().startswith("#") or not line.strip():
+            continue
+        buffer += line[:-1] + " " if line.endswith("\\") else line
+        if not line.endswith("\\"):
+            joined.append(buffer.strip())
+            buffer = ""
+    if buffer:
+        joined.append(buffer.strip())
+
+    out: list[_Instruction] = []
+    stage = -1
+    stage_name = ""
+    for index, line in enumerate(joined):
+        parts = line.split(None, 1)
+        keyword = parts[0].upper()
+        argument = parts[1] if len(parts) > 1 else ""
+        if keyword == "FROM":
+            stage += 1
+            pieces = argument.split()
+            stage_name = (
+                pieces[-1].lower() if len(pieces) >= 3 and pieces[-2].upper() == "AS" else ""
+            )
+        out.append(_Instruction(stage, stage_name, keyword, argument, index))
+    return out
+
+
+def _final_stage() -> list[_Instruction]:
+    instructions = _instructions()
+    last = max(i.stage for i in instructions)
+    return [i for i in instructions if i.stage == last]
 
 
 def test_the_dockerfile_sits_at_the_repository_root() -> None:
@@ -30,46 +89,85 @@ def test_the_dockerfile_sits_at_the_repository_root() -> None:
     assert (REPO_ROOT / "Dockerfile").is_file()
 
 
-def test_the_dockerfile_never_bakes_the_port_or_the_data_directory() -> None:
-    """An ENV default always beats a code fallback chain and defeats platform injection."""
-    body = _dockerfile()
-    assert "ENV PORT=" not in body
-    assert "ENV PREE_DATA_DIR=" not in body
-    assert "ENV STORAGE_MOUNT_PATH=" not in body
+def test_the_resolved_runtime_user_is_the_non_root_numeric_one() -> None:
+    """The LAST USER in the final stage is what runs, not the first one present.
+
+    Appending `USER root` left the old grep green while the container ran as root.
+    """
+    users = [i.argument.strip() for i in _final_stage() if i.keyword == "USER"]
+    assert users, "the final stage sets no USER at all, so it runs as root"
+    assert users[-1] == "10001:10001", f"the effective runtime user is {users[-1]!r}"
 
 
-def test_the_container_binds_every_interface_on_the_platform_port() -> None:
-    body = _dockerfile()
-    assert "0.0.0.0:${PORT:-8080}" in body
-    assert "EXPOSE 8080" in body
+def test_no_stage_bakes_the_port_or_the_data_directory() -> None:
+    """An ENV default beats the code fallback chain and defeats platform injection.
+
+    Checked per resolved instruction and in both syntaxes: `ENV KEY=VALUE` and the legacy
+    `ENV KEY VALUE`, the latter of which slipped past a grep for `ENV PORT=`.
+    """
+    baked: list[str] = []
+    for instruction in _instructions():
+        if instruction.keyword != "ENV":
+            continue
+        for assignment in instruction.argument.split():
+            name = assignment.split("=")[0]
+            if name in {"PORT", "PREE_DATA_DIR", "STORAGE_MOUNT_PATH"}:
+                baked.append(f"{instruction.keyword} {instruction.argument}")
+        first = instruction.argument.split(None, 1)[0] if instruction.argument else ""
+        if "=" not in first and first in {"PORT", "PREE_DATA_DIR", "STORAGE_MOUNT_PATH"}:
+            baked.append(f"{instruction.keyword} {instruction.argument}")
+    assert not baked, f"platform-injected values baked into the image: {baked}"
 
 
-def test_the_container_runs_as_a_non_root_numeric_user() -> None:
-    assert "USER 10001:10001" in _dockerfile()
+def test_the_effective_launch_command_binds_every_interface_and_execs() -> None:
+    """Asserted on the resolved CMD, not on the file.
+
+    Binding loopback while leaving the 0.0.0.0 string in a comment, and dropping `exec` while
+    leaving "exec gunicorn" in a comment, both passed the old greps.
+    """
+    commands = [i.argument for i in _final_stage() if i.keyword == "CMD"]
+    assert len(commands) == 1, f"expected exactly one CMD in the final stage, found {commands}"
+    command = commands[0]
+    assert "0.0.0.0:" in command, f"the launch command does not bind every interface: {command}"
+    assert "127.0.0.1" not in command, f"the launch command binds loopback: {command}"
+    assert "exec gunicorn" in command, (
+        f"without exec, SIGTERM never reaches the server and shutdown hangs: {command}"
+    )
+    assert "EXPOSE 8080" in _dockerfile()
 
 
-def test_the_launch_command_execs_so_sigterm_reaches_the_server() -> None:
-    assert "exec gunicorn" in _dockerfile()
+def test_the_suid_sweep_is_the_last_mutating_instruction_of_its_stage() -> None:
+    """Nothing may follow the sweep, because later instructions can re-introduce the bits.
+
+    The old version forbade only useradd, adduser and COPY in the tail, so a `chmod u+s`
+    after the sweep passed. This asserts the sweep's position against every mutating
+    instruction in its stage instead of a denylist of three.
+    """
+    instructions = _instructions()
+    sweep = next(i for i in instructions if "-perm /6000" in i.argument)
+    mutating = {"RUN", "COPY", "ADD"}
+    later = [
+        f"{i.keyword} {i.argument[:60]}"
+        for i in instructions
+        if i.stage == sweep.stage and i.keyword in mutating and i.index > sweep.index
+    ]
+    assert not later, f"instructions follow the suid sweep in its own stage: {later}"
 
 
-def test_the_suid_sweep_is_the_last_mutation_in_the_prep_stage() -> None:
-    """Later instructions can re-introduce the bits the sweep just cleared."""
-    body = _dockerfile()
-    sweep = body.index("-perm /6000")
-    prep_end = body.index("\nFROM scratch\n")
-    assert sweep < prep_end
-    tail = body[sweep:prep_end]
-    assert "useradd" not in tail
-    assert "adduser" not in tail
-    assert "COPY" not in tail
+def test_the_shipped_stage_is_exactly_one_copied_layer() -> None:
+    """The image-policy scan reads layer history, so one clean layer is the point.
 
-
-def test_the_shipped_stage_is_flattened_to_a_single_layer() -> None:
-    """The image policy scan reads layer history, so one clean layer is the only construction
-    with no history to flag."""
-    body = _dockerfile()
-    assert "\nFROM scratch\n" in body
-    assert body.count("COPY --from=prep / /") == 1
+    Counting only `COPY --from=prep / /` let a second COPY into the scratch stage pass.
+    """
+    final = _final_stage()
+    copies = [i.argument for i in final if i.keyword in {"COPY", "ADD"}]
+    runs = [i.argument for i in final if i.keyword == "RUN"]
+    assert len(copies) == 1, f"the shipped stage copies {len(copies)} times: {copies}"
+    assert copies[0].startswith("--from="), f"the single copy is not from a stage: {copies[0]}"
+    assert not runs, f"the shipped stage runs commands, adding layers: {runs}"
+    assert any(i.keyword == "FROM" and i.argument.strip().lower() == "scratch" for i in final), (
+        "the shipped stage is not FROM scratch"
+    )
 
 
 def test_the_sonar_configuration_scopes_sources_to_src() -> None:
@@ -78,28 +176,59 @@ def test_the_sonar_configuration_scopes_sources_to_src() -> None:
     assert "sonar.python.coverage.reportPaths=coverage.xml" in body
 
 
-def test_the_gitignore_blocks_every_secret_and_local_artefact() -> None:
-    body = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
-    for pattern in (".env", ".env.local", ".env.*.local", "data/", "coverage/", "coverage.xml"):
-        assert pattern in body, f".gitignore is missing {pattern}"
+def test_git_actually_ignores_every_secret_and_local_artefact() -> None:
+    """Assert the BEHAVIOUR, not the text of the file.
+
+    The previous version grepped .gitignore for substrings. Appending "!.env" kept it green
+    while `git check-ignore .env` stopped matching, so the file that would hold the production
+    token became committable, and the only behavioural guard merely checked non-existence and
+    is skipped on the platform runner.
+    """
+    candidates = [
+        ".env",
+        ".env.local",
+        ".env.production.local",
+        "data/assessments.json",
+        "coverage.xml",
+        ".coverage",
+        "src/pree/__pycache__/app.cpython-312.pyc",
+    ]
+    git = shutil.which("git")
+    assert git, "git is required to assert ignore behaviour rather than file contents"
+    result = subprocess.run(  # noqa: S603 - resolved git path, fixed literal arguments
+        [git, "check-ignore", "--stdin", "--no-index"],
+        input="\n".join(candidates),
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    ignored = set(result.stdout.split())
+    missing = [path for path in candidates if path not in ignored]
+    assert not missing, f"git does not ignore: {missing}"
 
 
 def test_the_example_environment_file_carries_no_real_value() -> None:
-    body = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "PREE_TEAM_TOKEN=\n" in body or "PREE_TEAM_TOKEN=" in body
-    assert "PORT=" not in body.replace("# PORT is injected", "")
+    """Every value must be empty or an explicit placeholder.
 
-
-@pytest.mark.skipif(
-    ON_PLATFORM_RUNNER,
-    reason=(
-        "Environment-gated negative assertion. The platform commits its own generated "
-        ".gitlab-ci.yml into the checkout, so an assertion about untracked files is "
-        "guaranteed-false there and would fail the stage that gates the deploy."
-    ),
-)
-def test_no_environment_file_is_tracked_in_the_working_tree() -> None:
-    assert not (REPO_ROOT / ".env").exists()
+    The previous version read `assert "PREE_TEAM_TOKEN=\n" in body or "PREE_TEAM_TOKEN=" in
+    body`, and the second clause is true for any value at all, so the test named
+    "carries_no_real_value" passed with a live-looking token in the file. That matters beyond
+    hygiene: the packaging allowlist ships .env.example inside the App Store archive, so a
+    pasted credential would be committed and delivered.
+    """
+    allowed_placeholders = {"", "development", "local"}
+    offending: list[str] = []
+    for line in (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        if value.strip().strip("\"'") not in allowed_placeholders:
+            offending.append(f"{name.strip()}={value.strip()}")
+    assert not offending, (
+        f"the example environment file carries values that are not placeholders: {offending}"
+    )
 
 
 def test_the_launch_command_targets_the_factory_that_actually_exists() -> None:
