@@ -476,31 +476,38 @@ def _keys_for(peer: str, headers: dict[str, str]) -> tuple[str, ...]:
 
 
 def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space() -> None:
-    """A forwarding header may only ever REDUCE a caller's allowance, never change bucket.
+    """A forwarding header may only ever ADD a constraint, never move the caller to a new one.
 
-    Two defects, one round apart. First, the peer address both tiers key on is rewritten above
-    the application by uvicorn's proxy-header middleware from a header the caller sends, so
-    rotating it minted a fresh bucket per request: measured at two workers, 0 of 1,000 refused.
-    Folding on the header's presence stopped that. But the folded key was a DIFFERENT bucket
-    from the peer's own, so a caller already at its limit escaped by adding the header:
-    measured, a throttled caller went back to 404 with any of three headers. The request is now
-    charged to both keys and refused if either is over.
+    Three defects in three rounds. The peer address both tiers key on is rewritten above the
+    application by uvicorn's proxy-header middleware from a header the caller sends, so rotating
+    it minted a fresh bucket per request. Folding on the header's presence stopped that but put
+    the request in a DIFFERENT bucket from the peer's own, so a throttled caller escaped by
+    adding the header. Charging both keys fixed that, and then the socket key was spelled
+    `socket:<ip>` only when a header was present and a bare `<ip>` when it was not: two
+    different strings again, so the escape came straight back. Measured: 240 admitted, then 240
+    more, and 20 authenticated writes then 20 more against a documented 20.
+
+    The socket key is unconditional now, so the fold can only ever add.
     """
-    plain = {_keys_for(f"10.0.0.{n}", {}) for n in range(8)}
-    assert len(plain) == 8, f"distinct peers must get distinct buckets, got {plain}"
+    bare = {_keys_for(f"10.0.0.{n}", {}) for n in range(8)}
+    assert len(bare) == 8, f"distinct peers must get distinct buckets, got {bare}"
 
     for header in ("x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"):
-        keys = [_keys_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"}) for n in range(8)]
-        # The FOLDED key, which is the one a rotating header would otherwise vary. The socket
-        # key still differs per peer by design: that is what stops the header being an escape.
-        folded = {key[0] for key in keys}
-        assert len(folded) == 1, f"a rotating {header} minted {len(folded)} buckets: {folded}"
-        assert folded == {"forwarded"}, folded
-        # And the peer's own key is still charged, so the header cannot be an escape hatch.
-        for peer_index, key_set in enumerate(keys):
-            assert f"socket:10.0.0.{peer_index}" in key_set, (
-                f"adding {header} dropped the peer's own bucket: {key_set}"
+        for index in range(8):
+            without = _keys_for(f"10.0.0.{index}", {})
+            with_header = _keys_for(f"10.0.0.{index}", {header: f"203.0.113.{index}"})
+            # The SAME socket key both times. This is the assertion the previous version was
+            # missing: it compared the folded key across peers and never compared a peer's own
+            # key with and without the header.
+            assert set(without) <= set(with_header), (
+                f"adding {header} changed the peer's own bucket from {without} to "
+                f"{with_header}, so the header buys a fresh allowance"
             )
+            assert len(with_header) == len(without) + 1, (
+                f"adding {header} did not add a constraint: {with_header}"
+            )
+        folded = {_keys_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"})[-1] for n in range(8)}
+        assert folded == {"forwarded"}, f"a rotating {header} varied the folded key: {folded}"
 
 
 def test_the_storage_probe_publishes_the_data_directory_only_on_failure(
@@ -860,6 +867,49 @@ def test_a_preflight_to_a_probe_path_is_refused_without_an_audit_line(tmp_path: 
     )
     assert metered.status_code == 400
     assert "cors_reject" in stream.getvalue()
+
+
+def test_a_wrong_method_on_a_probe_path_is_metered_and_not_audited(tmp_path: Path) -> None:
+    """The exemption is for the PROBE, not for the path.
+
+    It used to cover the path whatever the method, so any verb other than GET on one of the six
+    got a router 405 and a full audit line with nothing counting it: measured, 4,000 requests
+    across eight threads, none refused, 624,000 bytes of log in 4.60 seconds, about 8.1 MB a
+    minute per worker on the channel the forensic trail lives in. That is the same amplification,
+    at the same measured rate, that the previous commit closed for preflights while claiming to
+    have closed the last uncounted unauthenticated path.
+
+    HEAD is now a liveness method rather than a 405, because a probe may be configured to use
+    it and it was also the cheapest way in.
+    """
+    stream = io.StringIO()
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    client = build_client(
+        config,
+        build_logger(stream),
+        StorageProber(cache_seconds=0.0),
+        global_limiter=RateLimiter(4, 60.0),
+    )
+    codes = [client.request("DELETE", "/healthz").status_code for _ in range(10)]
+    assert 429 in codes, f"a wrong method on a probe path is not metered: {codes}"
+    assert 405 in codes, f"expected method-not-allowed before the limit bites: {codes}"
+    assert "http_reject" not in stream.getvalue(), (
+        "a 405 on a probe path wrote an audit line, which is the amplification channel"
+    )
+
+    # A 405 on a REAL route is still audited: the method a caller tried is worth knowing there.
+    audited = io.StringIO()
+    real = build_client(config, build_logger(audited), StorageProber(cache_seconds=0.0))
+    assert real.request("DELETE", "/v1/assess", headers=AUTH).status_code == 405
+    assert "http_reject" in audited.getvalue()
+
+
+def test_every_liveness_path_answers_head_as_well_as_get(client: TestClient) -> None:
+    """A probe configured with HEAD got a 405, on a path whose whole job is to answer 200."""
+    for path in EXPECTED_LIVENESS_PATHS:
+        response = client.head(path)
+        assert response.status_code == 200, f"HEAD {path} gave {response.status_code}"
+        assert response.content == b"", "a HEAD response carried a body"
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:

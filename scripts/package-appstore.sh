@@ -103,7 +103,7 @@ fi
 NAMED=$(printf '%s
 ' "$LISTING_NAMES" \
   | grep -vE '^\.env\.example$' \
-  | grep -iE 'keys?([_.-]|$)'\
+  | grep -iE 'keys?([_./-]|$)'\
 '|token|secret|cred|passwd|password|bearer|keytab|kubeconfig|pypirc|dotenv'\
 '|service.?account|authorized|private.?key|vault|jwt|pat[_.-]|id[_.-]?(rsa|dsa|ecdsa|ed25519)' \
   || true)

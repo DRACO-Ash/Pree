@@ -436,3 +436,25 @@ Seventeenth security review, four majors:
 ● The setuid parse had no positive control; `RateLimiter.spent` grew the table from questions;
   a non-preflight `OPTIONS` was metered twice; and the image listing leaked to the system temp
   directory on failure paths.
+
+Eighteenth security review, three majors, all in controls already repaired once:
+
+● The rate-limit escape returned through one string: the socket key was `socket:<ip>` with a
+  forwarding header and a bare `<ip>` without, two different keys, so a saturated caller added
+  any forwarding header and got a fresh bucket. Measured 240 then 240 more on the coarse tier
+  and 20 authenticated writes then 20 more. The socket key is unconditional now.
+● The unmetered-audit amplification returned through the method: the probe-path exemption
+  covered any verb, so a DELETE got a router 405 and a full audit line uncounted. 4,000
+  requests, none refused, 8.1 MB of log a minute per worker. The exemption is for the probe now,
+  not the path, the 405 is not audited, and HEAD is a liveness method rather than a 405.
+● The suid sweep guard fell for the seventh round, to the simplest attack nobody had tried:
+  `RUN cp /bin/true /usr/bin/find`, which the guard never considered. Also a DIRECTORY
+  destination, since normpath strips the trailing slash; `WORKDIR $D` from an ARG; and a local
+  tar `ADD`, which docker detects by content. ADD is now refused outright.
+● The packaging key rule omitted `/` from its delimiter class, so `docs/keys/prod.txt` shipped.
+● The image listing's name scan read a `tar -tv` line's last field, which is the link TARGET,
+  so every symlink and hard link was invisible, including to the positive control added one
+  commit earlier. The mode count also excluded the hard-link type.
+● `_TOKEN_TERMS` omitted "key", after "secret" and "passphrase" had been added for the same
+  reason. Both that table and the size-word table are now named as residuals.
+● An orphan comment described the guessing budget this project deleted.

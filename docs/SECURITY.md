@@ -101,6 +101,8 @@ the assessment store.
 | A guessing run is bounded by the ordinary limiter, with no oracle | `src/pree/app.py` | `test_a_guessing_run_is_bounded_by_the_ordinary_limiter` |
 | An unauthenticated flood cannot refuse a request the limit would admit | `src/pree/app.py` | `test_an_unauthenticated_flood_cannot_refuse_a_request_the_limit_would_admit` |
 | A preflight to a probe path is refused without an audit line | `src/pree/app.py` | `test_a_preflight_to_a_probe_path_is_refused_without_an_audit_line` |
+| A wrong method on a probe path is metered and not audited | `src/pree/app.py` | `test_a_wrong_method_on_a_probe_path_is_metered_and_not_audited` |
+| Every liveness path answers HEAD as well as GET | `src/pree/app.py` | `test_every_liveness_path_answers_head_as_well_as_get` |
 | Production refuses a cleartext allowed origin | `src/pree/config.py` | `test_production_refuses_a_cleartext_allowed_origin` |
 | The access log redacts a query string | `src/pree/audit.py` | `test_the_access_log_filter_redacts_a_query_string` |
 | A malformed store key is refused at the boundary | `src/pree/app.py` | `test_a_malformed_store_key_is_refused_at_the_boundary` |
@@ -797,6 +799,63 @@ One thing in this round was mine to notice. The middleware-position assertion I 
 minor did not type-check as an identity comparison, and the version that did type-check asserted
 nothing, because mypy read the branch as unreachable. It took three attempts to write an
 assertion that both compiles and fires.
+
+Eighteenth review: three majors, and all three were in controls this project had already
+repaired at least once.
+
+The rate-limit escape came back through one string. The socket key was spelled `socket:<ip>`
+when a forwarding header was present and a bare `<ip>` when it was not, which are two different
+keys, so a saturated caller added any forwarding header and got a fresh bucket: measured, 240
+admitted then 240 more on the coarse tier, and 20 authenticated writes then 20 more on the
+expensive path, twice the documented budget per peer and four times it at two workers. The
+docstring said a header "can only ever reduce a caller's allowance" and it doubled it. The
+socket key is unconditional now and the fold is additional, and the test that missed this
+compared the folded key across peers without ever comparing one peer's key with and without the
+header.
+
+The unmetered-audit amplification came back through the method. `_refuse_over_limit` exempted
+the six probe paths whatever the verb, so any method other than GET got a router 405 and a full
+audit line with nothing counting it: 4,000 requests across eight threads, none refused, 624,000
+bytes in 4.60 seconds, about 8.1 MB a minute per worker on the channel the forensic trail lives
+in. That is the same amplification, at the same measured rate, that the previous commit closed
+for preflights while claiming to have closed the last uncounted unauthenticated path. HEAD was
+the cheapest trigger, because FastAPI does not add HEAD for a GET route. The exemption is now
+for the probe rather than for the path, the 405 on a probe path is not audited, and HEAD is a
+liveness method.
+
+The suid sweep guard fell for the SEVENTH consecutive round, and this time the simplest form of
+the attack was the one nobody had tried: `RUN cp /bin/true /usr/bin/find`. The guard only ever
+considered COPY and ADD. Three more forms were also invisible: `normpath` strips a trailing
+slash, so a DIRECTORY destination (`/usr/bin`, `/usr/bin/`, `/usr/bin/.`) never matched a prefix
+test for `/usr/bin/` while docker still writes `/usr/bin/<basename>`; the variable refusal
+inspected only the destination token, so `ARG D=/usr/bin` with `WORKDIR $D` reached the same
+place; and `ADD <local tar> /` extracts over anything, with docker detecting the archive by
+content, so a tar named `.txt` is unreadable from the file. The directory itself is now flagged,
+a variable anywhere in the resolved path is refused, RUN commands that write into those
+directories are checked, and ADD is refused outright rather than inspected, because this project
+uses COPY everywhere and an extension list will always be one short.
+
+Five minors. The packaging key rule omitted `/` from its delimiter class, so "key" as a whole
+path COMPONENT was not a delimited word and `docs/keys/prod.txt`, `docs/key/prod.txt` and
+`src/pree/keyring/x.py` all shipped a real private key past a scan whose own comment claimed a
+component-wide match. The image listing's name scan read the last field of a `tar -tv` line,
+which is the link TARGET for a symlink or a hard link, so every link member was invisible: a
+listing containing `opt/venv/bin/pip3 -> python3.12` matched nothing, and the positive control
+added one commit earlier was blind in exactly the same way. The mode-column count excluded `h`,
+the hard-link type. An orphan comment still described the guessing budget this project deleted.
+And `_TOKEN_TERMS` omitted "key", so "the shared access key as 16 random characters" stated a
+wrong floor with a full size word in it and passed, after "secret" and "passphrase" had already
+been added to that same table for the same reason. The docstring now names the token-synonym
+table as a residual alongside the size-word one, because two tables that have each been one
+entry short are not a solved problem.
+
+The pattern across the last four rounds is worth stating without softening it. Every major in
+this round, and five of seven in the round before, were defects in controls this project had
+already fixed once: the same escape through a different spelling, the same amplification through
+a different method, the same guard through a different path form. The application's own
+boundaries, the constant-time compare, the boundary validation, the CSP and CORS lock, the
+generic-error contract, the secret trace, have held throughout. What keeps failing is the layer
+written to prove they hold, and it keeps failing in the direction of reporting a pass.
 
 Each of these now has a named regression test in the control table above.
 

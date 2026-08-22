@@ -57,6 +57,9 @@ STORAGE_PROBE_PATH = "/healthz/storage"
 # container HEALTHCHECK to 429 and restart the pod, which is a cheaper denial of service than
 # attacking the application itself.
 UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
+# The methods a platform probe actually uses. The exemption is for the probe, not for the path:
+# any other verb on one of these paths is ordinary traffic and is metered like any other.
+_PROBE_METHODS = frozenset({"GET", "HEAD"})
 # Any header by which a proxy claims to speak for someone else. Their PRESENCE collapses the
 # rate-limit key rather than being trusted for its content.
 _FORWARD_HEADERS = frozenset({"x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"})
@@ -347,16 +350,33 @@ def _limit_keys(request: Request) -> tuple[str, ...]:
     before any of this. A control that has to be repaired twice and is worse each time is a
     control that should not exist.
 
-    A forwarded request is charged to the fold AND to the socket peer, so a header can only ever
-    reduce a caller's allowance. That part has held and stays.
+    The socket key is ALWAYS the same string, header or no header. The previous version
+    returned a bare `<ip>` without a forwarding header and `socket:<ip>` with one, which are two
+    different keys, so a saturated caller added any forwarding header and got a fresh bucket:
+    measured, 240 then 240 more on the coarse tier and 20 then 20 more on the expensive path,
+    twice the documented budget per peer and four times it at the shipped two workers. The
+    docstring claimed a header "can only ever reduce a caller's allowance" and it doubled it.
+
+    Now the socket key is unconditional and the fold is ADDITIONAL, so a forwarding header can
+    only ever add a constraint.
     """
-    peer = _peer_key(request)
-    keys = [peer]
-    if peer != "forwarded":
-        return tuple(keys)
     client = request.client
-    keys.append(f"socket:{client.host if client else 'unknown'}")
+    keys = [f"socket:{client.host if client else 'unknown'}"]
+    if _peer_key(request) == "forwarded":
+        keys.append("forwarded")
     return tuple(keys)
+
+
+def _unaudited_rejection(request: Request, code: int) -> bool:
+    """Is this a rejection whose audit line would be pure noise an attacker can size?
+
+    Exactly one shape qualifies: a method-not-allowed on one of the six paths the platform
+    probes. Those paths exist to be hit constantly by infrastructure, the refusal reveals
+    nothing, and writing a record for each was measured at 8.1 MB a minute per worker from an
+    unauthenticated caller. Deliberately narrow: a 405 on a real route is still audited, because
+    there the method a caller tried is worth knowing.
+    """
+    return code == status.HTTP_405_METHOD_NOT_ALLOWED and request.url.path in UNMETERED_PATHS
 
 
 def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
@@ -433,6 +453,13 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         reflect a message the app did not write.
         """
         detail = exc.detail if exc.detail in OWN_ERROR_DETAILS else GENERIC_CLIENT_ERROR
+        # A wrong method on a probe path gets the contract but no audit line. Auditing it was
+        # the other half of an 8.1 MB-a-minute amplification: the record says nothing an
+        # operator needs, because a DELETE to /healthz is refused whoever sends it, and the
+        # request is metered now so the flood is bounded either way. Every other rejection,
+        # including a 405 on a real route, is still audited.
+        if _unaudited_rejection(request, exc.status_code):
+            return JSONResponse({"error": detail}, status_code=exc.status_code)
         audit_log.warning(
             json.dumps(
                 {
@@ -498,7 +525,10 @@ def register_health_routes(
         app.add_api_route(
             path,
             liveness,
-            methods=["GET"],
+            # HEAD as well as GET. FastAPI does not add HEAD for a GET route, so `HEAD /healthz`
+            # was a 405, which is both wrong for a liveness path a probe may be configured to
+            # HEAD and the cheapest way into the unmetered-405 amplification below.
+            methods=["GET", "HEAD"],
             status_code=status.HTTP_200_OK,
             include_in_schema=path == "/healthz",
         )
@@ -766,8 +796,6 @@ def create_app(
     bound_access_log()
     coarse = global_limiter or RateLimiter(GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
     fine = actor_limiter or RateLimiter(ACTOR_LIMIT, ACTOR_WINDOW_SECONDS)
-    # Wrong tokens per peer, counted separately from traffic so a legitimate operator's normal
-    # request rate can never exhaust it and a guessing run cannot hide inside it.
     # Holds the last observed storage state so a change of state can be logged once, rather
     # than every probe restating it. A pod the platform later kills still leaves a narrative.
     last_ready: dict[str, bool | None] = {"writable": None}
@@ -822,8 +850,17 @@ def create_app(
         )
 
     def _refuse_over_limit(request: Request) -> Response | None:
-        """The metered-path entry point: exempt the platform's probes, then charge."""
-        if request.url.path in UNMETERED_PATHS:
+        """The metered-path entry point: exempt the platform's PROBES, then charge.
+
+        A probe is a GET or a HEAD. The exemption used to cover the path whatever the method,
+        so any other verb on one of the six got a router 405 and a full audit line with nothing
+        counting it: measured, 4,000 requests across eight threads, none refused, 624,000 bytes
+        of log in 4.60 seconds, about 8.1 MB a minute per worker on the channel the forensic
+        trail lives in. That is the same amplification, at the same measured rate, that this
+        project closed for preflights one commit earlier while claiming to have closed the last
+        uncounted unauthenticated path.
+        """
+        if request.url.path in UNMETERED_PATHS and request.method in _PROBE_METHODS:
             return None
         return _charge_coarse(request)
 

@@ -1,7 +1,13 @@
 """Two-tier rate limiting.
 
-A coarse global limit protects the process from any caller. A finer per-actor limit protects
-the expensive scoring path specifically. Exceeding either returns 429.
+A coarse limit protects the process from any caller. A finer limit protects the expensive
+scoring path specifically. Exceeding either returns 429.
+
+Both tiers key on the PEER ADDRESS. The names below still say "actor", which is the keying this
+project deliberately abandoned: the fine tier once keyed on a caller-supplied actor header, so a
+fresh label per request bypassed it entirely. The constants keep their names because renaming a
+public constant is a change with no security value, and the history is recorded here so nobody
+reads the name as a description.
 
 The window is a fixed monotonic bucket, which is cheap and cannot be skewed by a wall-clock
 change. Time is injected so the behaviour is testable without sleeping.
@@ -16,6 +22,7 @@ from collections.abc import Callable
 
 GLOBAL_LIMIT = 240
 GLOBAL_WINDOW_SECONDS = 60.0
+# Named for history, keyed on the peer address. See the module docstring.
 ACTOR_LIMIT = 20
 ACTOR_WINDOW_SECONDS = 60.0
 MAX_TRACKED_ACTORS = 1024

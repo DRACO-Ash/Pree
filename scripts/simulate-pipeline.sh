@@ -18,6 +18,14 @@ cd "$ROOT"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# The member name from a `tar -tv` line, whatever the member type. Fields six onward is the
+# name; a symlink appends " -> target" and a hard link " link to target", and reading the last
+# field instead gave the TARGET for both, so every link member was invisible to a name scan.
+_member_names() {
+  awk '{ name = ""; for (i = 6; i <= NF; i++) name = name (i > 6 ? " " : "") $i
+         sub(/ -> .*$/, "", name); sub(/ link to .*$/, "", name); print name }' "$1"
+}
+
 echo "=== stage: package ==="
 sh scripts/package-appstore.sh "$WORK/upload.zip"
 
@@ -103,14 +111,21 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     exit 1
   fi
   # The mode column must parse, or the setuid scan reads silence from an unparseable listing.
-  MODED=$(awk 'length($1) == 10 && $1 ~ /^[-dlbcps]/ { n++ } END { print n + 0 }' "$LISTING")
+  # 'h' is in the type class: tar renders a hard link as `hrw-r--r--`, and excluding it meant
+  # the parse count could fall short on an image with many links and fail a control that works.
+  # The setuid scan reads the same column, so it must recognise the same member types.
+  MODED=$(awk 'length($1) == 10 && $1 ~ /^[-dhlbcps]/ { n++ } END { print n + 0 }' "$LISTING")
   if [ "$MODED" -lt 1000 ]; then
     echo "image: only $MODED of $ENTRIES lines carry a parseable mode column" >&2
     exit 1
   fi
   # And the pip pattern must be able to match SOMETHING: the venv the build creates is in the
   # listing, so if this cannot be found the pattern is wrong and its silence means nothing.
-  if ! awk '{ print $NF }' "$LISTING" | grep -q '^opt/venv/'; then
+  # The member NAME, not the last field. `tar -tv` renders a symlink as `name -> target` and a
+  # hard link as `name link to target`, so $NF is the TARGET for every link member: a listing
+  # containing `opt/venv/bin/pip3 -> python3.12` matched nothing at all, and the positive
+  # control below it was blind in the same way.
+  if ! _member_names "$LISTING" | grep -q '^opt/venv/'; then
     echo "image: the pip pattern's own path prefix is absent, so the scan below is dead" >&2
     exit 1
   fi
@@ -132,7 +147,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   # start-of-line: the anchored pattern this replaces could not match a single line, and the
   # check printed its success message on every run. The library directory is covered too, not
   # only the entry points, because site-packages/pip is what the policy scan reads.
-  if awk '{ print $NF }' "$LISTING" \
+  if _member_names "$LISTING" \
        | grep -E '(^|/)pip[0-9.]*$|/site-packages/(pip|setuptools|pkg_resources)/' >&2; then
     echo "image: pip or setuptools is present in the shipped filesystem (listed above)" >&2
     exit 1

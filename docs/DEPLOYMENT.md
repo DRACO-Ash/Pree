@@ -119,7 +119,10 @@ to wanting more history: that is the POSTGRESQL add-on.
 
 The read path costs too, and the sheet used to say only that the write did. A single
 `GET /v1/assessments/{key}` parses the whole snapshot, with no cache: measured at **81 ms** at
-the cap, against a coarse limit of 240 requests a minute per address and a 1 CPU pod limit.
+the cap, against a coarse limit of 240 requests a minute per address PER WORKER, so 480 at
+the shipped two workers, and a 1 CPU pod limit. The per-worker qualifier matters: a
+forwarding header once bought a second bucket per worker as well, making it 960, which is
+closed and recorded in the security policy.
 Roughly three busy authenticated callers will saturate the CPU budget. Reads are deliberately
 outside the per-actor limiter, because the actor label is caller-supplied and cannot be a
 security boundary, so the coarse limiter is the only bound on read cost. If read traffic grows

@@ -56,6 +56,10 @@ _DOCKERFILE_KEYWORDS = frozenset(
 # What counts as a sentence about the team token, and the retired rules that must not return.
 # "credential" is here because a fabricated sentence naming only "the shared operator
 # credential" stated a 16-character floor and was not checked at all.
+# What counts as a line about the team token. This IS a table, it IS short, and it has now been
+# one entry short twice: "secret" and "passphrase" were added after a fabrication used them, and
+# "key" after "the shared access key as 16 random characters" stated a wrong floor with a full
+# size word in it and passed.
 _TOKEN_TERMS = (
     "token",
     "pree_team_token",
@@ -63,6 +67,7 @@ _TOKEN_TERMS = (
     "secret",
     "passphrase",
     "password",
+    "key",
 )
 _RETIRED_TOKEN_RULES = (
     "distinct character",
@@ -489,13 +494,25 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
         # `COPY --from=build /bin/true find` gives the token "find", and the JSON form
         # `COPY --from=build ["/bin/true", "/usr/bin/find"]` gives `"/usr/bin/find"]`. Both
         # replaced /usr/bin/find with a no-op and left the whole suite green.
+        # ADD is refused outright, not inspected. docker detects an archive by CONTENT, so a tar
+        # named `hardening.txt` extracts over whatever it likes and no reading of this file can
+        # tell: the extension-matching version of this check caught `.tar` and missed exactly
+        # that. This project uses COPY everywhere and has no legitimate ADD, so the whole
+        # instruction goes rather than a list of extensions that will always be one short.
+        assert instruction.keyword != "ADD", (
+            f"ADD extracts a local archive over its destination and fetches remote URLs, and "
+            f"docker detects the archive by content rather than by name, so what it writes "
+            f"cannot be read from this file. Use COPY: {instruction.argument[:80]}"
+        )
         raw = instruction.argument.split()[-1].strip("[]\"',")
-        # A destination containing a variable is refused outright rather than resolved. `ENV
-        # TGT=/usr/bin/find` with `COPY --from=build /bin/true $TGT` left the whole suite green,
-        # and chasing every substitution form is the losing game this project keeps replaying.
-        assert "$" not in raw, (
+        # A variable ANYWHERE in the resolved path, destination or WORKDIR. Checking only the
+        # last token meant `ARG D=/usr/bin` with `WORKDIR $D` and a relative destination reached
+        # the same place unseen, and chasing every substitution form is the losing game this
+        # project keeps replaying.
+        assert "$" not in raw and "$" not in instruction.workdir, (
             f"a COPY destination is built from a variable, so what it writes cannot be read "
-            f"from this file: {instruction.argument[:80]}"
+            f"from this file: {instruction.keyword} {instruction.argument[:60]} "
+            f"(workdir {instruction.workdir!r})"
         )
         joined = raw if raw.startswith("/") else f"{instruction.workdir.rstrip('/')}/{raw}"
         # NORMALISED. `//usr/bin/find`, `/usr//bin/find` and `WORKDIR /usr/./bin` with a
@@ -505,8 +522,31 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
         # implementation-defined, so posixpath.normpath("//usr/bin/find") returns it unchanged
         # and the prefix test still missed it. Collapse every run of slashes first.
         target = posixpath.normpath(re.sub(r"/{2,}", "/", joined))
-        if any(target.startswith(directory) for directory in _EXECUTABLE_DIRECTORIES):
+        # The directory ITSELF, not only paths under it. normpath strips the trailing slash, so
+        # `/usr/bin`, `/usr/bin/` and `/usr/bin/.` all normalise to `/usr/bin` and none of them
+        # started with `/usr/bin/`: `COPY --from=build /tmp/find /usr/bin` writes
+        # /usr/bin/find and passed. Two lines was enough to neuter the sweep.
+        if any(
+            target == directory.rstrip("/") or target.startswith(directory)
+            for directory in _EXECUTABLE_DIRECTORIES
+        ):
             offenders.append(f"{instruction.keyword} {instruction.argument[:80]} -> {target}")
+    # And a RUN that writes into one of those directories. The guard only ever considered COPY
+    # and ADD, so `RUN cp /bin/true /usr/bin/find` before the sweep was invisible: the simplest
+    # form of the attack, and the one nobody had tried.
+    # Word-bounded verbs. A substring list matched "useradd" through "dd " and flagged the
+    # legitimate pip-removal RUN, and a guard that cries wolf gets relaxed rather than obeyed.
+    writer = re.compile(r"(?:^|[;&|]\s*|\s)(cp|mv|install|ln|tee|dd)\s")
+    for instruction in _instructions():
+        if instruction.keyword != "RUN":
+            continue
+        collapsed = " ".join(instruction.argument.split())
+        if not writer.search(collapsed):
+            continue
+        for directory in _EXECUTABLE_DIRECTORIES:
+            if directory in collapsed:
+                offenders.append(f"RUN writes into {directory}: {collapsed[:80]}")
+
     assert not offenders, (
         f"an instruction writes into a system executable directory, so the binaries the "
         f"hardening steps name may not be the binaries that run: {offenders}"
@@ -723,9 +763,14 @@ def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
     was. `size.search` gates the whole check, so the size-word set is still a table and still
     incomplete: "Generate PREE_TEAM_TOKEN as 16 random units" states a wrong floor with no size
     word in it and passes. What the inversion actually buys is that the NUMBER side needs no
-    table, which is where five consecutive rounds of defeats came from. The size side remains a
-    denylist, its consequence is a misled operator and a fail-closed boot refusal rather than a
-    weak token in production, and it is written down here rather than implied to be solved.
+    table, which is where five consecutive rounds of defeats came from.
+
+    TWO tables remain, and both have been one entry short. The size-word set: "16 random units"
+    states a floor with no size word in it. And the token-synonym set: "the shared access key as
+    16 random characters" has a full size word and passed because "key" was missing, after
+    "secret" and "passphrase" had already been added for the same reason. The consequence of
+    either gap is a misled operator and a fail-closed boot refusal rather than a weak token in
+    production, and both are written down here rather than implied to be solved.
 
     The other cost is real too: a legitimate sentence pairing the token with any other figure
     fails, and two in this repository did.
