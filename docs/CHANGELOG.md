@@ -637,3 +637,22 @@ Twenty-fifth security review, one blocker and one minor, both the same mistake:
 ● The exception-handler pin compared bare `__name__` strings, and two types can share a name, so a
   decoy handler on a second class called `StoreError` left the pinned set unchanged. Handlers are
   pinned by type identity now and reported module-qualified.
+
+Twenty-sixth security review, one blocker, one major and two minors:
+
+● BLOCKER: round 25 put the pin on the listener and left the GATE asserted only on factory-built
+  apps, so one `add_api_route` in `main.py` after the factory returns served the team token to an
+  unauthenticated caller in production configuration with 307 of 307 green, confirmed over the
+  wire. The listener's route inventory is a pinned literal now, gate included, and a second test
+  mounts a client on the listener and asks every non-exempt route without a token.
+● Swapping an existing route's `route.app` after registration kept the type, the dependant tree,
+  the endpoint and the count intact while the attacker's callable answered. The inventory pins each
+  route's ASGI callable as Starlette's own wrapper.
+● `PREE_ENV` was missing from the platform-injected set, and the loader defaults it to production,
+  so `ENV PREE_ENV=development` in the ship stage passed every test and would turn off the token
+  requirement, serve the documentation paths unauthenticated and admit a cleartext origin. It is in
+  the set with the token and the origin.
+● The pre-write hook's credential rule required a quoted value, so the unquoted Dockerfile
+  assignment form walked past the net CLAUDE.md says stops a credential before it lands. Two nets
+  now, and the first attempt at the rule was reverted for firing on five legitimate files including
+  this changelog.

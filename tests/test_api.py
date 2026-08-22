@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import logging
+import os
 import re
 import tempfile
 from collections.abc import Iterator
@@ -1609,6 +1610,146 @@ def test_the_middleware_stack_is_exactly_the_pinned_one() -> None:
             )
 
 
+# The route inventory of the app that LISTENS, as a literal. Path, methods, the endpoint's
+# qualified name, whether the token gate is in its dependant tree, and the ASGI callable the
+# route actually invokes.
+#
+# A literal, because every derived form of this control has been beaten. The gate was asserted on
+# `create_app`'s output while gunicorn launches `build()`, so ONE line added in main.py after the
+# factory returns served the team token to an unauthenticated caller in production configuration
+# with 307 of 307 green: measured against the real listener with curl. Types were pinned on the
+# listener and gating was not, so pinning types was not enough. And swapping an existing route's
+# `route.app` for a wrapper kept the type, the dependant tree and the route count intact while the
+# callable that ran was the attacker's.
+#
+# `request_response.<locals>.app` is Starlette's own wrapper, which is what a route built by
+# FastAPI carries. Pinning it means a dependency bump that changes the wrapper fails loudly here,
+# which is the safe direction: a loud failure gets read, a silent pass does not.
+_STARLETTE_ROUTE_APP = "request_response.<locals>.app"
+EXPECTED_SERVED_ROUTES = frozenset(
+    {
+        ("/", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
+        ("/healthz", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
+        ("/readyz", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
+        ("/livez", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
+        ("/ping", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
+        (
+            "/healthz/storage",
+            ("GET",),
+            "register_health_routes.<locals>.storage_health",
+            False,
+        ),
+        ("/diagnostics", ("GET",), "register_health_routes.<locals>.read_diagnostics", True),
+        ("/v1/assess", ("POST",), "register_api_routes.<locals>.create_assessment", True),
+        (
+            "/v1/assessments/{key}",
+            ("GET",),
+            "register_api_routes.<locals>.read_assessment",
+            True,
+        ),
+    }
+)
+
+
+def _served_inventory(app: Any) -> frozenset[tuple[str, tuple[str, ...], str, bool]]:
+    """The API route inventory, as the tuples EXPECTED_SERVED_ROUTES pins."""
+    return frozenset(
+        (
+            route.path,
+            tuple(sorted((route.methods or set()) - {"OPTIONS"})),
+            route.endpoint.__qualname__,
+            "require_token" in _dependency_names(route),
+        )
+        for route in app.routes
+        if type(route) is APIRoute
+    )
+
+
+@contextmanager
+def _listener(env: str, directory: Path) -> Iterator[Any]:
+    """The app `build()` returns, which is what gunicorn launches, per environment."""
+    previous = dict(os.environ)
+    os.environ.update(
+        {
+            "PREE_ENV": env,
+            "PREE_DATA_DIR": str(directory / f"listener-{env}"),
+            "PREE_BUILD_ID": "listener-pin",
+        }
+    )
+    # A token in BOTH environments, because these tests assert the gate and the gate is what a
+    # token turns on. Development with NO token is single-user local mode, open by design and
+    # covered by the `open_client` fixture's own tests; asserting 401 there would be asserting
+    # against the documented contract rather than for it.
+    os.environ["PREE_TEAM_TOKEN"] = PRODUCTION_TOKEN
+    if env == "production":
+        os.environ["PREE_ALLOWED_ORIGIN"] = "https://pree.apps.bluestaq.com"
+    else:
+        os.environ.pop("PREE_ALLOWED_ORIGIN", None)
+    try:
+        yield build()
+    finally:
+        os.environ.clear()
+        os.environ.update(previous)
+
+
+def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) -> None:
+    """Asserted on `build()`, because `build()` is what gunicorn launches.
+
+    Every gate control read a `create_app` app, and the one test that read `build()` checked types
+    only. So `app.add_api_route("/v1/support", support, methods=["GET"])` in `main.py`, after the
+    factory returns, served the team token to an unauthenticated caller in production
+    configuration with 307 of 307 green, 100% coverage and pip-audit clean, confirmed against the
+    real listener over the wire. Pinning types on the listener while asserting the gate elsewhere
+    left the gate unasserted on the thing that runs.
+    """
+    for env in ("development", "production"):
+        with _listener(env, tmp_path) as app:
+            inventory = _served_inventory(app)
+            assert inventory == EXPECTED_SERVED_ROUTES, (
+                f"the {env} listener serves a different route inventory than the pinned one.\n"
+                f"unexpected: {sorted(inventory - EXPECTED_SERVED_ROUTES)}\n"
+                f"missing:    {sorted(EXPECTED_SERVED_ROUTES - inventory)}"
+            )
+            # And the callable each route INVOKES, which the tuple above cannot see. Replacing
+            # `route.app` with a wrapper left the path, the methods, the endpoint, the gate and
+            # the count all correct while the wrapper answered the request.
+            swapped = [
+                f"{route.path} -> {route.app.__qualname__}"
+                for route in app.routes
+                if type(route) is APIRoute and route.app.__qualname__ != _STARLETTE_ROUTE_APP
+            ]
+            assert not swapped, (
+                f"the {env} listener has routes whose ASGI callable is not Starlette's own "
+                f"wrapper, so the handler that runs is not the endpoint the inventory names: "
+                f"{swapped}"
+            )
+
+
+def test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set(
+    tmp_path: Path,
+) -> None:
+    """The behavioural half, on the LISTENER rather than on a fixture-built app.
+
+    Asking is the check that needs no knowledge of how a route was registered or wrapped, and
+    running it against `build()` closes the gap between what is pinned and what is exercised.
+    """
+    for env in ("development", "production"):
+        with _listener(env, tmp_path) as app:
+            answered: list[str] = []
+            with TestClient(app) as probe:
+                for route in app.routes:
+                    path = getattr(route, "path", None)
+                    if path is None or path in UNAUTHENTICATED_PATHS:
+                        continue
+                    target = path.replace("{key}", "probe:key")
+                    methods = (getattr(route, "methods", None) or set()) - {"HEAD", "OPTIONS"}
+                    for method in sorted(methods):
+                        code = probe.request(method, target, json={}).status_code
+                        if code != 401:
+                            answered.append(f"{env}: {method} {target} -> {code}")
+            assert not answered, f"the listener answered without a token: {answered}"
+
+
 def test_every_request_handling_surface_of_the_built_app_is_pinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1664,7 +1805,13 @@ def test_every_request_handling_surface_of_the_built_app_is_pinned(
                 subclassed = [
                     f"{type(route).__name__} {getattr(route, 'path', route)!r}"
                     for route in app.routes
-                    if type(route) is not APIRoute and type(route) is not Route
+                    if type(route) is not APIRoute
+                    # A plain Route is permitted only at a DOCUMENTATION path. This clause used
+                    # to accept `type(route) is Route` anywhere, so `app.add_route(...)` on any
+                    # path satisfied it.
+                    and not (
+                        type(route) is Route and getattr(route, "path", None) in EXPECTED_DOC_PATHS
+                    )
                 ]
                 assert not subclassed, (
                     f"{name} carries routes whose type is neither APIRoute nor Route: "

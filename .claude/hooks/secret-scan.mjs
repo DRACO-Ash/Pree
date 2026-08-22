@@ -35,7 +35,22 @@ const RULES = [
   // Banned anti-pattern: a hardcoded client-side access gate (public artifact PIN).
   ['Client-side access gate',    /\b(?:ADMIN_)?PIN\s*=\s*['"][0-9A-Za-z]{4,}['"]/],
   // Banned anti-pattern: ENV PORT in a Dockerfile silently overrides the platform port 8080.
-  ['Dockerfile ENV PORT',        /^\s*ENV\s+PORT\s*=/im]
+  ['Dockerfile ENV PORT',        /^\s*ENV\s+PORT\s*=/im],
+  // The generic rule above requires a QUOTED value, so `ENV PREE_TEAM_TOKEN=Ab3-Cd6...` in a
+  // Dockerfile was allowed while the same line quoted was blocked. This is the assignment form a
+  // baked credential actually takes, and it is matched unquoted.
+  //
+  // Deliberately NARROW rather than a general bare-value rule. A general one was tried and fired
+  // on five legitimate files at once: the prose placeholder `token=<token>`, the sentence
+  // "Token: anything", and the keyword argument `token=require_token,`. A net that flags a
+  // repository's own documentation gets switched off rather than obeyed, so the name must END in
+  // a credential term after a separator, which keeps MONKEY out of it.
+  ['Baked credential assignment', /^\s*(?:ENV|ARG|export)\s+(?:[A-Za-z0-9]+_)*(?:TOKEN|SECRET|PASSWORD|PASSPHRASE|KEY|CREDENTIAL)\s*=\s*\S{8,}/im],
+  // Banned anti-pattern: any platform-injected variable given an image-level default. PREE_ENV is
+  // the worst of them, because the loader defaults it to production, so baking `development`
+  // turns off the token requirement, serves the docs unauthenticated and admits a cleartext
+  // origin.
+  ['Dockerfile ENV platform value', /^\s*ENV\s+(?:PREE_ENV|PREE_DATA_DIR|PREE_TEAM_TOKEN|PREE_ALLOWED_ORIGIN|STORAGE_MOUNT_PATH)\s*[= ]/im]
 ];
 
 const hits = [];

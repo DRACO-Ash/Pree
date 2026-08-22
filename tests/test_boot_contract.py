@@ -497,12 +497,60 @@ def test_no_stage_bakes_the_port_or_the_data_directory() -> None:
             continue
         for assignment in instruction.argument.split():
             name = assignment.split("=")[0]
-            if name in {"PORT", "PREE_DATA_DIR", "STORAGE_MOUNT_PATH"}:
+            if name in _PLATFORM_INJECTED:
                 baked.append(f"{instruction.keyword} {instruction.argument}")
         first = instruction.argument.split(None, 1)[0] if instruction.argument else ""
-        if "=" not in first and first in {"PORT", "PREE_DATA_DIR", "STORAGE_MOUNT_PATH"}:
+        if "=" not in first and first in _PLATFORM_INJECTED:
             baked.append(f"{instruction.keyword} {instruction.argument}")
     assert not baked, f"platform-injected values baked into the image: {baked}"
+
+
+# The variables the PLATFORM injects, which an image-level default silently beats. The set held
+# PORT, PREE_DATA_DIR and STORAGE_MOUNT_PATH, and PREE_ENV was the worse omission: it defaults to
+# production in the loader, so `ENV PREE_ENV=development` in the ship stage passed all 307 tests
+# and would turn the whole posture over. Development permits no token at all, serves the three
+# documentation paths unauthenticated, exempts them from the Content-Security-Policy, and admits a
+# credentialed cleartext origin. That is precisely the failure this guard exists to stop, one
+# variable further along. The token and the origin are here for the same reason: baking either is
+# a credential or a trust decision frozen into a layer.
+_PLATFORM_INJECTED = frozenset(
+    {
+        "PORT",
+        "PREE_DATA_DIR",
+        "STORAGE_MOUNT_PATH",
+        "PREE_ENV",
+        "PREE_TEAM_TOKEN",
+        "PREE_ALLOWED_ORIGIN",
+    }
+)
+
+
+def test_no_credential_is_baked_into_an_env_assignment() -> None:
+    """The second net under the pre-write hook, which the unquoted form walked past.
+
+    The hook's generic-credential rule required a QUOTED value, so
+    `ENV PREE_TEAM_TOKEN=Ab3-...` was allowed while the same line quoted was blocked, and no test
+    caught a baked token either: 307 of 307 green with the credential in the shipped stage. A name
+    that reads like a credential may not be assigned a value here at all, whatever its quoting,
+    which is a stricter and simpler rule than judging the value.
+    """
+    baked: list[str] = []
+    for instruction in _instructions():
+        if instruction.keyword not in {"ENV", "ARG"}:
+            continue
+        for name, value in _env_assignments(instruction.argument):
+            if any(term in name.lower() for term in _CREDENTIAL_TERMS) and value:
+                baked.append(f"{instruction.keyword} {name}=[REDACTED:credential]")
+    assert not baked, (
+        f"a credential is assigned a value in the image, which freezes it into a layer and ships "
+        f"it to anyone who can pull: {baked}"
+    )
+
+
+# Name fragments that make an assignment a credential. The same shape the packaging scan uses, and
+# deliberately plain substrings: "keys?" as a delimited word missed `keyring` and `keystore` for
+# three rounds.
+_CREDENTIAL_TERMS = ("token", "secret", "password", "passphrase", "key", "credential")
 
 
 def _resolved_launch_command() -> str:

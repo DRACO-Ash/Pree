@@ -133,6 +133,10 @@ the assessment store.
 | The middleware stack is the pinned one, per environment | `src/pree/app.py` | `test_the_middleware_stack_is_exactly_the_pinned_one` |
 | Middleware, handler types, route class, router dependencies and overrides are pinned on the LISTENER | `src/pree/main.py` | `test_every_request_handling_surface_of_the_built_app_is_pinned` |
 | Every route's type is APIRoute EXACTLY, so a subclass cannot wrap the handler | `src/pree/app.py` | `test_the_route_table_holds_nothing_but_api_routes_and_the_documentation` |
+| The LISTENER serves exactly the pinned route inventory, gate included | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
+| The LISTENER refuses every unauthenticated caller outside the probe set | `src/pree/main.py` | `test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set` |
+| No credential is baked into an ENV or ARG assignment | `Dockerfile` | `test_no_credential_is_baked_into_an_env_assignment` |
+| No platform-injected variable has an image-level default, PREE_ENV included | `Dockerfile` | `test_no_stage_bakes_the_port_or_the_data_directory` |
 
 ## Deliberately accepted risks
 
@@ -1294,6 +1298,53 @@ fix was correct about the mechanism it had just been shown and loose about the b
 category. `isinstance` is the sharpest instance of it, because the loose check and the strict one
 are one word apart and the loose one reads as more idiomatic Python. Where a type IS the control,
 identity is the test.
+
+### Twenty-sixth review: one blocker, one major, two minors
+
+The blocker is the same gap as the round before, moved one step: the pin was put on the listener
+and the GATE was not. Round 25 answered "the factory is not what listens" by asserting middleware,
+handler types, route class, router dependencies and route types on `build()`. Nothing asserted that
+a route on the listening app is gated, because every gate control read a `create_app` app. So one
+line in `main.py` after the factory returns, `app.add_api_route("/v1/support", support,
+methods=["GET"])`, served the team token to an unauthenticated internet caller in production
+configuration with 307 of 307 green, 100% coverage and pip-audit clean, confirmed over the wire
+against a real uvicorn listener while `/diagnostics` correctly returned 401.
+
+The answer is the strongest available form rather than another type check. The listener's route
+inventory is a pinned LITERAL: path, methods, the endpoint's qualified name, and whether the token
+gate is in its dependant tree, for all nine routes, in both environments. A second test mounts a
+client on the listener and asks every non-exempt route without a token. Every derived form of this
+control has now been beaten in turn, so the derivation is gone.
+
+The major is the same family and the reason the inventory pins the ASGI callable too. Swapping an
+existing route's `route.app` for a wrapper after registration leaves the exact type, the dependant
+tree, the endpoint and the route count all correct while the callable that actually runs is the
+attacker's: `POST /v1/assess` with a chosen header and no token returned the token, 307 of 307
+green. The pin asserts each route's `route.app` is Starlette's own `request_response.<locals>.app`.
+A dependency bump that renames that wrapper fails here loudly, which is the safe direction.
+
+Two minors, and one of them is a hard rule in CLAUDE.md not holding. The platform-injected set
+guarded PORT, PREE_DATA_DIR and STORAGE_MOUNT_PATH, and PREE_ENV was the worse omission: the loader
+defaults it to production, so `ENV PREE_ENV=development` in the ship stage passed all 307 tests and
+would turn the entire posture over, permitting no token at all, serving the documentation paths
+unauthenticated, exempting them from the Content-Security-Policy and admitting a credentialed
+cleartext origin. PREE_ENV, PREE_TEAM_TOKEN and PREE_ALLOWED_ORIGIN are in the set now.
+
+And the pre-write hook, which CLAUDE.md says "blocks a credential before it lands", required a
+QUOTED value, so `ENV PREE_TEAM_TOKEN=Ab3-...` was allowed while the same line quoted was blocked.
+Two nets now: a hook rule for the unquoted assignment form, and a boot-contract test refusing any
+ENV or ARG whose name reads like a credential and carries a value. Worth recording how the first
+attempt at the hook rule went, because it is the same failure mode as a guard that cries wolf: a
+general bare-value rule fired on five legitimate files at once, among them the prose placeholder
+`token=<token>`, the sentence "Token: anything", and the keyword argument `token=require_token,`.
+Measured against the tree before and after, so the count was a measurement rather than an
+impression. The rule is narrow now, requires the name to end in a credential term after a
+separator, and adds no new false positive anywhere in the repository.
+
+One structural limit, stated because no static pin can close it: a surface registered only when an
+environment variable the suite never sets is present cannot be seen by any of these controls. The
+behavioural listener probe narrows it, since it asks the app that runs, but it asks under the
+environments the suite constructs.
 
 ## Not accepted, and why it is not a risk here
 
