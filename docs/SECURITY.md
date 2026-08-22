@@ -2069,6 +2069,14 @@ truncation cap, with no `.strip()` anywhere in the path, and the honest limit st
 cannot be injective. Where an ASGI server omits `raw_path`, one accessor falls back to the decoded
 path, which loses injectivity and not safety, and that branch is exercised.
 
+**One thing the canaries found in my own fix, worth stating because it is the same defect one level
+up.** A test I wrote was named `..._never_deletes_and_never_strips`, and reintroducing a `.strip()`
+left the whole suite green. That is not a hole in the test: with space escaped to `%20` the strip has
+nothing to find, so the mutation is behaviour-preserving and no test can see it. The hole was in the
+NAME, which claimed a property the body could not check. The load-bearing fact is that no permitted
+byte is whitespace, so the test now asserts that, and permitting space again turns it red for the
+reason the collision existed rather than for the presence of a trim somewhere in the file.
+
 **Two changes to how this is asserted, which matter more than the fix.** The probe set is now
 GENERATED - every byte 0x00 to 0xFF in leading, trailing and embedded position - because the
 hand-picked list is what let the space through, and its docstring claimed to cover "every refused

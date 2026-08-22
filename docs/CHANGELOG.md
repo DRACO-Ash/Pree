@@ -947,6 +947,10 @@ Third security review of the audit layer, one major and five minors:
   decoding aliases whatever runs afterwards, so `/v1/%assess` shared a record with
   `/v1/%25assess` and `/v1/assessments/a%2Fb:c` read as `/v1/assessments/a/b:c`. Injective by
   construction up to the cap, with no strip anywhere and the truncation limit stated.
+● A test of mine was named for absent code rather than an invariant: reintroducing the `.strip()`
+  left the suite green, correctly, because with space escaped the strip is a behaviour-preserving
+  no-op. The name claimed what the body could not check. It now asserts the load-bearing fact, that
+  no permitted path byte is whitespace, and permitting space again turns it red.
 ● The probe set is GENERATED, every byte in three positions, because the hand-picked list is what
   let the space through while claiming to cover every refused character. And the property is
   asserted end to end on real records, because for three rounds the sanitiser was injective in

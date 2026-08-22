@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from pree.security import (
+    _PERMITTED_PATH_BYTES,
     MAX_ACTOR_LENGTH,
     UNPRINTABLE_MARKER,
     AuthError,
@@ -159,13 +160,25 @@ def test_the_path_scrub_is_injective_over_every_single_byte() -> None:
         assert len(out) <= 160
 
 
-def test_the_path_scrub_never_deletes_and_never_strips() -> None:
-    """The two mechanisms that produced the two collision rounds, asserted directly.
+def test_no_permitted_path_byte_is_whitespace_so_no_trim_can_delete_one() -> None:
+    """The INVARIANT behind the last collision, rather than the absence of the code that used it.
 
-    Deletion is not injective and `.strip()` is a deletion at the ends. Neither belongs in a field
-    whose whole job is to name what was requested, and asserting the mapping alone would leave the
-    next reader free to reintroduce either as a "tidy-up".
+    A `.strip()` two functions away from the escape removed a trailing space that the escape had
+    permitted through, and `GET /v1/assessments/a:b%20` was audited byte-identically to
+    `GET /v1/assessments/a:b`. Deleting the strip is not what closed it: with space escaped to
+    `%20` the strip has nothing to find, so reintroducing one is a behaviour-preserving no-op and
+    no test can see it.
+
+    What is load-bearing is that NO permitted byte is whitespace, and this asserts that. Permit
+    space again and this turns red for the reason the collision existed, whether or not a trim is
+    anywhere in the file. A test named for the absent code rather than the invariant would have
+    claimed a property it could not check, which is the defect class this range keeps finding.
     """
+    whitespace = sorted(byte for byte in _PERMITTED_PATH_BYTES if chr(byte).isspace())
+    assert not whitespace, (
+        f"a permitted path byte is whitespace, so any trim downstream of the escape deletes it and "
+        f"two distinct targets share one record: {whitespace}"
+    )
     assert sanitise_log_path(b"/v1/,assess", 160) == "/v1/%2Cassess"
     assert sanitise_log_path(b"/v1/assess ", 160) == "/v1/assess%20"
     assert sanitise_log_path(b" /v1/assess", 160) == "%20/v1/assess"
