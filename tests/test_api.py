@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -1793,11 +1794,18 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
             # And FastAPI's documentation routes, structurally: exactly `Route`, on a pinned path,
             # ungated. Nothing else may be in the table at all.
             foreign = [row for row in _served_inventory(app) if row[3] != "pree.app"]
-            for kind, path, _methods, _module, _qualname, gated in foreign:
-                assert (kind, path in EXPECTED_DOC_PATHS, gated) == ("Route", True, False), (
-                    f"the {env} listener carries a route this suite cannot account for: "
-                    f"{(kind, path, gated)}"
-                )
+            for kind, path, _methods, origin, _qualname, _gated in foreign:
+                # The ORIGIN is asserted, not merely used to partition. It was computed and then
+                # never compared, so a `Route("/redoc", leak)` defined in main.py landed in the
+                # `unrecognised:` bucket and satisfied every property that WAS checked: `gated` is
+                # computed only for an APIRoute and is unconditionally False for a plain Route, so
+                # two of the three asserted nothing at all, and the route served the whole
+                # assessment store as HTML to an unauthenticated caller.
+                assert (kind, path in EXPECTED_DOC_PATHS, origin) == (
+                    "Route",
+                    True,
+                    "fastapi.applications",
+                ), f"the {env} listener carries a route this suite cannot account for: {path!r}"
             if env == "production":
                 assert not foreign, f"production serves routes outside pree.app: {foreign}"
             else:
@@ -1828,10 +1836,13 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
             assert not outside, (
                 f"the {env} listener serves an endpoint defined outside {source}: {outside}"
             )
+            # EVERY route, not only an APIRoute. The exclusion meant a plain Route's callable was
+            # never examined, which is the other half of what let the forged /redoc through.
             swapped = [
-                f"{route.path} -> {route.app.__qualname__}"
+                f"{getattr(route, 'path', route)}"
                 for route in _all_routes(app)
-                if type(route) is APIRoute and route.app.__qualname__ != _STARLETTE_ROUTE_APP
+                if getattr(getattr(route, "app", None), "__qualname__", None)
+                != _STARLETTE_ROUTE_APP
             ]
             assert not swapped, (
                 f"the {env} listener has routes whose ASGI callable is not Starlette's own "
@@ -2227,7 +2238,23 @@ def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestCl
 # audit call wrote the shared credential into the pod log store on every write with the suite green.
 # Every string-valued audit field, by exact set or bounded pattern. A number cannot carry a base64
 # credential; a string can, which is why these and not the numeric fields.
-AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str]] = {
+class _ScrubIdempotent:
+    """Matches a value only if the shipped sanitiser would leave it unchanged.
+
+    A stand-in for a pattern, so the rule is the application's own function rather than a charset
+    restated beside it. Two hand-written charsets in this table had already drifted from the code
+    they described.
+    """
+
+    pattern = "sanitise_actor(value) == value and len(value) <= MAX_ACTOR_LENGTH"
+
+    def match(self, value: str) -> bool:
+        return sanitise_actor(value) == value and len(value) <= MAX_ACTOR_LENGTH
+
+
+_SCRUB_IDEMPOTENT = _ScrubIdempotent()
+
+AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str] | _ScrubIdempotent] = {
     "kind": frozenset(
         {
             "audit",
@@ -2239,7 +2266,12 @@ AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str]] = {
         }
     ),
     "action": frozenset({"assess", "read_assessment"}),
-    "actor": re.compile(r"^[A-Za-z0-9 ._:@-]{0,64}$"),
+    # DERIVED from the shipped scrub, not restated. The hand-written charset admitted ASCII only
+    # while `_UNSAFE_LOG_CHARS` uses `\w`, which admits roughly 130,000 Unicode word characters, so
+    # a legitimate operator name in any non-Latin script would have failed a pin that claimed to
+    # describe the application. Idempotence under the real function is the property that matters
+    # and it cannot drift: a value the scrub would change is a value that was never scrubbed.
+    "actor": _SCRUB_IDEMPOTENT,
     # The five outcomes the application actually emits. "created" and "refused" were in this set
     # and produced by nothing, which is the same standing-exemption defect as the `reason` field
     # below, one value wide instead of one field wide.
@@ -2256,7 +2288,8 @@ AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str]] = {
     # Inside `validation_reject.errors`, which the flat scan never reached. Both are bounded
     # server-side to MAX_ACTOR_LENGTH and both echo caller-shaped input, so they get the tightest
     # pattern that admits a pydantic location path and error type.
-    "loc": re.compile(r"^[A-Za-z0-9_.\[\]-]{0,64}$"),
+    # Same derivation, now that the application scrubs each part rather than only capping it.
+    "loc": _SCRUB_IDEMPOTENT,
     "type": re.compile(r"^[a-z0-9_.]{0,64}$"),
 }
 
@@ -2265,13 +2298,17 @@ AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str]] = {
 # token fits inside one, and `int.from_bytes(token.encode(), "big")` on `duration_ms` decodes back
 # to the credential exactly. The bounds are the ranges the application can legitimately produce.
 AUDIT_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
-    "duration_ms": (0, 300_000),
+    # CORRELATED, not bounded. A bound of 300,000 still leaves about eighteen bits per record, and
+    # `duration_ms = int.from_bytes(token[:2], "big") % 300_001` put two bytes of the credential in
+    # every successful-write line with the suite green; rotate the offset and the pod log store
+    # holds the whole token. Shrinking a covert channel is not closing it. The ceiling below is
+    # asserted against the exercise's own measured wall clock, so the field cannot carry more than
+    # the timing it reports.
+    "duration_ms": (0, 0),
     "status": (400, 599),
     "error_count": (0, MAX_VALIDATION_ERRORS_LOGGED),
     "score": (0.0, 100.0),
     "evidence_coverage": (0.0, 1.0),
-    "declared_bytes": (0, 1 << 40),
-    "retry_after_seconds": (0, 3_600),
 }
 
 
@@ -2439,6 +2476,51 @@ def test_the_team_token_reaches_no_response_body_header_or_log_record(
     assert TEST_TOKEN not in log, "the audit log carried the team token"
 
 
+def _check_audit_value(
+    field: str,
+    value: Any,
+    where: str,
+    bounds: dict[str, tuple[float, float]],
+    offending: list[str],
+) -> None:
+    """Every value at every depth. Strings by rule, numbers by bound, containers by recursion.
+
+    The first version skipped every non-string on the stated reasoning that "a number cannot
+    carry a base64 credential". It can carry the credential itself:
+    `duration_ms=int.from_bytes(token.encode(), "big")` emitted a 77-digit integer that decodes
+    byte for byte back to the token, on every successful write, with the suite green and the
+    substring search blind to it. Strings nested inside `validation_reject.errors` were never
+    reached either.
+    """
+    if isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        allowed = AUDIT_STRING_VALUES.get(field)
+        if allowed is None:
+            offending.append(f"{where} is a string no rule pins: {value!r}")
+        elif isinstance(allowed, re.Pattern) and not allowed.match(value):
+            offending.append(f"{where}={value!r} fails {allowed.pattern}")
+        elif isinstance(allowed, frozenset) and value not in allowed:
+            offending.append(f"{where}={value!r} outside {sorted(allowed)}")
+        return
+    if isinstance(value, (int, float)):
+        bound = bounds.get(field)
+        if bound is None:
+            offending.append(f"{where} is a number no bound pins: {value!r}")
+        elif not bound[0] <= value <= bound[1]:
+            offending.append(f"{where}={value!r} outside {bound}")
+        return
+    if isinstance(value, dict):
+        for inner, item in value.items():
+            _check_audit_value(str(inner), item, f"{where}.{inner}", bounds, offending)
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _check_audit_value(field, item, f"{where}[{index}]", bounds, offending)
+        return
+    offending.append(f"{where} is a {type(value).__name__}, which no rule pins")
+
+
 def test_every_audit_record_matches_its_pinned_shape_and_values(
     tmp_path: Path, prober: StorageProber
 ) -> None:
@@ -2459,8 +2541,13 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
     route, every method, three token states and six error shapes, so a condition it misses has to
     be one no ordinary caller can reach either.
     """
+    started = time.monotonic()
     _, _, log = _exercise_every_surface(tmp_path, prober)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     emitted = [json.loads(line) for line in log.splitlines() if line.strip()]
+    # No single operation in the exercise can have taken longer than the whole exercise, so this is
+    # the tightest ceiling available without re-instrumenting the application.
+    bounds = {**AUDIT_NUMERIC_BOUNDS, "duration_ms": (0, elapsed_ms)}
     assert emitted, "the walk produced no audit records at all, so this greps an empty stream"
     # An unknown KIND is itself a finding, not a record to skip: a new record shape is a new
     # disclosure channel, and `.get(kind, set())` on a missing key would have waved it through.
@@ -2506,45 +2593,27 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
     # now an exact set member or a bounded pattern; a number cannot encode a token.
     offending: list[str] = []
 
-    def check(kind: str, field: str, value: Any, where: str) -> None:
-        """Every value at every depth. Strings by rule, numbers by bound, containers by recursion.
-
-        The first version skipped every non-string on the stated reasoning that "a number cannot
-        carry a base64 credential". It can carry the credential itself:
-        `duration_ms=int.from_bytes(token.encode(), "big")` emitted a 77-digit integer that decodes
-        byte for byte back to the token, on every successful write, with the suite green and the
-        substring search blind to it. Strings nested inside `validation_reject.errors` were never
-        reached either.
-        """
-        if isinstance(value, bool):
-            return
-        if isinstance(value, str):
-            allowed = AUDIT_STRING_VALUES.get(field)
-            if allowed is None:
-                offending.append(f"{where} is a string no rule pins: {value!r}")
-            elif isinstance(allowed, re.Pattern) and not allowed.match(value):
-                offending.append(f"{where}={value!r} fails {allowed.pattern}")
-            elif isinstance(allowed, frozenset) and value not in allowed:
-                offending.append(f"{where}={value!r} outside {sorted(allowed)}")
-            return
-        if isinstance(value, (int, float)):
-            bound = AUDIT_NUMERIC_BOUNDS.get(field)
-            if bound is None:
-                offending.append(f"{where} is a number no bound pins: {value!r}")
-            elif not bound[0] <= value <= bound[1]:
-                offending.append(f"{where}={value!r} outside {bound}")
-            return
-        if isinstance(value, dict):
-            for inner, item in value.items():
-                check(kind, str(inner), item, f"{where}.{inner}")
-            return
-        if isinstance(value, list):
-            for index, item in enumerate(value):
-                check(kind, field, item, f"{where}[{index}]")
-            return
-        offending.append(f"{where} is a {type(value).__name__}, which no rule pins")
-
     for found in emitted:
         for field, value in found.items():
-            check(found["kind"], field, value, f"{found['kind']}.{field}")
+            _check_audit_value(field, value, f"{found['kind']}.{field}", bounds, offending)
     assert not offending, f"an audit record value is unpinned: {offending}"
+    # Every ENTRY in both tables must be exercised, or it is a standing exemption rather than a
+    # pin. `declared_bytes` and `retry_after_seconds` were bounds for fields this application never
+    # emits, which is the same defect as the `reason` field and the `created` outcome before them.
+    seen: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for inner, item in value.items():
+                seen.add(str(inner))
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    for found in emitted:
+        collect(found)
+    unexercised = sorted((set(AUDIT_STRING_VALUES) | set(AUDIT_NUMERIC_BOUNDS)) - seen)
+    assert not unexercised, (
+        f"these value rules are never exercised, so they permit rather than pin: {unexercised}"
+    )

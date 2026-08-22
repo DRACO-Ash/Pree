@@ -1642,6 +1642,74 @@ substring search blind to it. Strings nested inside `validation_reject.errors` w
 either. Every numeric field has a bound now and the scan recurses to any depth, which found two
 legitimate unpinned fields on its first run.
 
+### Thirty-fourth review: one blocker, two majors, four minors, and a change of shape
+
+This round's reviewer diagnosed the loop rather than only the defects, and the diagnosis is the
+useful part. Three findings, three for three inside the previous round's fix: a quoted key became a
+spliced and doubled key; a provenance classifier was replaced with one that was computed and then
+never asserted; an unbounded number became a bounded number still carrying two bytes of the token
+per record. The common factor is that each of those pins was a HAND-ROLLED RECOGNISER OF
+ADVERSARIAL INPUT - a regex standing in for BuildKit's lexer, a module string standing in for
+identity, a range standing in for a value. Hand-rolled recognisers lose to lexer-level tricks
+indefinitely, so another round of the same shape would have found the same class again.
+
+So all three controls changed shape rather than widening.
+
+**Refuse instead of parse.** The ENV reader no longer tries to recognise what docker accepts. It
+refuses every word that is not a plain `KEY=value`, one word at a time, and this Dockerfile is
+written in that form throughout. The evasion that beat the previous version is worth recording
+because it is elegant: the fail-closed count compared totals, so a token yielding TWO assignments
+paid for a token yielding NONE, and `ENV PYTHONUNBUFFERED="1"PYTHONDONTWRITEBYTECODE="1" …
+""PREE_TEAM_TOKEN""=Ab3-…` parsed three of three with every name allowlisted while BuildKit set the
+credential into the shipped image config. Nine spellings from three rounds are now red, including
+that one.
+
+**Assert identity instead of classify provenance.** `_endpoint_origin` was computed and then used
+only to partition rows; the origin itself was never compared, and of the three properties that WERE
+checked, two asserted nothing, because `gated` is derived only for an APIRoute and is unconditionally
+false for a plain Route. A `Route("/redoc", leak)` defined in `main.py` therefore served the whole
+assessment store as HTML to an unauthenticated development caller. The origin is asserted now, and
+every route's ASGI callable must be Starlette's own wrapper rather than only an APIRoute's.
+
+**Correlate instead of bound.** A bound of 300,000 on `duration_ms` still leaves about eighteen bits
+a record: `int.from_bytes(token[:2], "big") % 300_001` put two bytes of the credential in every
+successful-write line, and rotating the offset gives the whole token. Shrinking a covert channel is
+not closing it. The ceiling is now the exercise's own measured wall clock, so the field cannot report
+more than the timing it claims to measure. Two bounds for fields the application never emits were
+deleted, and every entry in both value tables must now be exercised by an emitted record, so a rule
+cannot be a standing exemption.
+
+Two application changes, the first in several rounds. The validation record's `loc` parts are
+caller-supplied field names and were capped but never scrubbed, while the actor label has been
+scrubbed for exactly this reason since round eleven; they go through the same sanitiser now. And two
+hand-written charsets in the value table were replaced by idempotence under the shipped sanitiser,
+which cannot drift from the code it describes and which stops a legitimate operator name in a
+non-Latin script from failing a pin that claimed to describe the application.
+
+One of my reported claims was measurably false again: I said both hook rules accept a quoted key and
+that the hook blocks `ENV "PORT"=8080`. It was two of three rules, and it did not. Corrected, with
+repeated quotes now accepted rather than a single one. Widening the rules to catch an assignment on a
+continuation line was tried and REVERTED, because it fired on this repository's own source three
+ways over - `token = os.environ[...]`, `token=require_token,` and an empty `PREE_TEAM_TOKEN=`. The
+boot contract's allowlist is the net that gates that case in continuous integration; the hook is
+write-time feedback, not the gate, and a net that flags a repository's own source gets switched off
+rather than obeyed.
+
+### Where the verification now stands, and what a human should know
+
+The reviewer's judgement, which I share and record rather than paraphrase: after these three changes
+of shape, freeze the pins. Four consecutive rounds of adversarial attention on `src/pree/` have
+produced zero application findings, including this round's twenty-two-probe live battery and five
+control mutations, so the marginal value of another round aimed at the code is nil.
+
+The remaining risk is in the VERIFICATION, not in the application, and the single largest gap is
+named plainly: **the container hardening rules have never been checked against a real image.** No
+setuid or setgid bits, the non-root numeric user, the absence of pip and the single flattened layer
+are each a hard rule, and each is currently verified only by text that three coordinated edits can
+neuter - measured, not hypothesised. `scripts/simulate-pipeline.sh` exits 2 and says so. Exit 2 is
+not a pass. The containerize leg should be a required gate on a runner with a Docker daemon before
+the first production deploy.
+
 ## Not accepted, and why it is not a risk here
 
 A client-side gate is never a boundary. Pree has no browser-side flag, PIN, or hidden field

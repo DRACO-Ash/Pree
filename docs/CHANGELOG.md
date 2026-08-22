@@ -775,3 +775,26 @@ Security review of the subtraction, one blocker, two majors and two minors:
   removed a second witness, so a two-edit neutered sweep passed. Both copies are back, deliberately.
 ● The claim that documentation-path bodies are pinned exactly was false; they are checked for the
   header channel and token absence only, and serve HTML by design. Corrected in place.
+
+Thirty-fourth security review, one blocker, two majors and four minors, answered by changing the
+shape of three controls rather than widening them:
+
+● BLOCKER: the fail-closed assignment count compared TOTALS, so a token yielding two assignments
+  paid for a token yielding none, and `ENV PYTHONUNBUFFERED="1"PYTHONDONTWRITEBYTECODE="1"
+  ""PREE_TEAM_TOKEN""=...` parsed three of three with every name allowlisted while BuildKit set the
+  credential into the shipped image config. The reader now REFUSES every word that is not a plain
+  KEY=value rather than trying to recognise what docker accepts. Nine spellings from three rounds
+  are red, including that one.
+● `_endpoint_origin` was computed and never asserted, and two of the three properties that were
+  checked asserted nothing, so a Route defined in main.py served the whole store as HTML to an
+  unauthenticated development caller. The origin is asserted, and every route's ASGI callable must
+  be Starlette's own wrapper rather than only an APIRoute's.
+● A bound of 300,000 on `duration_ms` left about eighteen bits a record, enough to leak the token
+  two bytes at a time. The ceiling is the exercise's own measured elapsed time now, two bounds for
+  fields never emitted are deleted, and every value rule must be exercised by an emitted record.
+● The validation record's `loc` parts are caller-supplied and were capped but never scrubbed; they
+  go through the same sanitiser as the actor label now. Two hand-written charsets in the value table
+  are replaced by idempotence under that sanitiser, which cannot drift from the code it describes.
+● My claim that both hook rules accept a quoted key was false: it was two of three, and
+  `ENV "PORT"=8080` was not blocked. Fixed, with repeated quotes accepted. Widening the rules to
+  catch a continuation line was tried and reverted for firing on this repository's own source.

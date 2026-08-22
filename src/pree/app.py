@@ -410,7 +410,12 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
                     "path": request.url.path[:MAX_LOGGED_PATH],
                     "errors": [
                         {
-                            "loc": [str(part)[:MAX_ACTOR_LENGTH] for part in item.get("loc", ())],
+                            # SCRUBBED, not merely capped: each part is a caller-supplied field
+                            # name, so a control sequence in a key reaches the log through it. One
+                            # line survives today only because json.dumps escapes it, which stops
+                            # holding the moment a value is unwrapped by a log viewer or `jq -r`.
+                            # The actor label has been scrubbed for this reason since round eleven.
+                            "loc": [sanitise_actor(str(part)) for part in item.get("loc", ())],
                             "type": str(item.get("type"))[:MAX_ACTOR_LENGTH],
                         }
                         for item in exc.errors()[:MAX_VALIDATION_ERRORS_LOGGED]

@@ -775,44 +775,43 @@ _EXECUTABLE_DIRECTORIES = (
 # Every `key=value` in an ENV argument, quotes stripped. A key is matched by EQUALITY against
 # this, never by substring: `PYTHONPATH` ends in `PATH`, and that one fact hid an unguarded
 # directory at the front of the shipped search path with the whole suite green.
-# The KEY may be QUOTED. BuildKit preserves the quotes in the parsed key and strips them later in
-# `processWords`, so `ENV "PREE_ENV"=development` sets PREE_ENV exactly as the bare form does. The
-# previous pattern required the key to start at a word boundary, so a quoted key matched NOTHING
-# and `findall` returned an empty list: the line was read and asserted about nothing, which is the
-# failure this parser exists to prevent. Measured, all with the suite green: quoted PREE_ENV,
-# PREE_TEAM_TOKEN, PORT and PATH, in both ENV and ARG, single or double quoted.
-_ENV_ASSIGNMENT = re.compile(
-    r"""["']?([A-Za-z_][A-Za-z0-9_]*)["']?=("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s]*)"""
-)
+# REFUSE, do not parse. Three rounds were spent chasing BuildKit's lexer with a regex: the key may
+# be quoted, and the quotes are stripped later, so `ENV "PREE_ENV"=development` sets PREE_ENV; then
+# a doubled-quote key beat the tolerant pattern; then a token yielding two assignments paid for a
+# token yielding none, so an aggregate count agreed while a credential went unparsed. Every one of
+# those is a lexer trick, and a hand-rolled recogniser of adversarial input loses to lexer tricks
+# indefinitely.
+#
+# So this does not recognise what docker accepts. It refuses everything that is not a PLAIN
+# assignment, one word at a time, and this Dockerfile is written in that form throughout. A word
+# docker would honour and this cannot read is a failure, not a skip.
+_PLAIN_ASSIGNMENT = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s"']*)""")
 
 
 def _env_assignments(argument: str) -> list[tuple[str, str]]:
-    """Parse an ENV argument into assignments, refusing the legacy space-separated form.
+    """Parse an ENV or ARG argument, refusing anything that is not a plain `KEY=value` word.
 
-    `ENV PATH /opt/tools/exec` sets PATH just as surely as `ENV PATH=...` and carries no `=` at
-    all, so it is refused rather than parsed: this Dockerfile uses the `=` form throughout and a
-    parser that silently returns nothing for the other form reports a pass for an unread line.
+    The legacy space-separated form carries no `=` at all and sets the variable just as surely, so
+    it is refused rather than parsed: a parser that silently returns nothing for a form docker
+    honours reports a pass for a line nobody read.
     """
-    # The FIRST WORD, which is what docker inspects. `"=" in argument` was satisfied by an `=`
-    # anywhere in the value, so `ENV PATH /opt/tools/exec=1:/opt/venv/bin:…` passed: docker finds
-    # no `=` in the first word, takes the legacy form, and the shipped PATH begins with an
-    # unguarded directory, while the regex below parsed `exec=1` as the assignment and saw no
-    # PATH at all. The correct predicate was already in this file, at the ENV PORT guard.
-    first = argument.split(None, 1)[0] if argument.split() else ""
-    assert "=" in first, (
-        f"an ENV instruction uses the legacy space-separated form, which this parser does not "
-        f"read and docker honours: {argument[:80]}"
+    words = argument.split()
+    assert words, "an ENV or ARG instruction has no argument at all"
+    # The FIRST WORD decides the form, which is what docker inspects. Testing the whole argument
+    # let `ENV PATH /opt/tools/exec=1:...` pass as an assignment while docker took the legacy form.
+    assert "=" in words[0], (
+        f"an ENV instruction uses the legacy space-separated form, which this parser does not read "
+        f"and docker honours: {argument[:80]}"
     )
-    parsed = [(key, value.strip("\"'")) for key, value in _ENV_ASSIGNMENT.findall(argument)]
-    # FAIL CLOSED on anything the pattern could not read. Silently returning fewer assignments than
-    # the line carries is how a quoted key became invisible: every guard downstream then reported a
-    # pass for a line nobody had parsed. Counting the `=`-bearing tokens is a crude check and that
-    # is the point, because it does not need to understand a token to notice it.
-    tokens = [token for token in argument.split() if "=" in token]
-    assert len(parsed) == len(tokens), (
-        f"this parser read {len(parsed)} of {len(tokens)} assignments in {argument[:80]!r}; an "
-        f"assignment it cannot read is one every guard below silently ignores"
-    )
+    parsed: list[tuple[str, str]] = []
+    for word in words:
+        found = _PLAIN_ASSIGNMENT.fullmatch(word)
+        assert found is not None, (
+            f"{word[:60]!r} is not a plain KEY=value assignment. Quoting, splicing and doubling a "
+            f"key all change what docker sets while leaving a permissive parser agreeing with "
+            f"itself, so anything but the plain form is refused: {argument[:80]}"
+        )
+        parsed.append((found.group(1), found.group(2).strip("\"'")))
     return parsed
 
 
