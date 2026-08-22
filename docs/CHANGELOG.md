@@ -822,3 +822,24 @@ Thirty-fifth security review, one major regression, one major, and six minors:
 ● Two false claims of mine in `docs/SECURITY.md` are corrected: "zero application findings" was
   contradicted by the same section, and a conditional recommendation to freeze the pins was recorded
   as an unconditional endorsement ahead of the review that would decide it.
+
+Thirty-sixth security review, one major and five minors, all closed:
+
+● The previous round's `sanitise_log_part` fix was unverified and self-contradictory: reverting the
+  application to `sanitise_actor` left 312 tests green, and the marker the application emits was a
+  value the `loc` rule rejected. Both closed, and the load-bearing half is the CALL SITE assertion,
+  since a unit test on the function passes whichever one the application calls.
+● Demoting the origin string to a partition key lost an attack identity does not cover: poisoning
+  `FastAPI.setup` at import makes the reference and the app share one forged code object. Both
+  checks are asserted now; the previous commit had traded rather than added.
+● Every `_Pattern` rule used `re.match` with `$`, which matches before a trailing newline, so each
+  admitted the one character it excludes. `fullmatch` now.
+● The timing correlation was derived from a measurement the leak inflates: a handler that sleeps for
+  the secret and reports its true duration raises its own ceiling. An absolute ceiling sits beside
+  the correlated one.
+● A backslash inside an accepted bare ENV value was read literally where docker strips it, so the
+  guarded-directory derivation would have guarded a path docker never creates. Refused.
+● CLAUDE.md gave a false mechanism for a hard rule: an image `ENV PORT` does NOT defeat platform
+  injection, because a runtime value overrides image ENV. The rule stands for two other reasons and
+  the clause is repaired here and in the Dockerfile comment that repeated it. An overclaim in
+  docs/SECURITY.md is struck.

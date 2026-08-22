@@ -851,6 +851,14 @@ def _env_assignments(argument: str) -> list[tuple[str, str]]:
     )
     parsed: list[tuple[str, str]] = []
     for word in words:
+        # A BACKSLASH is refused outright. Inside an accepted bare value it was read literally
+        # where docker strips it, so `PATH=/opt/venv/bin:/evil\\x` parsed as `/evil\\x` while
+        # docker sets `/evilx`, and this parse feeds the guarded-directory derivation: a future
+        # value could guard a directory docker never creates and leave the real one unguarded.
+        assert "\\" not in word, (
+            f"{word[:60]!r} contains a backslash, which docker strips and this parser would read "
+            f"literally, so what it guards would not be what docker sets: {argument[:80]}"
+        )
         found = _PLAIN_ASSIGNMENT.fullmatch(word)
         assert found is not None, (
             f"{word[:60]!r} is not a plain KEY=value assignment. Quoting, splicing and doubling a "

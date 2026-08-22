@@ -47,6 +47,7 @@ from pree.main import build
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
 from pree.security import (
     MAX_ACTOR_LENGTH,
+    UNPRINTABLE_MARKER,
     AuthError,
     sanitise_actor,
     sanitise_log_part,
@@ -1833,6 +1834,15 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
                 assert serving.endpoint.__code__ is reference_codes[path], (
                     f"the {env} listener's {path!r} is not FastAPI's own endpoint"
                 )
+                # AND the origin, because the two defeat different attacks and the previous version
+                # traded one for the other. Identity catches an endpoint compiled with FastAPI's
+                # filename; origin catches a POISONED reference, where `FastAPI.setup` is replaced
+                # at import so the reference and the app share the same forged code object and
+                # identity holds. Neither alone is enough.
+                assert serving.endpoint.__code__.co_filename == fastapi_applications.__file__, (
+                    f"the {env} listener's {path!r} endpoint is defined in "
+                    f"{serving.endpoint.__code__.co_filename}, not FastAPI's own module"
+                )
             if env == "production":
                 assert not foreign, f"production serves routes outside pree.app: {foreign}"
             else:
@@ -2283,12 +2293,20 @@ class _ValueRule:
 
 
 class _Pattern(_ValueRule):
+    """A regex rule, matched with `fullmatch`.
+
+    `re.match` with a `$` anchor accepts a trailing newline, because `$` matches before one, so
+    every pattern here admitted the single character it exists to exclude: `"/v1/assess\n"`,
+    `"token rejected\n"`, `"value_error\n"` and `"a:b\n"` were all accepted. A newline in a log
+    value is the whole point of scrubbing one.
+    """
+
     def __init__(self, pattern: str) -> None:
         super().__init__(pattern)
-        self._compiled = re.compile(pattern)
+        self._compiled = re.compile(pattern.removeprefix("^").removesuffix("$"))
 
     def rejects(self, value: str) -> bool:
-        return self._compiled.match(value) is None
+        return self._compiled.fullmatch(value) is None
 
 
 class _OneOf(_ValueRule):
@@ -2298,6 +2316,23 @@ class _OneOf(_ValueRule):
 
     def rejects(self, value: str) -> bool:
         return value not in self._permitted
+
+
+class _MarkerOr(_ValueRule):
+    """Accepts one exact marker, or delegates.
+
+    `sanitise_log_part` emits `[unprintable]` for a field name that scrubs to nothing, and the
+    brackets are characters the scrub itself strips, so the marker fails an idempotence rule. A
+    caller cannot forge it for the same reason, which is what makes accepting it exactly safe.
+    """
+
+    def __init__(self, marker: str, inner: _ValueRule) -> None:
+        super().__init__(f"{marker!r} or {inner.description}")
+        self._marker = marker
+        self._inner = inner
+
+    def rejects(self, value: str) -> bool:
+        return value != self._marker and self._inner.rejects(value)
 
 
 class _ScrubIdempotent(_ValueRule):
@@ -2347,7 +2382,7 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     # Inside `validation_reject.errors`, which the flat scan never reached. `loc` echoes a
     # caller-supplied field name and the application scrubs each part, so the same derivation
     # applies; `type` is pydantic's own vocabulary.
-    "loc": _LOG_PART_SCRUBBED,
+    "loc": _MarkerOr(UNPRINTABLE_MARKER, _LOG_PART_SCRUBBED),
     "type": _Pattern(r"^[a-z0-9_.]{0,64}$"),
 }
 
@@ -2355,6 +2390,11 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
 # Every NUMERIC audit field, with a bound. An unbounded integer is a disclosure channel: the whole
 # token fits inside one, and `int.from_bytes(token.encode(), "big")` on `duration_ms` decodes back
 # to the credential exactly. The bounds are the ranges the application can legitimately produce.
+# An absolute ceiling for a duration, alongside the correlated one. A handler that sleeps for the
+# secret and reports its true duration inflates the correlated ceiling to fit; this one it cannot
+# reach. Measured in-process at 0 to 2 ms per call.
+ABSOLUTE_DURATION_CEILING_MS = 50
+
 AUDIT_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     # CORRELATED, not bounded. A bound of 300,000 still leaves about eighteen bits per record, and
     # `duration_ms = int.from_bytes(token[:2], "big") % 300_001` put two bytes of the credential in
@@ -2483,6 +2523,11 @@ def _exercise_every_surface(
             ),
             "422 hostile field name",
         )
+        # A field name that scrubs to EMPTY, which is the one input `sanitise_log_part` exists for.
+        # Without it, reverting the application to `sanitise_actor` left the suite green, and the
+        # marker the application emits was a value the `loc` rule itself rejected: the two halves of
+        # that fix disagreed and nothing could say which was wrong.
+        record(probe.post("/v1/assess", headers=AUTH, json={"*": 1}), "422 unprintable field name")
         record(probe.get(f"/healthz?token={TEST_TOKEN}"), "query string")
         # EVERY error shape, because the walk above only ever produces 401s and 422s and each of
         # these is built by a different handler. A header set on one of them would have been
@@ -2636,6 +2681,21 @@ AUDIT_RULE_CANARIES: dict[str, str] = {
 }
 
 
+def test_the_log_part_scrub_marks_an_unprintable_name_distinctly() -> None:
+    """The one fact `sanitise_log_part` exists for, which nothing asserted.
+
+    Reverting the application to `sanitise_actor` left the whole suite green: the two scrubs differ
+    only in the empty case, and no test drove a field name that scrubs to nothing. `anonymous` is
+    the sentinel for "no actor supplied", so reusing it made `{"*": 1}` indistinguishable from an
+    anonymous caller in the field that exists for diagnosis.
+    """
+    assert sanitise_log_part("*") == UNPRINTABLE_MARKER
+    assert sanitise_actor("*") == "anonymous"
+    assert sanitise_log_part("*") != sanitise_actor("*")
+    # And the marker cannot be forged: the brackets are characters the scrub strips.
+    assert sanitise_log_part(UNPRINTABLE_MARKER) == "unprintable"
+
+
 def test_every_audit_value_rule_can_actually_reject_something() -> None:
     """A rule nothing can fail is a rule nothing pins.
 
@@ -2695,7 +2755,14 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
     # so a determined leak could spread a credential across many writes. Closing it entirely means
     # the application not reporting a duration at all, which would cost the operator the one field
     # that shows a slow store.
-    bounds = {**AUDIT_NUMERIC_BOUNDS, "duration_ms": (0, max(slowest_ms, 1))}
+    # BOTH bounds. The correlated one is derived from a measurement the leak itself inflates: a
+    # handler that sleeps for the secret and reports its true duration raises its own ceiling to
+    # accommodate it, and passed. These are in-process calls measured at 0 to 2 ms, so an absolute
+    # ceiling of 50 ms is generous and is not attacker-controlled.
+    bounds = {
+        **AUDIT_NUMERIC_BOUNDS,
+        "duration_ms": (0, min(max(slowest_ms, 1), ABSOLUTE_DURATION_CEILING_MS)),
+    }
     assert emitted, "the walk produced no audit records at all, so this greps an empty stream"
     # An unknown KIND is itself a finding, not a record to skip: a new record shape is a new
     # disclosure channel, and `.get(kind, set())` on a missing key would have waved it through.
@@ -2761,6 +2828,23 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
 
     for found in emitted:
         collect(found)
+    # The CALL SITE, not only the function. `sanitise_log_part` differs from `sanitise_actor` in the
+    # empty case alone, so a unit test on the function passes whichever the application calls:
+    # reverting `app.py` to `sanitise_actor` left every test green because `anonymous` satisfies the
+    # `loc` rule too. This asserts what the application actually emitted for a field name that
+    # scrubs away, which is the only thing that distinguishes them.
+    scrubbed = [
+        part
+        for found in emitted
+        if found["kind"] == "validation_reject"
+        for error in found.get("errors", ())
+        for part in error.get("loc", ())
+    ]
+    assert UNPRINTABLE_MARKER in scrubbed, (
+        f"a field name that scrubs to nothing was not marked {UNPRINTABLE_MARKER!r}; the "
+        f"application is using the actor scrub, whose empty case is the anonymous sentinel: "
+        f"{sorted(set(scrubbed))}"
+    )
     unexercised = sorted((set(AUDIT_STRING_VALUES) | set(AUDIT_NUMERIC_BOUNDS)) - seen)
     assert not unexercised, (
         f"these value rules are never exercised, so they permit rather than pin: {unexercised}"

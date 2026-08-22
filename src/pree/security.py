@@ -13,6 +13,11 @@ import re
 from .config import Config
 
 MAX_ACTOR_LENGTH = 64
+# What a log field carries when its whole value scrubs away. A caller cannot forge it, because the
+# brackets are characters the scrub itself strips, and it is deliberately NOT "anonymous": that is
+# the sentinel for "no actor supplied", and reusing it made a rejected field name of `{"*": 1}`
+# indistinguishable from an anonymous caller in the field that exists for diagnosis.
+UNPRINTABLE_MARKER = "[unprintable]"
 _UNSAFE_LOG_CHARS = re.compile(r"[^\w.@:\- ]")
 
 
@@ -63,7 +68,7 @@ def sanitise_log_part(value: str) -> str:
     and became indistinguishable from an anonymous caller in the one field that exists for
     diagnosis.
     """
-    return _scrub(value, empty="[unprintable]")
+    return _scrub(value, empty=UNPRINTABLE_MARKER)
 
 
 def _scrub(value: str, *, empty: str) -> str:

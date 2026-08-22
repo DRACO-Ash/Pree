@@ -1740,7 +1740,11 @@ stronger classifier for a weaker one: `co_filename` is whatever string was hande
 because it is a plain function Starlette wraps it in its own `request_response` app, satisfying the
 every-route callable check as well. The paragraph asserting that hand-rolled recognisers lose to
 lexer tricks contained a hand-rolled recogniser. It is a code-object IDENTITY comparison now,
-against a reference app FastAPI builds for itself, which is the thing that cannot be forged.
+against a reference app FastAPI builds for itself. That sentence used to end "which is the thing
+that cannot be forged", and it can be: poisoning `FastAPI.setup` at import makes the reference and
+the app share the same forged code object, so identity holds. The origin check is kept ALONGSIDE
+identity for that reason, because the two defeat different attacks and the commit that added
+identity had traded one for the other.
 
 The correlation narrowed the channel rather than closing it: measured at about 7.5 bits a record
 against 18.2 before, so `duration_ms = token[i] % 128` still passed and 32 writes carried a
@@ -1771,6 +1775,80 @@ a hard rule violation in CLAUDE.md for exactly the reason recorded there: an ima
 beats the code fallback chain and defeats platform injection. The hook now flags it, correctly. The
 rule stays and the example is the thing that is wrong; it is worth feeding back to the baseline
 rather than suppressed here.
+
+### Thirty-sixth review: four fixes, and a freeze that is now met on the reviewer's own terms
+
+Every one of these was small, and each closed a control that was green for the wrong reason.
+
+The `sanitise_log_part` fix from the previous round was UNVERIFIED and self-contradictory. Reverting
+the application to `sanitise_actor` left all 312 tests green, because the two scrubs differ only in
+the empty case and nothing drove a field name that scrubs to nothing. And the marker the application
+emits, `[unprintable]`, was a value the `loc` rule itself rejected, because the brackets are
+characters the scrub strips: the two halves of one commit disagreed and the suite could not say
+which was wrong. Both are closed, and the important half is the CALL SITE assertion rather than the
+function test: a unit test on `sanitise_log_part` passes whichever function the application calls,
+so the test now reads what was actually emitted for `{"*": 1}`.
+
+Demoting the origin string to a partition key lost an attack that identity does not cover. Poisoning
+`FastAPI.setup` at import makes the reference app and the served app share the same forged code
+object, so identity holds and `/redoc` serves the process environment. Identity catches an endpoint
+compiled with FastAPI's filename; origin catches a poisoned reference. They defeat different attacks
+and the previous commit had TRADED one for the other rather than adding it. Both are asserted now.
+
+Every `_Pattern` rule used `re.match` with a `$` anchor, and `$` matches before a trailing newline,
+so each rule admitted the single character it exists to exclude: `path`, `reason`, `type` and `key`
+all accepted a trailing newline. `fullmatch` now. This is the direct answer to a question worth
+keeping: a rule can pass its canary and still be too permissive, because a canary proves LIVENESS,
+not adequacy.
+
+The timing correlation was derived from a measurement the leak inflates. A handler that sleeps for
+the secret and reports its true duration raises its own ceiling to fit, and passed. There is an
+absolute ceiling alongside the correlated one now, because these are in-process calls measured at
+nought to two milliseconds.
+
+And a backslash inside an accepted bare ENV value was read literally where docker strips it, so
+`PATH=/opt/venv/bin:/evil\x` would have guarded a directory docker never creates and left the real
+one unguarded. Refused outright.
+
+### Two corrections to this project's own reasoning
+
+The reviewer found the claim "a reference app FastAPI builds for itself, which is the thing that
+cannot be forged" in the section that exists to correct claims of exactly that shape. Struck.
+
+More substantially, `CLAUDE.md` gave a technically WRONG mechanism for a hard rule. It said an
+image-level `ENV PORT` "beats the code fallback chain and defeats platform injection". The second
+half is false: a runtime-injected value overrides image `ENV` in both Docker and Kubernetes. The
+rule is still right, for two other reasons - an image `ENV` SHADOWS the code's documented default, so
+that default becomes unreachable and untestable, and the image asserts a port the platform may not
+use. The clause is repaired in `CLAUDE.md` and in the Dockerfile comment that repeated it, because a
+rule with a false mechanism does not survive the first engineer who tests it. The rule text itself is
+unchanged.
+
+The same reviewer confirmed the baseline finding and added to it: the licensing clause is
+`.claude/skills/release-and-deploy/SKILL.md:45`, "never set `ENV PORT=` to a DIFFERENT value", which
+carves out exactly the `PORT=8080` that line 35 bakes, where this project's rule is unconditional.
+The example and the clause both want fixing upstream, or the example grows back.
+
+### The freeze, and what a human needs before a first production deploy
+
+The reviewer's conditions for freezing are now met: shape one was already sound and mutation-proved
+three ways, and shapes two and three plus the major are closed above. It stated it would not ask for
+another round aimed at `src/pree/`, on the evidence that the live battery found nothing and the two
+application changes are behaviour-preserving where they claim to be, measured at nought divergences
+over 60,008 fuzz inputs.
+
+What it wants a human to see, in its order, recorded here because it is the shortest honest list:
+
+1. **The containerize leg green on a runner with a Docker daemon.** Three hard rules have never been
+   tested against a real image. Everything else on this list is smaller than this one.
+2. **The boot line from the real pod**, confirming `env=production`, the expected `token_len` and
+   `data_dir_configured=true`, with no `ENV PORT` or `ENV PREE_*` in the shipped image.
+3. **One request proving `/docs`, `/redoc` and `/openapi.json` are absent in production.** The suite
+   asserts it; this confirms the boundary that matters at the cost of one curl.
+4. **A decision on `duration_ms`.** It is a covert channel of its bound's width, so who may read the
+   audit stream is part of the control rather than incidental to it.
+5. **`securityContext.fsGroup=10001` on the deployment.** Without it every write to the FILE_STORAGE
+   mount returns EACCES, which is a deployment parameter rather than a code defect.
 
 ## Not accepted, and why it is not a risk here
 
