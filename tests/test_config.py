@@ -6,6 +6,7 @@ collide with another process or leave state behind.
 
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 
 import pytest
@@ -14,10 +15,10 @@ from pree.config import (
     DEFAULT_PORT,
     MAX_PORT,
     MIN_PORT,
-    MIN_PRODUCTION_TOKEN_LENGTH,
     ConfigError,
     load_config,
 )
+from tests.conftest import PRODUCTION_TOKEN
 
 
 def test_port_defaults_to_8080_when_unset(tmp_path: Path) -> None:
@@ -78,7 +79,7 @@ def test_token_without_allowed_origin_refuses_to_start_in_production(tmp_path: P
         load_config(
             {
                 "PREE_ENV": "production",
-                "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
+                "PREE_TEAM_TOKEN": PRODUCTION_TOKEN,
                 "PREE_DATA_DIR": str(tmp_path),
             }
         )
@@ -89,7 +90,7 @@ def test_wildcard_origin_with_a_token_refuses_to_start_in_production(tmp_path: P
         load_config(
             {
                 "PREE_ENV": "production",
-                "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
+                "PREE_TEAM_TOKEN": PRODUCTION_TOKEN,
                 "PREE_ALLOWED_ORIGIN": "*",
                 "PREE_DATA_DIR": str(tmp_path),
             }
@@ -100,7 +101,7 @@ def test_a_named_origin_with_a_token_starts_in_production(tmp_path: Path) -> Non
     config = load_config(
         {
             "PREE_ENV": "production",
-            "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
+            "PREE_TEAM_TOKEN": PRODUCTION_TOKEN,
             "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
             "PREE_DATA_DIR": str(tmp_path),
         }
@@ -113,7 +114,7 @@ def test_development_mode_tolerates_a_token_without_an_origin(tmp_path: Path) ->
     config = load_config(
         {
             "PREE_ENV": "development",
-            "PREE_TEAM_TOKEN": "t" * MIN_PRODUCTION_TOKEN_LENGTH,
+            "PREE_TEAM_TOKEN": PRODUCTION_TOKEN,
             "PREE_DATA_DIR": str(tmp_path),
         }
     )
@@ -266,7 +267,7 @@ def test_a_token_of_the_required_length_is_accepted_in_production(tmp_path: Path
     config = load_config(
         {
             "PREE_ENV": "production",
-            "PREE_TEAM_TOKEN": "y" * MIN_PRODUCTION_TOKEN_LENGTH,
+            "PREE_TEAM_TOKEN": PRODUCTION_TOKEN,
             "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
             "PREE_DATA_DIR": str(tmp_path),
         }
@@ -278,5 +279,42 @@ def test_development_does_not_impose_the_length_floor(tmp_path: Path) -> None:
     """Local single-user work is not the threat model the floor exists for."""
     config = load_config(
         {"PREE_ENV": "development", "PREE_TEAM_TOKEN": "short", "PREE_DATA_DIR": str(tmp_path)}
+    )
+    assert config.auth_enabled is True
+
+
+@pytest.mark.parametrize(
+    "repetitive", ["passwordpasswordpassword", "a" * 30, "abababababababababababab"]
+)
+def test_production_refuses_a_token_with_too_little_variety(
+    tmp_path: Path, repetitive: str
+) -> None:
+    """The claim said "short or guessable" while a repeated dictionary word booted.
+
+    Either the wording narrows or the control ships. Shipping it: a token from the named
+    generation command has far more character variety than this floor, so it costs a real
+    credential nothing and refuses the shapes a person actually chooses by hand.
+    """
+    with pytest.raises(ConfigError, match="distinct characters"):
+        load_config(
+            {
+                "PREE_ENV": "production",
+                "PREE_TEAM_TOKEN": repetitive,
+                "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
+                "PREE_DATA_DIR": str(tmp_path),
+            }
+        )
+
+
+def test_a_generated_token_clears_both_production_floors(tmp_path: Path) -> None:
+    """Guard the floors against being set somewhere a real token cannot reach."""
+    generated = secrets.token_urlsafe(32)
+    config = load_config(
+        {
+            "PREE_ENV": "production",
+            "PREE_TEAM_TOKEN": generated,
+            "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
+            "PREE_DATA_DIR": str(tmp_path),
+        }
     )
     assert config.auth_enabled is True

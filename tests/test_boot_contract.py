@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from pree.health import StorageProbe
+from tests.test_api import EXPECTED_LIVENESS_PATHS
 
 ON_PLATFORM_RUNNER = os.environ.get("GITLAB_CI") == "true"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -116,6 +117,21 @@ def test_the_launch_command_targets_the_factory_that_actually_exists() -> None:
     assert not hasattr(module, "app")
 
 
+def test_the_security_policy_has_exactly_one_controls_section() -> None:
+    """A second controls section is an unchecked place to put a claim.
+
+    A fabricated "Additional controls" section asserting encryption at rest, token rotation and
+    SIEM reporting passed the loop, and its encryption claim contradicted accepted risk 2 nine
+    lines further down the same document.
+    """
+    headings = [
+        line.strip()
+        for line in (REPO_ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8").splitlines()
+        if line.startswith("#") and "control" in line.lower()
+    ]
+    assert headings == ["## Controls"], f"expected exactly one controls section, found {headings}"
+
+
 def _controls_section() -> list[str]:
     """The lines of the Controls section, up to the next top-level heading."""
     lines = (REPO_ROOT / "docs" / "SECURITY.md").read_text(encoding="utf-8").splitlines()
@@ -149,6 +165,10 @@ def test_every_control_row_cites_a_test_that_exists() -> None:
     separator = next(
         i for i, line in enumerate(lines) if set(line.strip()) <= set("|- ") and "|" in line
     )
+    # Nothing may precede the header row but the heading and blank lines. A pipe-leading line
+    # above the separator renders as literal text, but it still reads as a control claim.
+    stray = [line.strip()[:80] for line in lines[: separator - 1] if line.strip().startswith("|")]
+    assert not stray, f"lines that look like control rows before the table header: {stray}"
     defined = _defined_test_names()
 
     rows: list[tuple[str, str]] = []
@@ -210,68 +230,109 @@ def test_the_where_column_of_every_control_row_points_at_a_real_file() -> None:
     assert not missing, f"control rows whose Where column names a missing file: {missing}"
 
 
-def _health_section() -> str:
-    """The health-paths section of the deployment sheet."""
-    text = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
-    start = text.index("## Health paths")
-    end = text.find("\n## ", start + 1)
-    return text[start:] if end == -1 else text[start:end]
+# Words that legitimately appear as backticked or quoted single tokens in a probe sentence.
+# A whitelist, not a denylist: a denylist only ever catches the spellings already thought of,
+# which is how "wedged", "busy", "BUSY", "not-ready" and "degraded" each got through in turn.
+_PROBE_VOCABULARY = frozenset(
+    {
+        "status",
+        "storage_writable",
+        "errno",
+        "errno_name",
+        "data_dir",
+        "probe_duration_ms",
+        "probe_timeout_ms",
+        "ETIMEDOUT",
+        "EACCES",
+        "ENOSPC",
+        "true",
+        "false",
+        "null",
+    }
+)
+# Sentences that name an HTTP code for a reason other than a probe verdict.
+_CODE_EXEMPT = ("header", "carries", "redirect", "router probes the root")
+_PROBE_TERMS = ("/healthz/storage", "probe", "write proof", "readiness", "health", "status")
+
+
+def _probe_sentences(text: str) -> list[str]:
+    """Every sentence anywhere in the sheet that makes a claim about the probe.
+
+    Scoped to the whole document deliberately. Scoping to the `## Health paths` section left
+    every probe claim elsewhere unchecked, and a fabricated `## Probe behaviour under load`
+    section documenting a 204, a "degraded" status and an EBUSY errno passed untouched.
+    """
+    flat = re.sub(r"\s+", " ", text)
+    return [
+        sentence
+        for sentence in re.split(r"(?<=[.!?])\s+", flat)
+        if any(term in sentence.lower() for term in _PROBE_TERMS)
+    ]
 
 
 def test_the_deployment_sheet_documents_only_probe_behaviour_the_code_can_produce() -> None:
     """The sheet must not describe a probe state, code, errno or header the app cannot emit.
 
-    Two earlier versions were defeated. The first was a three-token denylist wearing the name of
-    a property. The second checked one spelling, a lowercase quoted `"status": "..."`, so an
-    uppercase status, a hyphenated one, an unquoted one, a 429 stated in prose, a fabricated
-    X-Pree header and a 204 on readiness all passed. The vocabulary is derived from the code and
-    checked without depending on how the sheet happens to punctuate it.
+    Four earlier versions of this guard were defeated, each by a spelling or a location it did
+    not consider: a three-token denylist, a lowercase-quoted-status-only check, a scan bounded
+    to one section, and a status regex that only looked within six characters of the word
+    "status" so `wedged` and `busy` survived. This version scans the whole document, treats any
+    sentence mentioning the probe as a claim, and checks tokens against a derived allowlist.
     """
     emittable_status = {
         StorageProbe(True, "/data", None, None, 1).status,
         StorageProbe(False, "/data", 13, "EACCES", 1).status,
     }
-    section = _health_section()
+    sheet = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    claims = _probe_sentences(sheet)
+    assert claims, "the sheet makes no statement about the probe at all"
 
-    # Any word presented as a status, however it is quoted or cased.
-    documented_status = {
-        word.lower()
-        for word in re.findall(r'status["\'`:\s]{1,6}["\'`]?([A-Za-z][A-Za-z-]*)', section)
-    }
-    documented_status -= {"code", "codes", "is", "of", "the", "and", "or", "for"}
-    impossible = sorted(documented_status - emittable_status)
-    assert not impossible, (
-        f"the sheet presents statuses the code cannot return: {impossible}; "
-        f"the code can return {sorted(emittable_status)}"
+    allowed_tokens = emittable_status | _PROBE_VOCABULARY
+
+    unknown_words: list[str] = []
+    unexpected_codes: list[int] = []
+    for sentence in claims:
+        for token in re.findall(r"[`\"']([A-Za-z][A-Za-z_-]*)[`\"']", sentence):
+            if token not in allowed_tokens and token.lower() not in allowed_tokens:
+                unknown_words.append(token)
+        if any(exempt in sentence.lower() for exempt in _CODE_EXEMPT):
+            continue
+        for code in re.findall(r"\b([1-5][0-9]{2})\b", sentence):
+            if int(code) not in {200, 503}:
+                unexpected_codes.append(int(code))
+
+    assert not unknown_words, (
+        f"the sheet presents probe values the code cannot produce: {sorted(set(unknown_words))}; "
+        f"allowed: {sorted(allowed_tokens)}"
     )
-
-    # HTTP codes, judged only in sentences that are actually about the probe. Elsewhere the
-    # section legitimately mentions other codes, for instance which responses carry the
-    # hardening headers, and the rule that the root must never return a redirect.
-    probe_claims = [
-        sentence
-        for sentence in re.split(r"(?<=[.!?])\s+", section.replace("\n", " "))
-        if "/healthz/storage" in sentence or "status" in sentence.lower()
-    ]
-    assert probe_claims, "the sheet makes no statement about the probe at all"
-    claimed_codes = {
-        int(code)
-        for sentence in probe_claims
-        for code in re.findall(r"\b([1-5][0-9]{2})\b", sentence)
-    }
-    unexpected_codes = sorted(claimed_codes - {200, 503})
     assert not unexpected_codes, (
-        f"the sheet claims HTTP codes the probe never returns: {unexpected_codes}"
+        f"the sheet claims HTTP codes the probe never returns: {sorted(set(unexpected_codes))}"
     )
 
-    # Response headers named in the sheet must be ones the app actually sets.
+    # Any header named anywhere in the sheet must be one the app actually sets. Matched without
+    # requiring an X- prefix, which a fabricated `Pree-Probe-State:` header slipped past.
     app_source = (REPO_ROOT / "src" / "pree" / "app.py").read_text(encoding="utf-8")
-    named_headers = set(re.findall(r"\b(X-[A-Za-z]+(?:-[A-Za-z]+)*)\b", section))
-    invented = sorted(h for h in named_headers if h not in app_source)
+    named = set(re.findall(r"\b([A-Z][A-Za-z]+(?:-[A-Za-z]+)+)\s*:", sheet))
+    invented = sorted(h for h in named if h not in app_source)
     assert not invented, f"the sheet names headers the app does not set: {invented}"
 
-    # And the retired synthesised states must not return by any spelling.
+    # And the retired synthesised states must not return by any spelling or in any section.
     health_source = (REPO_ROOT / "src" / "pree" / "health.py").read_text(encoding="utf-8")
     for retired in ("EBUSY", "indeterminate", "degraded"):
         assert retired not in health_source, f"{retired} is back in the source; update the docs"
-        assert retired.lower() not in section.lower(), f"the sheet still documents {retired}"
+        assert retired.lower() not in sheet.lower(), f"the sheet still documents {retired}"
+
+
+def test_the_documented_liveness_paths_match_the_paths_the_code_pins() -> None:
+    """Close the code-doc-pin triangle.
+
+    The pinned literals could not be defeated by editing the docs, but nothing tied the two
+    together, so the sheet could quietly disagree with the platform contract.
+    """
+    sheet = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    row = next(line for line in sheet.splitlines() if "`/healthz`" in line and "`/ping`" in line)
+    documented = set(re.findall(r"`(/[a-z]*)`", row))
+    assert documented == set(EXPECTED_LIVENESS_PATHS), (
+        f"the sheet documents {sorted(documented)} but the code pins "
+        f"{sorted(EXPECTED_LIVENESS_PATHS)}"
+    )

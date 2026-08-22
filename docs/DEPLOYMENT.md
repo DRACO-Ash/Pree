@@ -36,9 +36,11 @@ what they judge dangerous, so an open gate is a disclosure, not a convenience.
 | `STORAGE_MOUNT_PATH` | **delete this variable** | the FILE_STORAGE add-on, as `/data` |
 | `PREE_DATA_DIR` | **delete this variable** | code resolves it from `STORAGE_MOUNT_PATH` |
 | `PREE_ENV` | **COPY-PASTE EXACT:** `production` | operator |
-| `PREE_TEAM_TOKEN` | the team token, as a **secret** | operator |
+| `PREE_TEAM_TOKEN` | the team token, as a **secret** (see below) | operator |
 | `PREE_ALLOWED_ORIGIN` | **COPY-PASTE EXACT:** `https://pree.apps.bluestaq.com` | operator |
 | `PREE_BUILD_ID` | leave unset, or set to the release tag | release process |
+
+Generate the token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Production refuses a token shorter than 24 characters or using fewer than 12 distinct characters, so a repeated word will not start the app.
 
 All three of the operator-set values go in before the first submission. The app refuses to
 start on any unsafe combination: production with no token, a token with no origin, or a token

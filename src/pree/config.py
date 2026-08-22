@@ -23,6 +23,10 @@ _CONTROL_CHARS = frozenset(chr(code) for code in [*range(0, 32), 127])
 # choices well inside an hour, so a short or guessable token gets the same fail-closed boot
 # treatment as an unsafe origin rather than a warning nobody reads.
 MIN_PRODUCTION_TOKEN_LENGTH = 24
+# A 24-character repetition of one dictionary word cleared the length floor while the
+# control was described as rejecting a guessable token. secrets.token_urlsafe(32) yields 43
+# characters with far more variety than this, so the floor costs a real token nothing.
+MIN_PRODUCTION_TOKEN_VARIETY = 12
 _ORIGIN_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
 
 DEFAULT_PORT = 8080
@@ -157,6 +161,13 @@ def _validate_production_auth(token: str | None, origin: str | None, environment
             f"Refusing to start: PREE_TEAM_TOKEN is {len(token)} characters, below the "
             f"{MIN_PRODUCTION_TOKEN_LENGTH} required in production. Generate one with "
             f'python -c "import secrets; print(secrets.token_urlsafe(32))".'
+        )
+    if len(set(token)) < MIN_PRODUCTION_TOKEN_VARIETY:
+        raise ConfigError(
+            f"Refusing to start: PREE_TEAM_TOKEN uses only {len(set(token))} distinct "
+            f"characters, below the {MIN_PRODUCTION_TOKEN_VARIETY} required in production. "
+            f'Generate one with python -c "import secrets; '
+            f'print(secrets.token_urlsafe(32))".'
         )
     if origin is None:
         raise ConfigError(

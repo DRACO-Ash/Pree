@@ -14,7 +14,7 @@ the assessment store.
 
 | Control | Where | Verified by |
 |---|---|---|
-| Team token compared in constant time | `src/pree/security.py` | `test_token_compare_uses_a_constant_time_primitive` |
+| Team token compared in constant time | `src/pree/security.py` | `test_token_compare_invokes_the_constant_time_primitive`, `test_the_constant_time_primitive_is_actually_reached_at_runtime` |
 | Every state-changing route gated on the token | `src/pree/app.py` | `test_assess_requires_the_token` |
 | Generic client errors, detail server-side only | `src/pree/app.py` | `test_a_wrong_token_gets_the_same_generic_error` |
 | CORS fail-closed: named origin only, never a wildcard with a token | `src/pree/config.py` | `test_cors_allows_only_the_configured_origin` |
@@ -42,7 +42,9 @@ the assessment store.
 | A snapshot too deep to parse fails closed, not into an unhandled 500 | `src/pree/store.py` | `test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing` |
 | The liveness handlers never occupy the shared request threadpool | `src/pree/app.py` | `test_the_liveness_routes_never_occupy_the_shared_request_threadpool` |
 | The five documented liveness paths exist and stay unmetered | `src/pree/app.py` | `test_the_liveness_contract_is_exactly_the_five_documented_paths`, `test_every_documented_liveness_path_is_exempt_from_rate_limiting` |
-| Production refuses a short or guessable team token | `src/pree/config.py` | `test_production_refuses_a_short_or_guessable_token` |
+| Production refuses a short or low-variety team token | `src/pree/config.py` | `test_production_refuses_a_short_or_guessable_token`, `test_production_refuses_a_token_with_too_little_variety` |
+| The security policy has exactly one controls section | `docs/SECURITY.md` | `test_the_security_policy_has_exactly_one_controls_section` |
+| The documented liveness paths match the pinned literals | `docs/DEPLOYMENT.md` | `test_the_documented_liveness_paths_match_the_paths_the_code_pins` |
 | Every control row here cites a test that exists | `docs/SECURITY.md` | `test_every_control_row_cites_a_test_that_exists`, `test_the_where_column_of_every_control_row_points_at_a_real_file` |
 | The deployment sheet documents only probe behaviour the code can produce | `docs/DEPLOYMENT.md` | `test_the_deployment_sheet_documents_only_probe_behaviour_the_code_can_produce` |
 | The retention cap holds even on a snapshot with a partial write order | `src/pree/store.py` | `test_a_partial_write_order_still_trims_to_the_cap` |

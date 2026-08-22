@@ -17,6 +17,10 @@ from pree.store import JsonStore
 # At least MIN_PRODUCTION_TOKEN_LENGTH characters, so the production configurations the
 # suite builds are ones the app would actually accept.
 TEST_TOKEN = "test-token-0123456789-abcdef"
+# A credential shaped like one the generation command produces: past the length floor and well
+# past the variety floor. Tests that satisfied the length floor with a repeated character were
+# rejected the moment the variety floor shipped, which is the floor doing its job.
+PRODUCTION_TOKEN = "Ab3-Cd6_Ef9.Gh2~Ij5Kl8Mn1Op4"
 AUTH = {"x-pree-token": TEST_TOKEN}
 
 
