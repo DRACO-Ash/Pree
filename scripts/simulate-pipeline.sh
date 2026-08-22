@@ -72,10 +72,49 @@ echo "=== stage: containerize ==="
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   docker build -t pree:simulated .
   echo "container build: green"
+
+  # The container hard rules are asserted against the BUILT IMAGE here, not against the
+  # Dockerfile's text. Four consecutive security reviews defeated the text guards, each in a
+  # new place: the sweep moved to another stage, its predicate was narrowed, PATH was changed
+  # so `find` resolved elsewhere, and a no-op binary was copied over /usr/bin/find. Every one
+  # of those left the whole suite green, because text cannot verify what an image contains.
+  # These three checks can. They run only when a daemon exists, which is why the no-daemon
+  # branch below exits 2 rather than reporting a pass.
+  echo "--- image: no setuid or setgid bits ---"
+  BITS=$(docker run --rm --entrypoint /usr/bin/find pree:simulated \
+    / -xdev -perm /6000 \( -type f -o -type d \) -print 2>/dev/null || true)
+  if [ -n "$BITS" ]; then
+    echo "image: setuid or setgid bits present in the shipped filesystem:" >&2
+    echo "$BITS" >&2
+    exit 1
+  fi
+  echo "image: no setuid or setgid bits"
+
+  echo "--- image: runs as the non-root numeric user ---"
+  IDENTITY=$(docker run --rm --entrypoint /opt/venv/bin/python pree:simulated \
+    -c 'import os;print(f"{os.getuid()}:{os.getgid()}")')
+  if [ "$IDENTITY" != "10001:10001" ]; then
+    echo "image: runtime identity is $IDENTITY, not 10001:10001" >&2
+    exit 1
+  fi
+  echo "image: runs as $IDENTITY"
+
+  echo "--- image: the package manager does not ship ---"
+  PIPS=$(docker run --rm --entrypoint /usr/bin/find pree:simulated \
+    /opt/venv/bin /usr/local/bin -maxdepth 1 -name 'pip*' -print 2>/dev/null || true)
+  if [ -n "$PIPS" ]; then
+    echo "image: pip is present in the shipped filesystem:" >&2
+    echo "$PIPS" >&2
+    exit 1
+  fi
+  echo "image: no pip in the shipped filesystem"
 else
   # An honest non-zero skip, never a green pass. Continuous integration is the binding source
-  # of truth for this leg.
+  # of truth for this leg, and it is the ONLY place the three image assertions above can run,
+  # which means the container hard rules are unverified until CI builds the image.
   echo "container build: NO DOCKER DAEMON AVAILABLE, deferred to CI" >&2
+  echo "         The image assertions (no setuid bits, non-root numeric user, no pip) run" >&2
+  echo "         only with a daemon, so those three rules are UNVERIFIED here." >&2
   exit 2
 fi
 

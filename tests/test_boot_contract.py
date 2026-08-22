@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from pree.app import STORAGE_PROBE_PATH
 from pree.health import StorageProbe
 from tests.test_api import EXPECTED_LIVENESS_PATHS
 
@@ -70,31 +71,53 @@ _RETIRED_TOKEN_RULES = (
     "mixed case",
     "upper case, lower case",
 )
-# A floor is always stated with a comparator or the word "floor" itself. Requiring one keeps
-# the guard from reading an unrelated character count as a rule.
-_FLOOR_PHRASES = (
-    "floor",
-    "shorter than",
-    "fewer than",
-    "longer than",
-    "at least",
-    "no less than",
-    "minimum",
-    "raised to",
-    "must be",
-)
-_NUMBER_WORDS = {
-    "eight": 8,
-    "ten": 10,
-    "twelve": 12,
-    "sixteen": 16,
-    "twenty": 20,
-    "twenty-four": 24,
-    "thirty": 30,
-    "thirty-two": 32,
-    "forty-eight": 48,
-    "sixty-four": 64,
-}
+
+
+def _build_number_words() -> dict[str, int]:
+    """Every spelled-out integer from zero to a thousand, hyphenated and spaced.
+
+    Constructed, not listed. Five consecutive rounds defeated this guard with a number word
+    that was not in a hand-written table: "ten", "thirty", "eighteen", "twenty-eight". A table
+    someone has to remember to extend is a table that will be short by one entry again.
+    """
+    ones = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+    ]
+    tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+    words = {name: value for value, name in enumerate(ones)}
+    for ten in range(2, 10):
+        words[tens[ten]] = ten * 10
+        for one in range(1, 10):
+            for joiner in ("-", " "):
+                words[f"{tens[ten]}{joiner}{ones[one]}"] = ten * 10 + one
+    for one in range(1, 10):
+        words[f"{ones[one]} hundred"] = one * 100
+    words["a hundred"] = 100
+    words["a thousand"] = 1000
+    words["one thousand"] = 1000
+    return words
+
+
+_NUMBER_WORDS = _build_number_words()
 
 
 @dataclass(frozen=True)
@@ -367,7 +390,12 @@ def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
     assert not misplaced, misplaced
 
 
-SUID_SWEEP = "find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec chmod a-s {} +"
+SUID_SWEEP = (
+    "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +"
+)
+# Paths a mutation could plant a no-op binary on to neuter a command whose text is pinned.
+# `COPY --from=build /bin/true /usr/bin/find` was one line and left 22 of 22 tests green.
+_EXECUTABLE_DIRECTORIES = ("/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/")
 
 
 def test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit() -> None:
@@ -418,6 +446,47 @@ def test_the_launch_command_refuses_to_trust_a_forwarded_client_address() -> Non
         f"the forwarded trust list is {value!r}; only the limited broadcast address is vetted "
         "here, and '*' or a loopback value trusts a header the caller writes"
     )
+
+
+def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
+    """Pinning a command's text is worthless if its binaries can be replaced.
+
+    `COPY --from=build /bin/true /usr/bin/find` above the sweep is one line, changes not a
+    character of the pinned command, and leaves every other assertion green while the sweep
+    clears nothing. Absolute paths in the sweep close the PATH route; this closes the other one.
+    """
+    offenders: list[str] = []
+    for instruction in _instructions():
+        if instruction.keyword not in {"COPY", "ADD"}:
+            continue
+        target = instruction.argument.split()[-1]
+        if any(target.startswith(directory) for directory in _EXECUTABLE_DIRECTORIES):
+            offenders.append(f"{instruction.keyword} {instruction.argument[:80]}")
+    assert not offenders, (
+        f"an instruction writes into a system executable directory, so the binaries the "
+        f"hardening steps name may not be the binaries that run: {offenders}"
+    )
+
+
+def test_the_shipped_stage_declares_no_instruction_that_undoes_a_control() -> None:
+    """HEALTHCHECK NONE, VOLUME and STOPSIGNAL all passed silently.
+
+    `HEALTHCHECK NONE` disables the storage proof that three earlier rounds treated as the
+    control keeping a pod with a broken mount out of service, and the security policy cites it
+    repeatedly. VOLUME on the data directory changes the mount semantics the store relies on.
+    STOPSIGNAL SIGKILL removes the graceful shutdown the exec form exists to preserve.
+    """
+    final = _final_stage()
+    checks = [i.argument for i in final if i.keyword == "HEALTHCHECK"]
+    assert len(checks) == 1, f"the shipped stage declares {len(checks)} HEALTHCHECKs: {checks}"
+    assert checks[0].strip().upper() != "NONE", "the shipped stage disables its HEALTHCHECK"
+    assert STORAGE_PROBE_PATH in checks[0], (
+        f"the HEALTHCHECK does not probe {STORAGE_PROBE_PATH}, so it proves nothing about "
+        f"storage: {checks[0][:120]}"
+    )
+    for unwanted in ("VOLUME", "STOPSIGNAL"):
+        found = [i.argument for i in final if i.keyword == unwanted]
+        assert not found, f"the shipped stage declares {unwanted} {found}"
 
 
 def test_the_pip_removal_targets_the_venv_the_build_actually_creates() -> None:
@@ -519,22 +588,45 @@ def _claim_units(path: Path) -> list[str]:
     # A leading ordered-list marker is stripped: "8." at the start of a line is the item's
     # index, not a claim about anything, and the inverted rule below would read it as one.
     units = [re.sub(r"^\d+\.\s+", "", line.strip(" ●■")) for line in lines if line]
+    # EVERY adjacent pair, not only table rows. Both these documents wrap at about 100 columns,
+    # so a sentence stating the floor can split into a line with the subject and no number and a
+    # line with the number and no subject, and neither half trips the rule. That is why
+    # DEPLOYMENT.md kept its floor sentence as one long unwrapped line, which no guard enforced:
+    # a rewrap would have silently disabled the check.
     units += [
-        f"{first} {second}"
-        for first, second in itertools.pairwise(lines)
-        if first.startswith("|") and second.startswith("|")
+        f"{first} {second}" for first, second in itertools.pairwise(lines) if first and second
     ]
     return units
 
 
-def _numbers_in(unit: str) -> set[str]:
-    """Every integer and number-word in this unit, as written."""
+_NUMBER_WORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(sorted(map(re.escape, _NUMBER_WORDS), key=len, reverse=True)) + r")\b"
+)
+
+
+def _numbers_in(unit: str, size: re.Pattern[str], *, words: bool) -> set[str]:
+    """Digits anywhere in the unit; spelled-out numbers only next to a size word.
+
+    The two need different rules, because English uses number words as pronouns and articles
+    and does not use digits that way. "or one built entirely from a repeated sequence" and
+    "all three of the operator-set values" are not claims about a length, and treating every
+    number word as a figure flagged four true sentences in this repository at once. A digit in
+    a line about the token and its size is a claim; "one" might be a pronoun.
+
+    Longest-first alternation, so "twenty-eight" matches as one number rather than as "twenty"
+    followed by "eight", which would report 20 and 8 for a unit that states 28.
+    """
     lowered = unit.lower()
-    digits = set(re.findall(r"\b\d[\d,]*\b", lowered))
-    words = {
-        word for word in re.findall(r"\b[a-z]+(?:-[a-z]+)?\b", lowered) if word in _NUMBER_WORDS
-    }
-    return digits | words
+    found = set(re.findall(r"\b\d[\d,]*\b", lowered))
+    if not words:
+        return found
+    for match in _NUMBER_WORD_PATTERN.finditer(lowered):
+        # Six words of slack either side: enough for "refused below eighteen characters" and
+        # "twenty-eight characters is the minimum", not enough to reach the next clause.
+        window = lowered[max(0, match.start() - 40) : match.end() + 40]
+        if size.search(window):
+            found.add(match.group(0))
+    return found
 
 
 def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
@@ -556,13 +648,23 @@ def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
     floor = str(importlib.import_module("pree.config").MIN_PRODUCTION_TOKEN_LENGTH)
     size = re.compile(
         r"char|byte|octet|bit\b|digit|letter|glyph|symbol|code ?point|length|long|floor|"
-        r"minimum|shorter|longer|fewer",
+        r"minimum|maximum|shorter|longer|fewer|under|below|beneath|less than|more than|over\b|"
+        r"at least|no fewer|refused below|rejects any",
         re.IGNORECASE,
     )
+    # The INSTRUCTION-bearing files only, and this scope is a decision with a reason rather
+    # than a convenience. docs/SECURITY.md and docs/CHANGELOG.md are records of engineering
+    # history, and that history is measurements: "five 5,000-character field names", "a
+    # 15,000-character request line", "a 30,074-byte record", each in a sentence that also says
+    # "token". No text rule can separate a measurement from a floor claim without understanding
+    # the sentence, and every version of this guard that tried flagged those true statements.
+    #
+    # What the scope costs: a wrong floor asserted inside the policy or the changelog would
+    # pass. What it protects: every file an operator reads and copies from. The sheet is where
+    # a wrong number becomes a wrong deployment, and the sheet is checked completely, digits
+    # and spelled-out words alike.
     scanned = [
         REPO_ROOT / "docs" / "DEPLOYMENT.md",
-        REPO_ROOT / "docs" / "SECURITY.md",
-        REPO_ROOT / "docs" / "CHANGELOG.md",
         REPO_ROOT / "README.md",
         REPO_ROOT / "CLAUDE.md",
         REPO_ROOT / ".env.example",
@@ -583,7 +685,17 @@ def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
                 retired.append(f"{path.name}: {unit[:160]}")
             if not size.search(unit):
                 continue
-            numbers = _numbers_in(unit)
+            # The early-out stays. Requiring the floor to be PRESENT in every unit that pairs
+            # the token with a size was tried and is unworkable at this document scale: prose
+            # legitimately says "the token length is reported as a boolean and a length" with no
+            # figure at all, and fourteen such lines in these documents flagged at once. A guard
+            # that flags fourteen true statements to catch one false one gets relaxed.
+            #
+            # The defeat those two fabrications used was an unrecognised number WORD, so the
+            # word table is now complete BY CONSTRUCTION for every value up to a thousand
+            # rather than hand-listed. "eighteen" and "twenty-eight" were the missing entries;
+            # there are no missing entries now.
+            numbers = _numbers_in(unit, size, words=True)
             if not numbers:
                 continue
             checked += 1

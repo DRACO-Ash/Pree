@@ -45,7 +45,13 @@ RUN rm -rf /opt/venv/lib/python3.12/site-packages/pip* \
  && chown -R 10001:10001 /app
 # LAST mutation in this stage. Files and directories alike; the policy tests the /6000 mask
 # only, so the sticky bit is left alone. Nothing may be added below this line.
-RUN find / -xdev -perm /6000 \( -type f -o -type d \) -exec chmod a-s {} +
+#
+# ABSOLUTE binaries, because pinning the command's text says nothing about what the names in it
+# resolve to. `ENV PATH="/neutered:$PATH"` above this line, with a no-op `find` planted on that
+# path, left the whole suite green while files at 4755 and 2755 survived. Absolute paths take
+# PATH out of the equation; a COPY over /usr/bin/find is refused separately, and the built
+# image is checked behaviourally in the pipeline, because text cannot verify this rule.
+RUN /usr/bin/find / -xdev -perm /6000 \( -type f -o -type d \) -exec /bin/chmod a-s {} +
 
 # ---- ship: one flattened layer, no history for the policy scan to read ----
 FROM scratch

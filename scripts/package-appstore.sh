@@ -74,6 +74,14 @@ if [ -n "$SUSPECT" ]; then
   exit 1
 fi
 
+# Five rounds of "one character outside the list", so the key rule is now the loosest thing
+# that still means something: any component ENDING in "key" or "keys", with no requirement for
+# a delimiter before it. `deploy_key` was refused and `deploy_key.txt` shipped; that was fixed
+# and `deploykey.txt` shipped, because deleting the delimiter beat the delimited-word rule; and
+# `id-rsa.md` shipped because the pattern spelled `id_rsa` with a literal underscore while its
+# neighbour on the same line used `.?` for exactly this reason. `vault` and `jwt` were two
+# ordinary credential names in no list at all.
+#
 # BOTH nets, because neither alone is enough and the first attempt at this replaced one with
 # the other. The allowlist above bounds the EXTENSION space, so an unknown extension fails by
 # default. It says nothing about a credential wearing an allowed extension, and five of the ten
@@ -83,10 +91,9 @@ fi
 # rather than only at its end, which is what let deploy_key.txt through when deploy_key did not.
 NAMED=$(unzip -Z1 "$OUT" \
   | grep -vE '(^|/)\.env\.example$' \
-  | grep -iE '(^|/|[_.-])keys?([_.-]|$)'\
-'|(api|ssh|gpg|pgp|priv|pub|host|sign|enc|master|secret|access|auth)keys?'\
-'|token|secret|cred|passwd|password|bearer|keytab|kubeconfig|pypirc'\
-'|service.?account|authorized|private.?key|id_(rsa|dsa|ecdsa|ed25519)' \
+  | grep -iE 'keys?([_.-]|$)'\
+'|token|secret|cred|passwd|password|bearer|keytab|kubeconfig|pypirc|dotenv'\
+'|service.?account|authorized|private.?key|vault|jwt|pat[_.-]|id[_.-]?(rsa|dsa|ecdsa|ed25519)' \
   || true)
 if [ -n "$NAMED" ]; then
   echo "package: the archive carries paths whose NAME reads like a credential:" >&2
@@ -127,7 +134,8 @@ if [ -n "$NONASCII" ]; then
   exit 1
 fi
 
-echo "package: archive checks passed: every extension on the allowlist, no name reading like"
-echo "         a credential, no banned directory, no symlink, no multiply-linked file, no"
-echo "         non-ASCII path"
+echo "package: archive checks passed: every extension on the allowlist, no name that"
+echo "         matched the credential list, no banned directory, no symlink, no"
+echo "         multiply-linked file, no non-ASCII path. This is a NAME check, not a"
+echo "         judgement: a credential under an unlisted name still ships."
 echo "package: note: the path scan reads names only; it cannot see inside an archived file"

@@ -20,10 +20,11 @@ from pree.app import (
     MAX_LOGGED_PATH,
     MAX_VALIDATION_ERRORS_LOGGED,
     STORAGE_PROBE_PATH,
-    _client_key,
+    _limit_keys,
     create_app,
 )
 from pree.audit import build_logger
+from pree.config import Config
 from pree.health import StorageProber
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
 from pree.security import MAX_ACTOR_LENGTH, sanitise_actor
@@ -457,14 +458,13 @@ def test_a_trailing_slash_is_a_404_not_a_redirect(client: TestClient) -> None:
         )
 
 
-def _key_for(peer: str, headers: dict[str, str]) -> str:
-    """The rate-limit key for a fabricated request, exercising _client_key directly.
+def _keys_for(peer: str, headers: dict[str, str], config: Config) -> tuple[str, ...]:
+    """The rate-limit keys for a fabricated request, exercising _limit_keys directly.
 
-    Direct, because the test client's peer address is a constant. The first version of the test
-    below rotated X-Forwarded-For through the client and asserted a 429, which it got with the
-    fold removed as well: the peer never varied, so the limiter refused for the wrong reason and
-    the assertion said nothing. Varying the peer is the whole point, and the only way to vary it
-    in process is to build the scope.
+    Direct, because the test client's peer address is a constant. An earlier version of the
+    test below rotated X-Forwarded-For through the client and asserted a 429, which it got with
+    the control removed as well: the peer never varied, so the limiter refused for the wrong
+    reason and the assertion said nothing at all.
     """
     scope = {
         "type": "http",
@@ -473,26 +473,51 @@ def _key_for(peer: str, headers: dict[str, str]) -> str:
         "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
         "client": (peer, 12345),
     }
-    return _client_key(Request(scope))
+    return _limit_keys(Request(scope), config)
 
 
-def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space() -> None:
-    """Defence in depth for a control that otherwise lives entirely in the launch command.
+def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space(tmp_path: Path) -> None:
+    """A forwarding header may only ever REDUCE a caller's allowance, never change bucket.
 
-    The peer address both tiers key on is rewritten above the application by uvicorn's
-    proxy-header middleware, from a header the caller sends. The launch command now refuses to
-    trust it, but if the platform ever supplies its own command that flag disappears and nothing
-    here could tell. So the PRESENCE of a forwarding header collapses the key instead: rotating
-    one cannot mint fresh buckets. Measured at the shipped two workers, 1,000 requests with a
-    rotating header: 0 refused with neither control, 615 with the shipped build.
+    Two defects, one round apart. First, the peer address both tiers key on is rewritten above
+    the application by uvicorn's proxy-header middleware from a header the caller sends, so
+    rotating it minted a fresh bucket per request: measured at two workers, 0 of 1,000 refused.
+    Folding on the header's presence stopped that. But the folded key was a DIFFERENT bucket
+    from the peer's own, so a caller already at its limit escaped by adding the header:
+    measured, a throttled caller went back to 404 with any of three headers. The request is now
+    charged to both keys and refused if either is over.
     """
-    plain = {_key_for(f"10.0.0.{n}", {}) for n in range(8)}
+    config = make_config(tmp_path)
+    plain = {_keys_for(f"10.0.0.{n}", {}, config) for n in range(8)}
     assert len(plain) == 8, f"distinct peers must get distinct buckets, got {plain}"
 
     for header in ("x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"):
-        folded = {_key_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"}) for n in range(8)}
-        assert len(folded) == 1, (
-            f"a rotating {header} minted {len(folded)} rate-limit buckets: {folded}"
+        keys = [_keys_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"}, config) for n in range(8)]
+        folded = {key[-1] for key in keys}
+        assert len(folded) == 1, f"a rotating {header} minted {len(folded)} buckets: {folded}"
+        # And the peer's own key is still charged, so the header cannot be an escape hatch.
+        for peer_index, key_set in enumerate(keys):
+            assert f"unauth:10.0.0.{peer_index}" in key_set, (
+                f"adding {header} dropped the peer's own bucket: {key_set}"
+            )
+
+
+def test_the_authenticated_key_space_needs_a_valid_token_not_a_present_one(
+    tmp_path: Path,
+) -> None:
+    """`if headers.get(...)` let the caller choose its own bucket.
+
+    Deciding the space on the header's PRESENCE meant an unauthenticated caller reached the
+    operators' space with `X-Pree-Token: anything`. Measured against the project's own
+    fixtures: flooding the coarse limiter with a garbage token header, then presenting the real
+    token from the same peer, returned 429. That is the same anti-pattern as keying on the
+    actor header, which this function's own docstring warns about.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    assert _keys_for("10.0.0.1", {"x-pree-token": TEST_TOKEN}, config) == ("auth:10.0.0.1",)
+    for wrong in ("", "not-the-token", TEST_TOKEN + "x", TEST_TOKEN[:-1]):
+        assert _keys_for("10.0.0.1", {"x-pree-token": wrong}, config) == ("unauth:10.0.0.1",), (
+            f"a token of {wrong!r} reached the authenticated rate-limit space"
         )
 
 
@@ -503,21 +528,130 @@ def test_an_unauthenticated_flood_does_not_exhaust_the_authenticated_budget(
 
     At the platform ingress every operator presents the same peer address, so an
     unauthenticated caller could hold them all at 429 for the rest of the window at roughly
-    eight requests a second. That is a materially different statement from "colleagues share a
-    bucket", and it was the direct cost of pinning the forwarded trust list.
+    eight requests a second.
+
+    The flood carries a WRONG TOKEN, which is how the first version of this test was defeated.
+    It flooded with no token header at all, so it passed while the split was decided on the
+    header's presence and an unauthenticated caller reached the operators' space by sending
+    `X-Pree-Token: anything`.
     """
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    client = build_client(
-        config,
-        build_logger(io.StringIO()),
-        StorageProber(cache_seconds=0.0),
-        global_limiter=RateLimiter(3, 60.0),
+    for flood_headers in ({}, {"x-pree-token": "not-the-real-token"}, {"x-pree-token": ""}):
+        client = build_client(
+            config,
+            build_logger(io.StringIO()),
+            StorageProber(cache_seconds=0.0),
+            global_limiter=RateLimiter(3, 60.0),
+        )
+        flood = [client.get("/no-such-route", headers=flood_headers).status_code for _ in range(10)]
+        assert 429 in flood, f"the flood was never refused with {flood_headers}: {flood}"
+        # The operator, same peer address, valid token, is unaffected.
+        assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200, (
+            f"a flood carrying {flood_headers} consumed the authenticated callers' budget"
+        )
+
+
+def test_the_storage_probe_publishes_the_data_directory_only_on_failure(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """This path is unauthenticated by design, so its 200 body is public.
+
+    It carried the resolved absolute data directory, publishing the container's filesystem
+    layout to anyone who asked, while `/diagnostics` gated the very same field on the reasoning
+    that configuration detail narrows an attacker's search space for free. The deployment sheet
+    described the directory as appearing in the 503 body, which was true of the sheet and not of
+    the code. On failure it earns its place: a screenshot of the 503 is the whole diagnosis.
+    """
+    ready = client.get(STORAGE_PROBE_PATH)
+    assert ready.status_code == 200
+    assert "data_dir" not in ready.json(), (
+        f"the successful probe publishes the data directory: {ready.json()}"
     )
-    flood = [client.get("/no-such-route").status_code for _ in range(10)]
-    assert 429 in flood, f"the unauthenticated flood was never refused: {flood}"
-    # And the operator, presenting the same peer address with a valid token, is unaffected.
-    assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200, (
-        "an unauthenticated flood consumed the authenticated callers' rate budget"
+    assert str(tmp_path) not in ready.text
+
+    # The failing case is built directly from the probe, because a config pointing at an
+    # unwritable directory cannot boot a store to hand the factory.
+    unwritable = StorageProber(cache_seconds=0.0).probe(Path("/proc/nonexistent-pree"))
+    assert unwritable.writable is False
+    assert unwritable.as_body()["data_dir"] == "/proc/nonexistent-pree", (
+        "the failing probe no longer names the directory, so a screenshot is not a diagnosis"
+    )
+    assert unwritable.as_body()["errno_name"], "the failing probe names no errno"
+
+
+def test_every_read_of_the_store_is_audited(tmp_path: Path) -> None:
+    """A successful disclosure was the one privileged action with no audit line.
+
+    A refused request was audited, a rejected body was audited, a store failure was audited, and
+    a successful read of a record was not. Under the shared-token model "who read what" is the
+    only forensic question the trail could answer about a stolen token.
+    """
+    stream = io.StringIO()
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    with build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0)) as audited:
+        assert audited.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
+        key = f"{FULL_BODY['protected_asset_id']}:{FULL_BODY['candidate_id']}"
+        hit = audited.get(f"/v1/assessments/{key}", headers=AUTH)
+        assert hit.status_code == 200
+        audited.get(
+            f"/v1/assessments/{key}", headers={**AUTH, "if-none-match": hit.headers["etag"]}
+        )
+        audited.get("/v1/assessments/nosuch:record", headers=AUTH)
+
+    outcomes = [
+        json.loads(line)["outcome"]
+        for line in stream.getvalue().splitlines()
+        if line.strip() and json.loads(line).get("action") == "read_assessment"
+    ]
+    assert outcomes == ["disclosed", "not_modified", "not_found"], (
+        f"the read path audited {outcomes}; every read must leave a record of its outcome"
+    )
+
+
+def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path: Path) -> None:
+    """Starlette answered a disallowed preflight itself, in plain text and unaudited.
+
+    The body carried no caller input, so this was contract drift rather than a reflection, but
+    the control table claimed every rejection used one contract and was audited, and this one
+    did neither.
+    """
+    stream = io.StringIO()
+    config = make_config(
+        tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
+    )
+    client = build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0))
+    refused = client.options(
+        "/v1/assess",
+        headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
+    )
+    assert refused.status_code == 400
+    assert refused.json() == {"error": "request rejected"}, refused.text
+    assert "Disallowed" not in refused.text
+    assert any("cors_reject" in line for line in stream.getvalue().splitlines()), (
+        "a refused preflight left no audit line"
+    )
+    # And the allowed origin still works, which is the whole point of the middleware.
+    allowed = client.options(
+        "/v1/assess",
+        headers={"Origin": "https://pree.example", "Access-Control-Request-Method": "POST"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "https://pree.example"
+
+    # A 400 that is NOT a refused preflight keeps its own handling. Rewriting every 400 would
+    # have swallowed the parse-failure path, which has its own audit line and its own reason.
+    huge = (
+        '{"protected_asset_id":"a","candidate_id":"b",'
+        '"indicators":{"manoeuvres_in_window":' + "9" * 5_000 + "}}"
+    )
+    parse_failure = client.post(
+        "/v1/assess", content=huge, headers={**AUTH, "content-type": "application/json"}
+    )
+    assert parse_failure.status_code == 400
+    assert parse_failure.json() == {"error": "request rejected"}
+    lines = stream.getvalue().splitlines()
+    assert any("http_reject" in line for line in lines), (
+        "the parse failure lost its own audit line to the CORS normaliser"
     )
 
 

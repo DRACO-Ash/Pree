@@ -45,7 +45,7 @@ from .ratelimit import (
     RateLimiter,
 )
 from .scoring import ThreatIndicators, assess
-from .security import MAX_ACTOR_LENGTH, AuthError, authorise, sanitise_actor
+from .security import MAX_ACTOR_LENGTH, AuthError, authorise, sanitise_actor, token_matches
 from .store import SCHEMA_VERSION, JsonStore, StoreError
 
 LIVENESS_PATHS = ("/", "/healthz", "/readyz", "/livez", "/ping")
@@ -153,12 +153,21 @@ class BodySizeLimit:
         return b"transfer-encoding" in names and b"content-length" in names
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or scope.get("method") in self._BODYLESS_METHODS:
+        if scope.get("type") != "http":
             await self._app(scope, receive, send)
             return
 
+        # BEFORE the bodyless-method return, not after. Placing it after meant the check never
+        # ran for GET, HEAD, OPTIONS, DELETE or TRACE, which is precisely the method class
+        # smuggling uses: a front end permits a GET with no body, so GET is the canonical
+        # CL.TE carrier. One socket write of `GET /healthz` with both framings produced two
+        # 200s. The refusal was written to close that exact primitive and did not.
         if self._ambiguously_framed(scope):
             await self._reject(send, status.HTTP_400_BAD_REQUEST, close=True)
+            return
+
+        if scope.get("method") in self._BODYLESS_METHODS:
+            await self._app(scope, receive, send)
             return
 
         if self._declared_over_cap(scope):
@@ -252,35 +261,46 @@ def _assessment_key(protected_asset_id: str, candidate_id: str) -> str:
     return f"{protected_asset_id}:{candidate_id}"
 
 
-def _client_key(request: Request) -> str:
-    """The rate-limit key: the peer address, never a caller-supplied header.
+def _first_refused(limiter: RateLimiter, keys: tuple[str, ...]) -> str | None:
+    """Charge every key and return the first that refused, or None if all admitted.
 
-    Keying the fine tier on the actor header let a caller mint a fresh label per request and
-    bypass the tier entirely. The peer address is not perfect behind a shared proxy, which is
-    recorded in the security policy, but it is not chosen by the caller.
+    Every key is charged even after one refuses. Short-circuiting on the first refusal would
+    leave the others uncounted, so a caller who is over one limit would ride free on the rest.
+    """
+    refused: str | None = None
+    for key in keys:
+        if not limiter.allow(key) and refused is None:
+            refused = key
+    return refused
 
-    Two defences beyond that, both learned the hard way.
 
-    The peer address itself was caller-chosen for two rounds, because uvicorn's proxy-header
-    middleware rewrites it above the application from an X-Forwarded-For the caller sends. The
-    launch command now refuses to trust that header, but the whole control living in a launch
-    command is how the original defect stayed invisible: if the platform ever supplies its own
-    command or an entrypoint wrapper, it vanishes and nothing here can tell. So a request that
-    carries a forwarding header at all is folded into ONE shared key. That is deliberately
-    pessimistic: it cannot be gamed, and in the shipped topology no such header arrives.
+def _limit_keys(request: Request, config: Config) -> tuple[str, ...]:
+    """Every bucket this request must fit inside. Refused if ANY of them is over.
 
-    And the key space is split by whether a token was presented, because the coarse tier runs
-    before authentication. Sharing one space let an unauthenticated caller consume the
-    operators' whole budget and hold them at 429 for the rest of the window.
+    Returning a tuple rather than one key closes the half of this that adding a header could
+    still exploit. Folding a forwarded request onto a single shared key stopped it minting
+    fresh buckets, but the folded key was a DIFFERENT bucket from the peer's own, so a caller
+    already at its limit escaped simply by adding X-Forwarded-For. Measured: a throttled
+    caller went back to 404 by adding any of three headers. Charging both keys means a header
+    can only ever reduce a caller's allowance, never increase it.
     """
     headers = request.headers
+    client = request.client
+    peer = client.host if client else "unknown"
+    # VALIDITY, not presence. `space = "auth" if headers.get(...)` let an unauthenticated
+    # caller into the operators' space with `X-Pree-Token: anything`, which is the same defect
+    # as keying on the actor header: the caller picks its own bucket. Measured: flooding with a
+    # garbage token header then presenting the real one from the same peer returned 429. The
+    # compare is the constant-time one, so this is not a new timing surface.
+    presented = headers.get(_TOKEN_HEADER)
+    authenticated = bool(
+        config.team_token and presented and token_matches(presented, config.team_token)
+    )
+    space = "auth" if authenticated else "unauth"
+    keys = [f"{space}:{peer}"]
     if _FORWARD_HEADERS & {name.lower() for name in headers}:
-        peer = "forwarded"
-    else:
-        client = request.client
-        peer = client.host if client else "unknown"
-    space = "auth" if headers.get(_TOKEN_HEADER) else "unauth"
-    return f"{space}:{peer}"
+        keys.append(f"{space}:forwarded")
+    return tuple(keys)
 
 
 def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
@@ -452,6 +472,8 @@ def register_health_routes(
 
 def register_api_routes(
     app: FastAPI,
+    *,
+    config: Config,
     store: JsonStore,
     audit_log: logging.Logger,
     fine: RateLimiter,
@@ -471,12 +493,12 @@ def register_api_routes(
         x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
     ) -> AssessResponse:
         """Score one candidate against one protected asset, then persist and audit it."""
-        limit_key = _client_key(request)
-        if not fine.allow(limit_key):
+        refused = _first_refused(fine, _limit_keys(request, config))
+        if refused is not None:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=RATE_LIMITED_ERROR,
-                headers={"Retry-After": str(fine.retry_after_seconds(limit_key))},
+                headers={"Retry-After": str(fine.retry_after_seconds(refused))},
             )
 
         # The actor label is for the audit trail only. It is caller-supplied, so it is never a
@@ -535,16 +557,35 @@ def register_api_routes(
     def read_assessment(
         key: str,
         response: Response,
+        x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
         if_none_match: str | None = Header(default=None, alias="if-none-match"),
     ) -> Any:
-        """Return a stored assessment, honouring If-None-Match with 304."""
+        """Return a stored assessment, honouring If-None-Match with 304.
+
+        Audited, including the successes. A refused request was audited, a rejected body was
+        audited, a store failure was audited, and a successful DISCLOSURE of a record was not.
+        The security policy names this store as one of the two assets worth protecting, because
+        it reveals what the operator is watching and what they judge dangerous; under the
+        shared-token model "who read what" is the only forensic question the trail could answer
+        about a stolen token, and it could not answer it.
+        """
+        started = time.monotonic()
+        actor = sanitise_actor(x_pree_actor)
         record = store.read()["assessments"].get(key)
+        elapsed = int((time.monotonic() - started) * 1000)
+        # The key is caller-supplied, but it reached here through the path validator, so it is
+        # already shape-checked. Truncated anyway: a bound that depends on another layer's
+        # correctness is a bound that moves when that layer does.
+        audited_key = key[:MAX_LOGGED_PATH]
         if record is None:
+            audit(audit_log, "read_assessment", actor, elapsed, "not_found", key=audited_key)
             response.status_code = status.HTTP_404_NOT_FOUND
             return {"error": "not found"}
         etag = _etag_for(record)
         if _etag_matches(if_none_match, etag):
+            audit(audit_log, "read_assessment", actor, elapsed, "not_modified", key=audited_key)
             return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+        audit(audit_log, "read_assessment", actor, elapsed, "disclosed", key=audited_key)
         response.headers["ETag"] = etag
         response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
         return record
@@ -619,12 +660,12 @@ def create_app(
         """
         if request.url.path in UNMETERED_PATHS:
             return await call_next(request)
-        key = _client_key(request)
-        if not coarse.allow(key):
+        refused = _first_refused(coarse, _limit_keys(request, config))
+        if refused is not None:
             return JSONResponse(
                 {"error": RATE_LIMITED_ERROR},
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                headers={"Retry-After": str(coarse.retry_after_seconds(key))},
+                headers={"Retry-After": str(coarse.retry_after_seconds(refused))},
             )
         return await call_next(request)
 
@@ -640,6 +681,39 @@ def create_app(
             allow_methods=["GET", "POST"],
             allow_headers=[_TOKEN_HEADER, _ACTOR_HEADER, "content-type"],
         )
+
+        @app.middleware("http")
+        async def normalise_cors_rejection(
+            request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        ) -> Response:
+            """Bring a refused preflight inside the one error contract, and audit it.
+
+            Starlette answers a disallowed preflight itself, with a 400 whose body is the plain
+            text "Disallowed CORS origin" and no audit line. The body carries no caller input,
+            so this was contract drift rather than a reflection, but the control table claimed
+            every rejection used one contract and was audited, and this one did neither. Sitting
+            ABOVE the CORS middleware is the only place that can see its answer.
+            """
+            response = await call_next(request)
+            if response.status_code != status.HTTP_400_BAD_REQUEST:
+                return response
+            if request.method != "OPTIONS" or "origin" not in request.headers:
+                return response
+            audit_log.warning(
+                json.dumps(
+                    {
+                        "kind": "cors_reject",
+                        "path": request.url.path[:MAX_LOGGED_PATH],
+                        "origin_allowed": False,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            return JSONResponse(
+                {"error": GENERIC_CLIENT_ERROR},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
 
     @app.middleware("http")
     async def security_headers(
@@ -668,6 +742,13 @@ def create_app(
 
     register_health_routes(app, config, probe_now, require_token)
 
-    register_api_routes(app, store, audit_log, fine, require_token)
+    register_api_routes(
+        app,
+        config=config,
+        store=store,
+        audit_log=audit_log,
+        fine=fine,
+        require_token=require_token,
+    )
 
     return app

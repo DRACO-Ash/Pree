@@ -40,7 +40,7 @@ what they judge dangerous, so an open gate is a disclosure, not a convenience.
 | `PREE_ALLOWED_ORIGIN` | **COPY-PASTE EXACT:** `https://pree.apps.bluestaq.com` | operator |
 | `PREE_BUILD_ID` | leave unset, or set to the release tag | release process |
 
-Generate the token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Production refuses a token shorter than 32 characters, or one built entirely from a repeated sequence, so a doubled word will not start the app.
+Generate the token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Production refuses a token shorter than 32 characters. It also refuses a token built entirely from a repeated sequence, so a doubled word will not start the app.
 
 All three of the operator-set values go in before the first submission. The app refuses to
 start on any unsafe combination: production with no token, a token with no origin, or a token
@@ -71,6 +71,10 @@ Pree runs as user `10001` and mounts the FILE_STORAGE volume. The mount arrives 
 an operations request; it is not settable from the console. Until it is set, `/healthz/storage`
 returns 503 with `"errno_name": "EACCES"` and the resolved directory in the body, so the fault
 is a one-screenshot diagnosis rather than a silent pod kill.
+
+The 200 body deliberately omits the directory. This path is unauthenticated, so on success it
+was publishing the container's filesystem layout to anyone who asked, while `/diagnostics` gated
+the same field. On failure the disclosure earns its place; on success it buys nothing.
 
 ## Resource budget
 

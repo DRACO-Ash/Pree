@@ -143,6 +143,30 @@ async def test_a_request_declaring_both_framings_is_refused() -> None:
 
 
 @pytest.mark.anyio
+async def test_a_request_declaring_both_framings_is_refused_on_a_bodyless_method() -> None:
+    """The check ran AFTER the bodyless-method early return, so it never ran for GET.
+
+    That is precisely the method class smuggling uses: a front end permits a GET with no body,
+    which makes GET the canonical CL.TE carrier. One socket write of `GET /healthz` with both
+    framings produced two 200 responses. The refusal was written to close that exact primitive
+    and, for five of the six methods it matters most for, did not.
+    """
+    for method in ("GET", "HEAD", "OPTIONS", "DELETE", "TRACE"):
+        scope = {
+            "type": "http",
+            "method": method,
+            "headers": [(b"transfer-encoding", b"chunked"), (b"content-length", b"6")],
+        }
+        sent = await _run(BodySizeLimit(_echo), scope, [])
+        assert sent[0]["status"] == 400, (
+            f"{method} with both framings reached the application with {sent[0]['status']}"
+        )
+        assert dict(sent[0]["headers"]).get(b"connection") == b"close", (
+            f"{method} left the connection open after an ambiguous frame"
+        )
+
+
+@pytest.mark.anyio
 async def test_either_framing_header_alone_is_still_accepted() -> None:
     """The refusal is about the PAIR. Refusing either alone would break every normal request."""
     for header in ((b"content-length", b"1"), (b"transfer-encoding", b"chunked")):

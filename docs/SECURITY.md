@@ -91,6 +91,13 @@ the assessment store.
 | The shipped COPY carries no flags that undo the hardening | `Dockerfile` | `test_the_shipped_stage_is_exactly_one_copied_layer` |
 | Every base image is pinned by digest | `Dockerfile` | `test_every_base_image_is_pinned_by_digest` |
 | The upload archive ships only allowlisted extensions | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
+| The authenticated rate space needs a valid token, not a present one | `src/pree/app.py` | `test_the_authenticated_key_space_needs_a_valid_token_not_a_present_one` |
+| An ambiguous frame is refused on every method, bodyless included | `src/pree/app.py` | `test_a_request_declaring_both_framings_is_refused_on_a_bodyless_method` |
+| Nothing writes over a binary the hardening steps name | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
+| The shipped stage declares nothing that undoes a control | `Dockerfile` | `test_the_shipped_stage_declares_no_instruction_that_undoes_a_control` |
+| The storage probe publishes the data directory only on failure | `src/pree/health.py` | `test_the_storage_probe_publishes_the_data_directory_only_on_failure` |
+| Every read of the assessment store is audited | `src/pree/app.py` | `test_every_read_of_the_store_is_audited` |
+| A refused CORS preflight uses one contract and is audited | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 
 ## Deliberately accepted risks
 
@@ -130,7 +137,7 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    There are now two independent controls. The launch command pins
    `--forwarded-allow-ips=255.255.255.255`, the limited broadcast address, which can never be
    the source of a TCP connection, and an explicit flag beats the environment default so this
-   cannot be widened from outside the image. And `_client_key` folds any request that carries a
+   cannot be widened from outside the image. And `_limit_keys` charges any request that carries a
    forwarding header at all into one shared key, so the control survives a launch command the
    platform supplies rather than living entirely in a flag, which is how the original defect
    stayed invisible.
@@ -529,7 +536,7 @@ a rotating header, 0 are refused with neither control and 615 with the shipped b
 The remaining four minors are smaller and each closed with a test: the coarse tier runs before
 authentication, so its key space is now split by whether a token was presented, and an
 unauthenticated flood can no longer consume the operators' budget; the forwarded-header control
-no longer lives only in the launch command, because `_client_key` folds any request carrying such
+no longer lives only in the launch command, because `_limit_keys` charges any request carrying such
 a header into one key; the base digest, which a comment claimed was pinned, is now asserted; and
 a request declaring both a Transfer-Encoding and a Content-Length is refused with the connection
 closed rather than framed by one parser and re-read by another.
@@ -541,6 +548,91 @@ limiter was refusing for the wrong reason. Varying the peer needs the ASGI scope
 And the register guard could not see an `async def`, so any row citing an async test read as
 citing a nonexistent one, which had quietly pushed the register towards citing file paths instead
 of test names, weaker evidence for no reason at all.
+
+Fifteenth review: three majors, and two of them were controls added in the previous two rounds
+that did not do what their own commit messages said.
+
+The Transfer-Encoding plus Content-Length refusal was placed AFTER the middleware's
+bodyless-method early return, so it never ran for GET, HEAD, OPTIONS, DELETE or TRACE. That is
+precisely the method class smuggling uses, because a front end permits a GET with no body, which
+makes GET the canonical carrier. One socket write of `GET /healthz` with both framings produced
+two 200 responses. The refusal was written to close that exact primitive and, for the five
+methods it matters most for, did not. It now runs first, and every bodyless method is refused
+with the connection closed, verified against the running server.
+
+The rate-limit key space was caller-selected. The split between authenticated and
+unauthenticated traffic was decided on the PRESENCE of the token header rather than its
+validity, so an unauthenticated caller reached the operators' space with
+`X-Pree-Token: anything`; and the fold that stopped a rotating forwarding header from minting
+fresh buckets put the request in a DIFFERENT bucket from the peer's own, so a caller already at
+its limit escaped by adding a header. Together one peer reached four buckets by toggling two
+headers it fully controls, and the reviewer measured 1,920 requests admitted against a nominal
+480. The space is now decided by the constant-time compare that was already available, and a
+request is charged to every key it belongs to and refused if any is over, so a header can only
+ever reduce an allowance. Measured the same way after the fix, at two workers, 720 requests per
+arm across five arms: 480 admitted in total, exactly the nominal two-worker budget.
+
+The third major was the suid sweep guard, for the fourth consecutive round, and it is worth
+being blunt about the pattern rather than reporting another repair. The command's text is pinned
+literally, `SHELL` is refused, and the guard was still defeated twice: `ENV PATH="/neutered:$PATH"`
+above the sweep with a no-op `find` planted on that path, and the single line
+`COPY --from=build /bin/true /usr/bin/find`. Both left the whole suite green, and the reviewer
+confirmed against a real fixture that files at 4755 and 2755 survived. Pinning what a command
+SAYS can never establish what it DOES. The sweep now names both binaries absolutely, which
+removes PATH from the question entirely, and an instruction writing into any system executable
+directory is refused. More importantly, the pipeline's containerize stage now asserts the three
+container hard rules against the BUILT IMAGE: no setuid or setgid bits anywhere on the
+filesystem, a runtime identity of exactly 10001:10001, and no pip. Those assertions need a
+Docker daemon, so they do not run here, and until Continuous Integration builds the image those
+three rules are claims and not evidence. That is stated in the simulation's own output now,
+rather than left for a reviewer to notice for a fifth time.
+
+Eight minors, four of which are corrections to guards or claims of mine.
+
+The token-floor guard was rewritten for the fifth time, and the honest outcome is a narrower
+scope rather than a cleverer rule. Four fabrications beat the previous version: a floor wrapped
+over two prose lines, "eighteen" and "twenty-eight" as words absent from a hand-written table,
+and "under 16" with no unit. Fixing the word table by construction rather than by enumeration
+fixed those, and then flagged fourteen true sentences, because the policy and the changelog
+narrate this guard's own history in measurements: "five 5,000-character field names", "a
+30,074-byte record", each in a sentence that also says "token". No text rule can separate a
+measurement from a floor claim without understanding the sentence. So the guard now covers the
+instruction-bearing files only, the deployment sheet, the README, this baseline and the example
+environment file, completely, digits and words alike; and it does not cover this policy or the
+changelog, where a wrong floor asserted in prose would pass. That is a real gap, deliberately
+chosen, on the reasoning that the sheet is where a wrong number becomes a wrong deployment.
+Twelve fabrications now turn it red, and lowering the code's own floor turns two tests red.
+
+The packaging scan lost for a fifth round, each time to a name one character outside its list:
+`.crt` but not `.cert`, `deploy_key` but not `deploy_key.txt`, then `deploy_key.txt` fixed and
+`deploykey.txt` shipping because deleting the delimiter beat the delimited-word rule, and
+`id-rsa.md` shipping because the pattern spelled `id_rsa` with a literal underscore while its
+neighbour on the same line used a wildcard for exactly this reason. `vault` and `jwt` were two
+ordinary credential names in no list at all. The key rule is now the loosest thing that still
+means something, any component ending in "key" or "keys", and the closing message says the scan
+matched no name on a list rather than claiming nothing reads like a credential.
+
+The unauthenticated storage probe published the resolved absolute data directory in its 200
+body, while `/diagnostics` gated the same field on the reasoning that configuration detail
+narrows an attacker's search space for free. The deployment sheet described the directory as
+appearing in the 503 body, which was true of the sheet and not of the code. It now appears only
+on failure, where it earns its place: a screenshot of the 503 is the whole diagnosis.
+
+A successful read of the assessment store wrote no audit line. A refused request was audited, a
+rejected body was audited, a store failure was audited, and a successful DISCLOSURE of a record
+was not. This policy names that store as one of the two assets worth protecting, because it
+reveals what the operator is watching and what they judge dangerous, and under the shared-token
+model "who read what" is the only forensic question the trail could answer about a stolen token.
+Every read is now audited with its outcome: disclosed, not modified, or not found.
+
+The remaining minors: a refused CORS preflight was answered by Starlette in plain text with no
+audit line, outside the single error contract this policy claims; `HEALTHCHECK NONE`, `VOLUME`
+and `STOPSIGNAL` in the shipped stage all passed silently, and `HEALTHCHECK NONE` disables the
+storage proof three earlier rounds treated as the control keeping a broken mount out of service;
+a `_FLOOR_PHRASES` constant sat in the test module with a comment describing a rule the guard did
+not implement, which is exactly the evidence inflation this document apologises for elsewhere,
+and it is deleted; and the per-record volume figure, wrong three times before, is now searched
+across all 64 indicator combinations rather than measured at one set of values.
 
 Each of these now has a named regression test in the control table above.
 

@@ -52,16 +52,29 @@ class StorageProbe:
         return "ready" if self.writable else "unready"
 
     def as_body(self) -> dict[str, Any]:
-        """The response body. Carries the directory and the errno, never file contents."""
-        return {
+        """The response body. Carries the errno, never file contents.
+
+        The resolved absolute directory appears only on FAILURE. This path is unauthenticated
+        by design, so on success it was publishing the container's filesystem layout to anyone
+        who asked, while `/diagnostics` gated the very same field on the stated reasoning that
+        configuration detail "narrows an attacker's search space for free". The deployment sheet
+        described the directory as appearing in the 503 body, which was true of the sheet and
+        not of the code.
+
+        On failure the disclosure earns its place: the whole point of this path is that a
+        screenshot of the 503 is a complete diagnosis, and the directory is half of it.
+        """
+        body: dict[str, Any] = {
             "status": self.status,
             "storage_writable": self.writable,
-            "data_dir": self.data_dir,
             "errno": self.errno_code,
             "errno_name": self.errno_name,
             "probe_duration_ms": self.duration_ms,
             "probe_timeout_ms": int(STORAGE_PROBE_TIMEOUT_SECONDS * 1000),
         }
+        if not self.writable:
+            body["data_dir"] = self.data_dir
+        return body
 
 
 def _write_probe(data_dir: Path) -> None:

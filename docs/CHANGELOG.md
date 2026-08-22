@@ -348,3 +348,35 @@ Fourteenth security review, two majors:
 ● Corrected: the previous round's rate-limit figures were measured at one worker while the
   shipped command runs two. Restated at two workers with a third arm: 0 of 1,000 refused with
   neither control, 615 with the shipped build.
+
+Fifteenth security review, three majors, two of them controls added in the previous two rounds
+that did not do what their commit messages said:
+
+● The Transfer-Encoding plus Content-Length refusal sat AFTER the bodyless-method early return,
+  so it never ran for GET, HEAD, OPTIONS, DELETE or TRACE, which is the method class smuggling
+  uses. One socket write of `GET /healthz` with both framings produced two 200 responses. It now
+  runs first, verified against the running server on every bodyless method.
+● The rate-limit key space was caller-selected two ways: the authenticated split was decided on
+  the token header's presence rather than its validity, and the forwarding-header fold put a
+  request in a different bucket from the peer's own, so a throttled caller escaped by adding a
+  header. One peer reached four buckets and 1,920 requests were admitted against a nominal 480.
+  The split now uses the constant-time compare, and a request is charged to every key it
+  belongs to. Re-measured at two workers across five arms: 480 admitted in total.
+● The suid sweep guard was defeated for the fourth consecutive round, by `ENV PATH` with a no-op
+  `find` planted, and by one line copying `/bin/true` over `/usr/bin/find`. Pinning what a
+  command says cannot establish what it does. The sweep now names both binaries absolutely, a
+  write into any system executable directory is refused, and the pipeline asserts the three
+  container hard rules against the BUILT IMAGE. Those assertions need a daemon, so the rules
+  stay unverified here, which the simulation now says in its own output.
+● The token-floor guard was rewritten for the fifth time. Four more forms beat it; fixing the
+  number-word table by construction then flagged fourteen true sentences, because this policy
+  narrates the guard's own history in measurements. It now covers the instruction-bearing files
+  completely and does not cover the policy or the changelog, a gap chosen deliberately.
+● The packaging scan lost for a fifth round to names one character outside its list, among them
+  `deploykey.txt` and `id-rsa.md`. Any component ending in "key" is now refused.
+● The unauthenticated storage probe published the resolved data directory in its 200 body.
+● A successful read of the assessment store wrote no audit line, the one privileged action with
+  no record. Every read is now audited with its outcome.
+● A refused CORS preflight was answered in plain text with no audit line, outside the contract.
+● `HEALTHCHECK NONE`, `VOLUME` and `STOPSIGNAL` in the shipped stage all passed silently.
+● A `_FLOOR_PHRASES` constant described a rule the guard did not implement; deleted.
