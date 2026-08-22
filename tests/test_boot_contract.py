@@ -15,6 +15,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from pree.health import StorageProbe
 from tests.test_api import EXPECTED_LIVENESS_PATHS
 
@@ -121,14 +123,20 @@ def _instructions() -> list[_Instruction]:
     # parser had swallowed whole and read the `USER root` hidden inside it as its own
     # instruction. Only the syntax directive is permitted; anything else is refused.
     for raw in text.splitlines():
-        stripped = raw.strip()
-        if not stripped.startswith("#"):
+        if not raw.strip().startswith("#"):
             break
-        directive = stripped.lstrip("#").strip()
-        if "=" in directive and " " not in directive.split("=")[0]:
-            assert directive.split("=")[0].strip() == "syntax", (
-                f"unrecognised parser directive {directive!r}; a directive changes how docker "
-                "reads this file and is invisible to a line-based parser"
+        # BuildKit's own directive pattern tolerates whitespace on both sides of the `=`
+        # (`^#[ \t]*escape[ \t]*=[ \t]*(?P<escapechar>.).*$`). The first version of this check
+        # skipped any fragment with a space before the `=`, so `# escape = ` with one space was
+        # a comment to this parser and a directive to docker: it stopped `\` continuing a line,
+        # split a HEALTHCHECK this parser had swallowed whole, and left the resolved user root
+        # with the whole suite green. A single space reopened the hole the check was added to
+        # close, so the pattern is now BuildKit's, not an approximation of it.
+        found = re.match(r"^#\s*([A-Za-z][A-Za-z0-9_.-]*)\s*=", raw)
+        if found is not None:
+            assert found.group(1).lower() == "syntax", (
+                f"unrecognised parser directive {found.group(1)!r}; a directive changes how "
+                "docker reads this file and is invisible to a line-based parser"
             )
     joined: list[str] = []
     buffer = ""
@@ -302,6 +310,63 @@ def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
     assert not misplaced, misplaced
 
 
+def test_the_suid_sweep_actually_sweeps_the_whole_filesystem() -> None:
+    """Being in the right stage says nothing about what the command does.
+
+    Presence was asserted by the substring `-perm /6000` alone, so three one-token mutations
+    each left the suite green while every setuid binary the base image carries shipped:
+    `find /app` scoped the search to a subtree with no setuid bits, a leading `-false`
+    short-circuited the predicate, and a trailing `|| true` tolerated a sweep that failed. With
+    no docker daemon in the loop this text is the ONLY verification of a hard rule, so the
+    resolved command is checked rather than a fragment of it.
+    """
+    sweep = next(i for i in _instructions() if "-perm /6000" in i.argument)
+    command = " ".join(sweep.argument.split())
+    assert command.startswith("find / -xdev -perm /6000 "), (
+        f"the sweep does not start at the filesystem root with -xdev: {command!r}"
+    )
+    assert command.endswith("-exec chmod a-s {} +"), (
+        f"the sweep does not clear the bits it finds: {command!r}"
+    )
+    for neutering in ("-false", "-true", "-name", "-path", "-prune", "-maxdepth", "||", "&&"):
+        assert f" {neutering} " not in f" {command} ", (
+            f"the sweep is narrowed or its failure tolerated by {neutering!r}: {command!r}"
+        )
+    assert ";" not in command and "|" not in command, (
+        f"the sweep shares its RUN with another command: {command!r}"
+    )
+
+
+def test_the_pip_removal_targets_the_venv_the_build_actually_creates() -> None:
+    """A removal aimed at a path that does not exist is a no-op the substring check accepted.
+
+    Repointing the removal at `/nowhere/site-packages/pip*` left the suite green, and pip then
+    ships in the image, which the Dockerfile's own comment says carries CVEs the policy scan
+    stops on. The removal is tied to the venv the build stage creates.
+    """
+    instructions = _instructions()
+    venv = next(i for i in instructions if i.keyword == "RUN" and "-m venv" in i.argument)
+    target = venv.argument.split()[-1]
+    assert target.startswith("/"), f"the venv is created at a relative path: {venv.argument!r}"
+    removal = next(i for i in instructions if "site-packages/pip" in i.argument)
+    assert f"{target}/lib/python3.12/site-packages/pip" in removal.argument, (
+        f"the pip removal does not target the venv at {target!r}: {removal.argument[:120]!r}"
+    )
+    assert f"{target}/bin/pip" in removal.argument, (
+        f"the pip entry points under {target!r} are not removed: {removal.argument[:120]!r}"
+    )
+
+
+def test_the_numeric_user_is_created_unprivileged() -> None:
+    """`--uid 0` satisfied "a useradd exists in the shipped stage" and creates root."""
+    creation = next(i for i in _instructions() if "--uid 10001" in i.argument)
+    assert "--uid 10001" in creation.argument
+    for privileged in ("--uid 0", "--gid 0", "--groups root", "-o "):
+        assert privileged not in creation.argument, (
+            f"the runtime user is created with {privileged!r}: {creation.argument[:120]!r}"
+        )
+
+
 def test_the_shipped_stage_is_exactly_one_copied_layer() -> None:
     """The image-policy scan reads layer history, so one clean layer is the point.
 
@@ -348,85 +413,117 @@ def test_the_sonar_configuration_scopes_sources_to_src() -> None:
     )
 
 
-def test_every_documented_token_floor_matches_the_number_the_code_enforces() -> None:
-    """Tie the documented token rule to the constant, so it cannot drift again.
+def _claim_units(path: Path) -> list[str]:
+    """One unit per line, except that contiguous table rows become a single unit.
 
-    It already had. The floor was raised from 24 to 32 and the character-variety rule was
-    deleted, but two documents still stated the old numbers and the retired rule, and one of my
-    own commit messages claimed all three had been updated when only one had. Prose drifts
-    silently; a constant does not.
+    Treating every line separately fixed a floor stated inside one table row and created a
+    two-row version of the same hole: `| Token floor |` on one line and `| at least 24
+    characters |` on the next put the subject and the figure in different units, and neither
+    unit had both.
+    """
+    units: list[str] = []
+    table: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        collapsed = re.sub(r"\s+", " ", raw).strip()
+        if collapsed.startswith("|"):
+            table.append(collapsed)
+            continue
+        if table:
+            units.append(" ".join(table))
+            table = []
+        units.append(collapsed)
+    if table:
+        units.append(" ".join(table))
+    return units
+
+
+def _figures_in(unit: str, patterns: tuple[str, ...]) -> list[int]:
+    """Every number attached to a size word in this unit, digits or words."""
+    found: list[int] = []
+    lowered = unit.lower()
+    for pattern in patterns:
+        for raw in re.findall(pattern, lowered):
+            cleaned = raw.replace(",", "").rstrip("+")
+            value = int(cleaned) if cleaned.isdigit() else _WORD_NUMBERS.get(cleaned)
+            if value is not None:
+                found.append(value)
+    return found
+
+
+def test_no_document_states_a_character_figure_for_the_token_but_the_enforced_one() -> None:
+    """Assert the ABSENCE of a wrong number, not the presence of a right one.
+
+    Two rounds of pattern-matching prose caught eight forms and admitted four more each time:
+    a comparator I had not listed, a "24+" with the plus inside the number, a floor stated in
+    bytes rather than characters, and a floor split across two lines of a table, which the
+    per-line fragmenting introduced while fixing the single-row case. Chasing forms is a losing
+    game, so the rule is inverted: within any line that mentions the token, EVERY figure
+    attached to a size word must be the enforced constant, whatever the surrounding phrasing.
+    That needs no comparator list, no word-number table and no notion of a sentence.
     """
     floor = importlib.import_module("pree.config").MIN_PRODUCTION_TOKEN_LENGTH
+    checked = 0
     wrong: list[str] = []
     retired: list[str] = []
-    checked = 0
-    for name in ("DEPLOYMENT.md", "SECURITY.md", "CHANGELOG.md"):
-        # Fragments are built PER LINE, then split into sentences within the line. Flattening
-        # the whole document first and splitting on the pipe put a table row's cells into
-        # separate fragments, so `| Token floor | at least 24 characters |` had the subject in
-        # one fragment and the number in another and neither fragment had both. A line keeps a
-        # row, a bullet and an undotted heading whole.
-        fragments: list[str] = []
-        for line in (REPO_ROOT / "docs" / name).read_text(encoding="utf-8").splitlines():
-            collapsed = re.sub(r"\s+", " ", line).strip(" ●■")
-            if collapsed:
-                fragments.extend(re.split(r"(?<=[.!?])\s+", collapsed))
-        for fragment in fragments:
-            lowered = fragment.lower()
-            # Named by the environment variable as well as by the word, because a sentence
-            # about "the shared operator credential" is about the token and said 16.
+    scanned = [
+        REPO_ROOT / "docs" / "DEPLOYMENT.md",
+        REPO_ROOT / "docs" / "SECURITY.md",
+        REPO_ROOT / "docs" / "CHANGELOG.md",
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "CLAUDE.md",
+        REPO_ROOT / ".env.example",
+    ]
+    # A size word, whatever unit it claims. A floor stated in bytes is still a floor, and
+    # "at least 16 bytes" was admitted by a guard that only understood characters.
+    size = r"(?:char(?:acter)?s?|bytes?|bits?|digits?|long|length|minimum|floor)"
+    number = r"(?:\d[\d,]*\+?|" + "|".join(sorted(_WORD_NUMBERS, key=len, reverse=True)) + r")"
+    joiner = r"[\s:=~-]{0,3}"
+    # Two patterns, matched in SEPARATE passes. Combining them into one alternation let the
+    # first branch consume the size word as if it were the figure, which advanced the scan past
+    # it, so "PREE_TEAM_TOKEN length: 24" matched "token length" and never saw the 24.
+    patterns = (
+        rf"\b({number}){joiner}{size}\b",
+        rf"\b{size}{joiner}({number})\b",
+    )
+    for path in scanned:
+        if not path.is_file():
+            continue
+        for unit in _claim_units(path):
+            lowered = unit.lower()
             if not any(term in lowered for term in _TOKEN_TERMS):
                 continue
-            # The retired-rule check runs BEFORE the floor gate. Putting it after meant a
-            # reworded variety rule ("must mix upper case, lower case and digits") states no
-            # number, failed the floor gate, and was never examined for the rule at all.
-            #
-            # It is scoped to the operator sheet on purpose. There, a sentence naming a rule is
-            # an instruction the operator will follow, so a rule the code no longer has is a
-            # defect. Elsewhere the same words appear in the record of the rule's REMOVAL, and
-            # no text test can reliably separate "we enforce this" from "we deleted this"
-            # without an exemption phrase that then becomes the escape hatch.
-            if name == "DEPLOYMENT.md" and any(
+            if path.name == "DEPLOYMENT.md" and any(
                 phrase in lowered for phrase in _RETIRED_TOKEN_RULES
             ):
-                retired.append(f"{name}: {fragment.strip()}")
-            # A number of characters is only a FLOOR claim when a comparator says so. Matching
-            # every "N characters" in a token sentence flagged "five 5,000-character field
-            # names", which is a fact about a log line, and a guard that cries wolf gets
-            # relaxed rather than obeyed.
-            if not any(phrase in lowered for phrase in _FLOOR_PHRASES):
-                continue
-            stated_numbers = [
-                int(digits) for digits in re.findall(r"\b(\d+)[\s-]*characters?\b", fragment)
-            ]
-            stated_numbers += [
-                _WORD_NUMBERS[word]
-                for word in re.findall(r"\b([a-z]+(?:-[a-z]+)?)[\s-]*characters?\b", lowered)
-                if word in _WORD_NUMBERS
-            ]
-            for stated in stated_numbers:
+                retired.append(f"{path.name}: {unit}")
+            for value in _figures_in(unit, patterns):
                 checked += 1
-                if stated != floor:
-                    wrong.append(f"{name}: {fragment.strip()}")
-    # A fenced block carries no prose the split above would recognise as a claim, so the
-    # constant's own name is checked wherever it appears with a value attached.
-    for name in ("DEPLOYMENT.md", "SECURITY.md", "CHANGELOG.md"):
-        body = (REPO_ROOT / "docs" / name).read_text(encoding="utf-8")
+                if value != floor:
+                    wrong.append(f"{path.name}: {unit} (states {value})")
+
+    # The constant by name, wherever it appears with a value. A fenced block is prose to the
+    # reader and its own line to the scan above, but `MIN_PRODUCTION_TOKEN_LENGTH` has no word
+    # boundary before "LENGTH" (an underscore is a word character), so the size-word patterns
+    # never fire on it.
+    for path in scanned:
+        if not path.is_file():
+            continue
+        body = path.read_text(encoding="utf-8")
         for value in re.findall(r"MIN_PRODUCTION_TOKEN_LENGTH\s*[=:]\s*(\d+)", body):
             checked += 1
             if int(value) != floor:
-                wrong.append(f"{name}: MIN_PRODUCTION_TOKEN_LENGTH stated as {value}")
+                wrong.append(f"{path.name}: MIN_PRODUCTION_TOKEN_LENGTH stated as {value}")
 
     assert checked, (
-        "no document states a character floor for the team token; the operator has no way to "
-        "know what production will refuse"
+        "no document states a size for the team token; the operator has no way to know what "
+        "production will refuse"
     )
     assert not wrong, (
-        f"the code refuses a token shorter than {floor} characters, but the docs say otherwise: "
-        f"{wrong}"
+        f"the code refuses a token shorter than {floor} characters, and these lines say "
+        f"otherwise: {wrong}"
     )
     assert not retired, (
-        f"the character-variety rule was deleted from the code but is still documented: {retired}"
+        f"a rule the code no longer has is still documented for the operator: {retired}"
     )
 
 
@@ -449,6 +546,33 @@ def test_git_actually_ignores_every_secret_and_local_artefact() -> None:
     ]
     git = shutil.which("git")
     assert git, "git is required to assert ignore behaviour rather than file contents"
+    # The platform pipeline runs this suite from the EXTRACTED archive: .gitignore is present,
+    # .git is not, and `git check-ignore` outside a work tree fails for every path. That
+    # surfaced only when the pipeline simulation was re-run after this test was rebuilt from a
+    # text check into a behavioural one, so the behavioural version had never run anywhere but
+    # a developer checkout.
+    #
+    # The first attempt at this skip asserted `not ON_PLATFORM_RUNNER` on the grounds that the
+    # platform commits its own generated .gitlab-ci.yml into a checkout, so a work tree would
+    # always exist there. The simulation, which sets GITLAB_CI=true and runs from the extracted
+    # archive, failed that assertion immediately: the belief was mine, not evidence, and it was
+    # wrong. Recorded rather than quietly deleted, because it was a guess dressed as a control.
+    #
+    # What the ignore rules actually protect is the environment where someone COMMITS, and that
+    # is a work tree by definition. The archive has no history to add to, so there is nothing
+    # for this to be true or false about there. The local loop always runs in a work tree, so
+    # the assertion below always runs somewhere that matters; the claim is exactly that, and
+    # not that the platform verifies it.
+    inside = subprocess.run(  # noqa: S603 - resolved git path, fixed literal arguments
+        [git, "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    in_work_tree = inside.stdout.strip() == "true"
+    if not in_work_tree:
+        pytest.skip("no git work tree: nothing can be committed here, so nothing to ignore")
     result = subprocess.run(  # noqa: S603 - resolved git path, fixed literal arguments
         [git, "check-ignore", "--stdin", "--no-index"],
         input="\n".join(candidates),

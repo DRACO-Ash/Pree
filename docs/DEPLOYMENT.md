@@ -83,8 +83,17 @@ Inside the 8Gi and 6 CPU envelope. Two gunicorn workers with a 60 second timeout
 
 Storage growth is bounded by construction: the assessment collection is capped at 5000
 records, dropping the oldest and never the record just written, so the volume cannot fill
-through ordinary accumulation. Measured at 1258 bytes per record, which is about **6.0 MiB** of
-steady state.
+through ordinary accumulation.
+
+Measured through the real scoring path on this build: **1339 bytes** for a minimal record and
+**1705 bytes** for a maximum-length one, meaning 64-character identifiers, a 64-character
+actor and every indicator present. Plan on the maximum, which is **8.1 MiB** of steady state.
+An earlier version of this sheet published 1258 bytes as the planning figure; that was a
+best-case measurement presented as a worst case, and it understated the volume by a third.
+
+The snapshot is rewritten whole on every upsert and a backup copy sits beside it, so the
+directory holds up to three copies at the moment of a write: request a volume of at least
+**64 MiB** and the cap can never be the thing that fills it.
 
 The number the cap's size actually trades against is write cost, so it is published here
 rather than left to be discovered. Every upsert reads, merges, serialises, fsyncs, copies the
@@ -95,6 +104,15 @@ per minute per address, so a handful of distinct addresses writing at the fine l
 on the lock and eventually meet gunicorn's 60 second timeout. It is authenticated traffic only,
 so it sits inside the shared-token risk, but it is the reason a larger cap is the wrong answer
 to wanting more history: that is the POSTGRESQL add-on.
+
+The read path costs too, and the sheet used to say only that the write did. A single
+`GET /v1/assessments/{key}` parses the whole snapshot, with no cache: measured at **81 ms** at
+the cap, against a coarse limit of 240 requests a minute per address and a 1 CPU pod limit.
+Roughly three busy authenticated callers will saturate the CPU budget. Reads are deliberately
+outside the per-actor limiter, because the actor label is caller-supplied and cannot be a
+security boundary, so the coarse limiter is the only bound on read cost. If read traffic grows
+past a handful of concurrent callers, cache the parsed snapshot behind the store's lock before
+raising the pod's CPU limit.
 
 ## Health paths
 

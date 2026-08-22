@@ -65,12 +65,19 @@ the assessment store.
 | The Dockerfile contract is asserted by parsing, not by substring | `Dockerfile` | `tests/test_boot_contract.py` |
 | A rejected body cannot write an unbounded audit line | `src/pree/app.py` | `test_a_rejected_body_cannot_write_an_unbounded_audit_line` |
 | The body cap is bounded against the granted memory | `src/pree/app.py` | `test_the_body_cap_is_derived_from_the_memory_the_platform_grants` |
-| Every documented token floor matches the enforced constant | `docs/` | `test_every_documented_token_floor_matches_the_number_the_code_enforces` |
+| No document states a token size but the enforced one | `docs/` | `test_no_document_states_a_character_figure_for_the_token_but_the_enforced_one` |
 | Sonar scans `src` only, read as a resolved property | `sonar-project.properties` | `test_the_sonar_configuration_scopes_sources_to_src` |
 | The upload archive carries no credential-shaped path | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
 | No handler writes an audit line an unauthenticated caller can size | `src/pree/app.py` | `test_a_long_request_path_cannot_write_an_unbounded_audit_line` |
 | Every hardening step runs in the stage that actually ships | `Dockerfile` | `test_every_hardening_step_runs_in_the_stage_that_actually_ships` |
 | The shipped collection cap matches the sheet and the volume | `src/pree/store.py` | `test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget` |
+| The access log cannot be sized by an unauthenticated caller | `src/pree/audit.py` | `test_the_access_log_filter_bounds_the_request_line` |
+| The suid sweep covers the whole filesystem, unnarrowed | `Dockerfile` | `test_the_suid_sweep_actually_sweeps_the_whole_filesystem` |
+| The pip removal targets the venv the build creates | `Dockerfile` | `test_the_pip_removal_targets_the_venv_the_build_actually_creates` |
+| The runtime user is created unprivileged | `Dockerfile` | `test_the_numeric_user_is_created_unprivileged` |
+| Every rejection uses one error contract and is audited | `src/pree/app.py` | `test_every_rejection_uses_one_error_contract_and_is_audited` |
+| Both rate-limit tiers answer identically and keep Retry-After | `src/pree/app.py` | `test_both_rate_limit_tiers_answer_identically_and_keep_retry_after` |
+| The limiter never turns a 429 into a 500 under concurrency | `src/pree/ratelimit.py` | `test_concurrent_callers_never_turn_a_429_into_a_500` |
 
 ## Deliberately accepted risks
 
@@ -302,6 +309,72 @@ Nine of nine mutations in the reviewer's own list now turn the suite red, verifi
 time. The pattern across the last four rounds is worth stating plainly, because it is not
 flattering: the application code has held every attack these rounds have run, and every defect
 found has been in a guard, in a document, or in a claim I made about one of them.
+
+Twelfth review: four majors, and for the first time in five rounds one of them is in the
+application rather than in a guard.
+
+The rate limiter's eviction pass was not thread-safe, and the fine limiter is genuinely
+concurrent: the scoring handler is synchronous, so Starlette runs it in the thread pool. Three
+failures lived in one function. `sorted(...)` iterated the key table while another thread
+inserted into it; two threads selected the same eviction candidate, so the second delete raised
+KeyError; and a deque emptied by one thread raised IndexError in another. Reproduced at 375
+exceptions in 4,000 concurrent calls, and every one of them was a 500 with no audit line and
+none of the hardening headers, in place of the 429 the limiter exists to return. The
+bookkeeping is now serialised and each delete tolerates an already-gone key.
+
+The second major was the log-amplification defect again, through a channel the application does
+not own. Round eleven bounded every audit line the handlers write; the shipped launch command
+passes `--access-logfile -`, so uvicorn writes the raw request line for every request, and
+`/healthz` is deliberately exempt from the limiter. Measured under the real launch command:
+15,046 bytes of log for one unauthenticated request, and a three-second burst wrote 31 MB,
+about 620 MB a minute per worker, with every request answered 200. That both fills the log
+volume and buries the audit trail the bounded handlers exist to produce. A truncating filter is
+now attached to both access loggers by the factory, so it applies in every worker; the same
+request now writes 208 bytes, measured the same way.
+
+The remaining two majors were the Dockerfile guard again, one layer deeper than last round.
+Round eleven tied each hardening step to the stage that ships; nothing checked what the steps
+actually did. `find /app` in place of `find /`, a leading `-false`, and a trailing `|| true`
+each left the suite green while every setuid binary the base image carries shipped, and the pip
+removal repointed at a path that does not exist passed the same way. The resolved command is
+now asserted: root, `-xdev`, no narrowing predicate, no tolerated failure, and a removal tied
+to the venv the build stage creates. A `# escape = ` directive with one space around the equals
+sign also reopened the exact hole the previous round closed, because the check skipped any
+fragment with a space before the `=`; the pattern is now BuildKit's own.
+
+Six minors came with them. The path bound was 96 characters against a longest legitimate path
+of 145, so a real store key was truncated out of every 401 and 503 record; and the test's
+1,024-byte ceiling was falsified by an input it never tried, because an astral code point costs
+twelve JSON bytes rather than one. The packaging scan anchored its extension list on the end of
+the whole path, so `deploy.key.txt` and `tls.pem/server.bundle` both shipped a real private
+key, and it saw neither hard links nor a Cyrillic homoglyph. The token-floor guard admitted four
+more forms, so it was inverted: rather than matching floor phrasings, it now requires every
+figure attached to a size word in any line mentioning the token to be the enforced constant,
+across six files. The per-record figure in the deployment sheet was a best case published as a
+planning number, understating the volume by a third, and the volume size it was checked against
+appeared in no document. And a 5,000-digit integer left the application's own error contract
+entirely, answering with the framework's message shape and writing no audit line, while the two
+tiers of the rate limiter disagreed about their own response body.
+
+Two defects in this round were found by neither the reviewer nor a test, and both are worth
+recording because of how they surfaced.
+
+The pipeline simulation, re-run for the first time since the ignore-rule guard was rebuilt from
+a text check into a behavioural one, failed immediately: the platform runs the suite from the
+extracted archive, which carries .gitignore and no .git, and `git check-ignore` outside a work
+tree fails for every path. The behavioural version had never run anywhere but a developer
+checkout. Worse, my first fix asserted that the platform runner must always have a work tree,
+on the reasoning that it commits its own generated pipeline file into a checkout. The simulation
+disproved that assertion on the next run. The belief was mine and it was wrong, so the guard now
+claims only what it can support: the ignore rules protect the environment where someone commits,
+that environment is a work tree by definition, and the local loop always runs in one.
+
+One defect in this round was found by neither the reviewer nor a test. Coverage reported two
+unreachable statements in the new access-log filter, and the reason was that `logging` sets
+`record.args` to an empty tuple rather than to None when a caller logs an already-formatted
+string. The filter's guard tested the type and not the emptiness, so the pre-formatted branch
+could never run, and gunicorn's own access logger formats its line before logging it. A
+coverage figure is not a test, and this is the case for reading it anyway.
 
 Each of these now has a named regression test in the control table above.
 

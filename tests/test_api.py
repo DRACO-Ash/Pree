@@ -310,15 +310,78 @@ def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path
     stream = io.StringIO()
     logger = build_logger(stream)
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    # Two encodings, because a control character and an astral one cost different numbers of
+    # BYTES per character. %01 escapes to six JSON bytes; an emoji arrives percent-decoded and
+    # json.dumps renders it as a 12-byte surrogate pair. The first version of this test tried
+    # only %01 and asserted a 1,024-byte ceiling that the emoji input already exceeded, so the
+    # bound held and the assertion about it did not.
+    worst_case = 0
     with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
-        long_path = "/v1/assessments/" + "%01" * 4_000
-        assert bounded.get(long_path, headers={"x-pree-token": "wrong"}).status_code == 401
+        for escaped in ("%01", "%F0%9F%98%80"):
+            path = "/v1/assessments/" + escaped * 4_000
+            assert bounded.get(path, headers={"x-pree-token": "wrong"}).status_code == 401
 
     lines = [line for line in stream.getvalue().splitlines() if "auth_reject" in line]
-    assert lines, "the rejection was not audited at all"
+    assert len(lines) == 2, f"expected one audit line per rejection, got {len(lines)}"
     for line in lines:
-        assert len(line) < 1024, f"audit line is {len(line)} bytes, unbounded by the caller"
+        worst_case = max(worst_case, len(line))
+        # 12 bytes per character is the surrogate-escape ceiling, plus the fixed JSON envelope.
+        assert len(line) <= MAX_LOGGED_PATH * 12 + 256, (
+            f"audit line is {len(line)} bytes, above the bound the truncation implies"
+        )
         assert len(json.loads(line)["path"]) <= MAX_LOGGED_PATH
+    # And state the measured figure, so a later change that quietly worsens it is visible.
+    assert worst_case > MAX_LOGGED_PATH, "the test never exercised the truncation at all"
+
+
+def test_every_rejection_uses_one_error_contract_and_is_audited(tmp_path: Path) -> None:
+    """One shape for every rejection, and a record of each.
+
+    Two escaped. A 5,000-digit integer exceeds CPython's int_max_str_digits, so json.loads
+    raises a plain ValueError rather than a JSONDecodeError and FastAPI answered with its own
+    `{"detail": "There was an error parsing the body"}` and wrote no audit line, from a body
+    every other malformed value audits. And the per-actor limiter answered `{"detail": ...}`
+    while the coarse limiter answered `{"error": ...}`, so two tiers of one control disagreed.
+    """
+    stream = io.StringIO()
+    logger = build_logger(stream)
+    config = make_config(tmp_path)
+    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as strict:
+        huge = (
+            '{"protected_asset_id":"a","candidate_id":"b",'
+            '"indicators":{"manoeuvres_in_window":' + "9" * 5_000 + "}}"
+        )
+        parsed = strict.post(
+            "/v1/assess", content=huge, headers={**AUTH, "content-type": "application/json"}
+        )
+        missing = strict.get("/v1/no-such-route", headers=AUTH)
+
+    for response in (parsed, missing):
+        assert response.json() == {"error": "request rejected"}, response.text
+        assert "detail" not in response.json()
+        assert response.headers["content-security-policy"].startswith("default-src 'none'")
+    assert parsed.status_code == 400
+    assert missing.status_code == 404
+    audited = [line for line in stream.getvalue().splitlines() if line.strip()]
+    assert len(audited) == 2, f"expected one audit line per rejection, got {audited}"
+
+
+def test_both_rate_limit_tiers_answer_identically_and_keep_retry_after(tmp_path: Path) -> None:
+    """The fine tier raised an HTTPException and the coarse tier built a response by hand."""
+    config = make_config(tmp_path)
+    for kwargs in (
+        {"actor_limiter": RateLimiter(1, 60.0)},
+        {"global_limiter": RateLimiter(1, 60.0)},
+    ):
+        with build_client(
+            config, build_logger(io.StringIO()), StorageProber(cache_seconds=0.0), **kwargs
+        ) as limited:
+            body = {"protected_asset_id": "a1", "candidate_id": "b1", "indicators": {}}
+            assert limited.post("/v1/assess", json=body, headers=AUTH).status_code == 200
+            refused = limited.post("/v1/assess", json=body, headers=AUTH)
+        assert refused.status_code == 429, kwargs
+        assert refused.json() == {"error": "rate limited"}, (kwargs, refused.text)
+        assert int(refused.headers["retry-after"]) >= 1, kwargs
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:

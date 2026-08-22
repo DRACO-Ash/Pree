@@ -30,10 +30,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, 
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .api_models import AssessRequest, AssessResponse, ContributionOut
-from .audit import audit, build_logger
+from .audit import audit, bound_access_log, build_logger
 from .config import Config
 from .health import StorageProbe, StorageProber, diagnostics
 from .ratelimit import (
@@ -57,6 +58,12 @@ STORAGE_PROBE_PATH = "/healthz/storage"
 UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
 GENERIC_CLIENT_ERROR = "request rejected"
 STORE_UNAVAILABLE_ERROR = "could not store the assessment"
+RATE_LIMITED_ERROR = "rate limited"
+# The only detail strings the HTTP handler will echo. Everything else, framework messages
+# included, becomes the generic error: a handler that passes through an arbitrary detail is a
+# reflection primitive, and one of those details already differed between two tiers of the
+# same control.
+OWN_ERROR_DETAILS = frozenset({GENERIC_CLIENT_ERROR, STORE_UNAVAILABLE_ERROR, RATE_LIMITED_ERROR})
 # Generous for this schema, which is a handful of numbers and two short identifiers, and small
 # enough that an unauthenticated caller cannot exhaust memory before the token gate runs.
 MAX_BODY_BYTES = 32 * 1024
@@ -67,9 +74,23 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 # The request PATH is caller controlled too, and bounding only the body missed the cheaper
 # attack: a rejected body needs an upload, while a long path needs neither a body nor a valid
 # token. h11 admits roughly 16 KiB of request line, and JSON escaping doubled that on the way
-# into the log, so one unauthenticated 401 wrote about 30 KB. Every handler that logs a path
-# truncates it, and 96 bytes is well past the longest route this app serves.
-MAX_LOGGED_PATH = 96
+# into the log, so one unauthenticated 401 wrote about 30 KB.
+#
+# 160 characters, not the 96 first chosen. The longest LEGITIMATE path this app serves is
+# /v1/assessments/ plus a 129-character store key (two 64-character identifiers and the colon
+# between them), which is 145 characters, so 96 truncated a real key out of every 401 and 503
+# record and destroyed the diagnosis it exists to give.
+#
+# The bound is on CHARACTERS and the cost is in BYTES, and the two are not the same: the path
+# arrives percent-decoded, and json.dumps renders one astral code point as a 12-byte surrogate
+# escape. The worst case is therefore about 12x this number, roughly 2 KB per record, which the
+# test asserts against that exact input rather than against an ASCII one.
+MAX_LOGGED_PATH = 160
+# The reason string is composed server-side in both handlers that log one: AuthError carries a
+# fixed literal, and StoreError embeds a configured path, never caller input. Truncating it to
+# the actor length cut "could not acquire the store lock at /proc/.../.assessments.json" off
+# mid-path and lost the errno, so the bound is generous and exists only as a backstop.
+MAX_LOGGED_REASON = 512
 # The interactive documentation paths. FastAPI serves all three by default, which made the
 # whole route table, every field range and the token header name readable by an unauthenticated
 # caller, and made /docs load a floating-tag CDN script onto the app origin: the same origin
@@ -228,7 +249,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
                 {
                     "kind": "auth_reject",
                     "path": request.url.path[:MAX_LOGGED_PATH],
-                    "reason": str(exc)[:MAX_ACTOR_LENGTH],
+                    "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -271,6 +292,38 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        """Bring every framework-raised HTTP error inside the app's own contract.
+
+        Two rejections escaped it. A 5,000-digit integer exceeds CPython's int_max_str_digits,
+        so json.loads raises a plain ValueError rather than a JSONDecodeError and FastAPI turns
+        it into `{"detail": "There was an error parsing the body"}` with no audit line: a
+        different response shape and no record, from a body every other rejection audits. And
+        the per-actor limiter raised `{"detail": "rate limited"}` while the coarse limiter
+        returned `{"error": "rate limited"}`, so the two tiers of one control disagreed.
+
+        The detail is echoed only when it is one of this application's own literals. Anything
+        else, including every framework message, becomes the generic error, so no handler can
+        reflect a message the app did not write.
+        """
+        detail = exc.detail if exc.detail in OWN_ERROR_DETAILS else GENERIC_CLIENT_ERROR
+        audit_log.warning(
+            json.dumps(
+                {
+                    "kind": "http_reject",
+                    "path": request.url.path[:MAX_LOGGED_PATH],
+                    "status": exc.status_code,
+                    "reason": str(exc.detail)[:MAX_LOGGED_REASON],
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        # exc.headers carries Retry-After for a 429; dropping it tells a compliant client to
+        # retry immediately, in a tight loop.
+        return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
+
     @app.exception_handler(StoreError)
     async def handle_store_error(request: Request, exc: StoreError) -> JSONResponse:
         """Storage refused. The client gets a generic 503; the cause is logged server-side."""
@@ -279,7 +332,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
                 {
                     "kind": "store_error",
                     "path": request.url.path[:MAX_LOGGED_PATH],
-                    "reason": str(exc)[:MAX_ACTOR_LENGTH],
+                    "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -367,7 +420,7 @@ def register_api_routes(
         if not fine.allow(limit_key):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="rate limited",
+                detail=RATE_LIMITED_ERROR,
                 headers={"Retry-After": str(fine.retry_after_seconds(limit_key))},
             )
 
@@ -454,6 +507,8 @@ def create_app(
     """Build the app from injected dependencies. Does not listen."""
     audit_log = logger or build_logger()
     storage = prober or StorageProber()
+    # Bound the access log before anything can be served through it.
+    bound_access_log()
     coarse = global_limiter or RateLimiter(GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
     fine = actor_limiter or RateLimiter(ACTOR_LIMIT, ACTOR_WINDOW_SECONDS)
     # Holds the last observed storage state so a change of state can be logged once, rather
@@ -503,7 +558,7 @@ def create_app(
         key = _client_key(request)
         if not coarse.allow(key):
             return JSONResponse(
-                {"error": "rate limited"},
+                {"error": RATE_LIMITED_ERROR},
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 headers={"Retry-After": str(coarse.retry_after_seconds(key))},
             )

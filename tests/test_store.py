@@ -551,12 +551,27 @@ def test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget() -> 
         f"{store_module.MAX_ASSESSMENTS}"
     )
 
-    # And the cap has to fit the volume. The sheet publishes 1258 bytes per record measured on
-    # this build; the snapshot is rewritten whole on every upsert, and a backup copy sits
-    # beside it, so the steady-state floor is twice the collection plus the temporary file.
-    measured_bytes_per_record = 1258
+    # And the cap has to fit the volume. The figure is the MAXIMUM-length record measured
+    # through the real scoring path, not the minimal one: the sheet published 1258 bytes as its
+    # planning number, which was a best case presented as a worst case and understated the
+    # volume by a third. The snapshot is rewritten whole on every upsert and a backup sits
+    # beside it, so the directory holds up to three copies at the moment of a write.
+    measured_bytes_per_record = 1705
+    stated_size = re.search(r"\*\*(\d+) bytes\*\* for a maximum-length", sheet)
+    assert stated_size is not None, "the sheet publishes no maximum-length per-record figure"
+    assert int(stated_size.group(1)) == measured_bytes_per_record, (
+        f"the sheet publishes {stated_size.group(1)} bytes per maximum-length record; this "
+        f"test was calibrated against {measured_bytes_per_record}"
+    )
+    requested = re.search(r"volume of at least\s+\*\*(\d+) MiB\*\*", sheet)
+    assert requested is not None, "the sheet requests no volume size, so no cap can be checked"
+
     peak_bytes = store_module.MAX_ASSESSMENTS * measured_bytes_per_record * 3
-    assert peak_bytes <= 64 * 1024 * 1024, (
-        f"at the shipped cap the volume holds up to {peak_bytes / 1024 / 1024:.0f} MiB across "
-        "the snapshot, its backup and the temporary file, which is not a bounded footprint"
+    # Against the volume the SHEET asks for, not an unsourced constant. The previous version
+    # compared to a bare 64 MiB that appeared nowhere in the documentation, so the sheet and
+    # the code could have agreed on any cap up to about 17,700 records and this still passed.
+    assert peak_bytes <= int(requested.group(1)) * 1024 * 1024, (
+        f"at the shipped cap the volume holds up to {peak_bytes / 1024 / 1024:.1f} MiB across "
+        f"the snapshot, its backup and the temporary file, but the sheet requests only "
+        f"{requested.group(1)} MiB"
     )

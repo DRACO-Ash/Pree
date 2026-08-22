@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import logging
+import threading
 
-from pree.audit import audit
+from pree.audit import MAX_ACCESS_PATH, audit, bound_access_log
 from pree.ratelimit import RateLimiter
 
 
@@ -122,3 +124,116 @@ def test_ordinary_use_is_unaffected_by_the_fail_closed_eviction() -> None:
     now = [0.0]
     limiter = RateLimiter(3, 60.0, clock=lambda: now[0], max_keys=4)
     assert [limiter.allow("a") for _ in range(5)] == [True, True, True, False, False]
+
+
+def test_concurrent_callers_never_turn_a_429_into_a_500() -> None:
+    """The eviction pass was not thread-safe, and the fine limiter is genuinely concurrent.
+
+    `create_assessment` is a sync handler, so Starlette runs it in the anyio threadpool and
+    several threads call `allow` at once. Three failures lived in `_evict_if_needed`:
+    `sorted(...)` iterated the key table while another thread's `setdefault` inserted into it,
+    two threads selected the same candidate so the second delete raised KeyError, and a deque
+    emptied by one thread raised IndexError in another. Measured before the lock: 9,571
+    exceptions across 24,000 calls. Each was a 500 with no audit line and none of the hardening
+    headers, in place of the 429 the limiter exists to return.
+
+    The table must be large for this to bite: the window in which another thread can insert is
+    the length of one pass over it, so a small table hides the race entirely. These parameters
+    are calibrated, not guessed: reverting the lock and running this shape three times gave
+    365, 382 and 373 exceptions, a wide enough margin to be reliable while costing the suite
+    four thousand calls rather than the twenty-four thousand the first version ran.
+    """
+    failures: list[str] = []
+    counter = itertools.count()
+    limiter = RateLimiter(limit=3, window_seconds=60.0, max_keys=2000)
+    for index in range(2700):
+        limiter.allow(f"seed-{index}")
+
+    def hammer() -> None:
+        for _ in range(500):
+            try:
+                limiter.allow(f"t{next(counter)}")
+            # Bare Exception on purpose: the assertion IS that nothing escapes.
+            except Exception as exc:
+                failures.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not failures, (
+        f"the limiter raised under concurrency, which the caller sees as a 500 rather than a "
+        f"429: {len(failures)} exceptions, {sorted(set(failures))}"
+    )
+
+
+def test_the_access_log_filter_bounds_the_request_line() -> None:
+    """The access log was the same amplification as the audit line, 500 times larger.
+
+    gunicorn's `--access-logfile -` hands uvicorn the raw request line, and `/healthz` is
+    deliberately exempt from the rate limiter, so an unauthenticated caller wrote 15 KB of log
+    per request with nothing counting the requests. Measured under the shipped launch command:
+    15,046 bytes for one request before the filter, 208 bytes after, and 31 MB written by a
+    three-second burst that returned 200 to every request.
+    """
+    bound_access_log()
+    bound_access_log()  # idempotent: the factory runs in every worker, and may run twice
+    access = logging.getLogger("uvicorn.access")
+    installed = [f for f in access.filters if type(f).__name__ == "_TruncateRequestPath"]
+    assert len(installed) == 1, f"expected exactly one truncating filter, got {len(installed)}"
+
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    access.handlers = [handler]
+    access.setLevel(logging.INFO)
+    access.propagate = False
+    long_path = "/healthz?" + "x" * 15_000
+    access.info('%s - "%s %s HTTP/%s" %d', "10.0.0.1", "GET", long_path, "1.1", 200)
+
+    written = buffer.getvalue()
+    assert "[truncated]" in written, "the filter did not fire"
+    assert len(written) < MAX_ACCESS_PATH + 200, f"the access line is {len(written)} bytes"
+    assert "/healthz" in written, "the filter destroyed the part an operator needs"
+
+
+def test_the_access_log_filter_leaves_a_normal_request_line_alone() -> None:
+    """A control that mangles ordinary traffic gets removed, so it must not."""
+    bound_access_log()
+    access = logging.getLogger("uvicorn.access")
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    access.handlers = [handler]
+    access.setLevel(logging.INFO)
+    access.propagate = False
+    # The longest legitimate path: /v1/assessments/ plus a 129-character store key.
+    real = "/v1/assessments/" + "a" * 64 + ":" + "b" * 64
+    access.info('%s - "%s %s HTTP/%s" %d', "10.0.0.1", "GET", real, "1.1", 200)
+    written = buffer.getvalue()
+    assert "[truncated]" not in written, "a legitimate longest-path request was truncated"
+    assert real in written
+
+
+def test_the_access_log_filter_also_bounds_a_pre_formatted_line() -> None:
+    """gunicorn's own access logger formats the line before logging it, so there are no args.
+
+    Truncating only the positional arguments would leave that path unbounded, and which of the
+    two shapes reaches the logger depends on the worker class and on gunicorn's configuration,
+    neither of which this test can pin. Both shapes are bounded.
+    """
+    bound_access_log()
+    access = logging.getLogger("gunicorn.access")
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    access.handlers = [handler]
+    access.setLevel(logging.INFO)
+    access.propagate = False
+    access.info('10.0.0.1 - "GET /healthz?%s HTTP/1.1" 200' % ("x" * 15_000))
+    written = buffer.getvalue()
+    assert "[truncated]" in written, "the pre-formatted path was not truncated"
+    assert len(written) < MAX_ACCESS_PATH * 4 + 200, f"the line is {len(written)} bytes"
+    assert "/healthz" in written

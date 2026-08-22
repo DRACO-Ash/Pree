@@ -9,6 +9,7 @@ change. Time is injected so the behaviour is testable without sleeping.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -35,6 +36,7 @@ class RateLimiter:
         self._clock = clock
         self._max_keys = max_keys
         self._hits: dict[str, deque[float]] = {}
+        self._guard = threading.Lock()
 
     def _prune(self, key: str, now: float) -> deque[float]:
         bucket = self._hits.setdefault(key, deque())
@@ -59,28 +61,43 @@ class RateLimiter:
             k for k, b in self._hits.items() if k != protected and (not b or b[-1] <= cutoff)
         ]
         for key in expired:
-            del self._hits[key]
+            # pop, not del: the lock rules out a concurrent delete, but a key can also appear
+            # in both candidate lists, and a KeyError here is a 500 in place of a 429.
+            self._hits.pop(key, None)
             if len(self._hits) <= self._max_keys:
                 return True
         evictable = sorted(
             (b[-1], k) for k, b in self._hits.items() if k != protected and len(b) < self._limit
         )
         for _, key in evictable:
-            del self._hits[key]
+            self._hits.pop(key, None)
             if len(self._hits) <= self._max_keys:
                 return True
         # Every remaining bucket is at its limit and belongs to someone else. Refuse.
-        del self._hits[protected]
+        self._hits.pop(protected, None)
         return False
 
     def allow(self, key: str) -> bool:
-        """Record a hit and report whether it is within the limit."""
-        now = self._clock()
-        bucket = self._prune(key, now)
-        if len(bucket) >= self._limit:
-            return False
-        bucket.append(now)
-        return self._evict_if_needed(now, key)
+        """Record a hit and report whether it is within the limit.
+
+        Serialised, because the fine limiter is genuinely concurrent. `create_assessment` is a
+        sync handler, so Starlette runs it in the anyio threadpool and several threads call this
+        at once. Two failures live in the eviction pass: `sorted(...)` iterates the key table
+        while another thread's `setdefault` inserts into it, which raises "dictionary changed
+        size during iteration"; and two threads can select the same candidate, so the second
+        `del` raises KeyError. Each became a 500 with no audit line and none of the hardening
+        headers, in place of the 429 the limiter exists to return.
+
+        The lock is held only for the bookkeeping: a few deque operations and, in the saturated
+        case, one pass over a table capped at MAX_TRACKED_ACTORS.
+        """
+        with self._guard:
+            now = self._clock()
+            bucket = self._prune(key, now)
+            if len(bucket) >= self._limit:
+                return False
+            bucket.append(now)
+            return self._evict_if_needed(now, key)
 
     def retry_after_seconds(self, key: str) -> int:
         """Seconds until the oldest hit in the window expires, for the Retry-After header."""

@@ -263,3 +263,37 @@ Eleventh security review, three majors and four overstated claims of mine:
   row stays whole, and the retired-rule check runs before the floor gate.
 ● The shipped `MAX_ASSESSMENTS` value was unpinned, because every cap test monkeypatched it.
   It is now asserted against the sheet and the volume footprint.
+
+Twelfth security review, four majors, one of them in the application:
+
+● The rate limiter's eviction pass was not thread-safe, and the fine limiter is concurrent
+  because the scoring handler is synchronous and runs in the thread pool. Measured at 375
+  exceptions in 4,000 concurrent calls, each a 500 with no audit line and no hardening headers
+  in place of a 429. The bookkeeping is serialised and each delete tolerates a missing key.
+● `--access-logfile -` reinstated the log-amplification defect through a channel the app does
+  not own: 15,046 bytes per unauthenticated request on an unmetered path, and 31 MB written by
+  a three-second burst. A truncating filter attached by the factory brings that to 208 bytes,
+  measured under the shipped launch command.
+● The suid sweep and the pip removal were asserted by substring, so `find /app`, a leading
+  `-false`, a trailing `|| true` and a removal aimed at a nonexistent path all passed. The
+  resolved commands are now asserted.
+● `# escape = ` with spaces around the equals sign reopened the hole the previous round closed.
+  The check now uses BuildKit's own directive pattern.
+● The logged-path bound was shorter than the longest legitimate path, so a real store key was
+  truncated out of every 401 and 503 record.
+● The packaging scan anchored its extension list on the whole path, so `deploy.key.txt` and
+  `tls.pem/server.bundle` shipped a private key; it now matches on path components and refuses
+  hard links and non-ASCII names.
+● The token-floor guard was inverted: every figure attached to a size word in a line mentioning
+  the token must be the enforced constant, across six files.
+● The sheet's per-record figure was a best case published as a planning number. Corrected to
+  1705 bytes for a maximum-length record, 8.1 MiB at the cap, with the volume request stated.
+● A 5,000-digit integer escaped the app's error contract, and the two rate-limit tiers
+  disagreed about their response body. One contract now covers every rejection, each audited.
+● Found by coverage rather than by the review: `logging` sets `record.args` to an empty tuple,
+  not None, so the access filter's pre-formatted branch was unreachable and gunicorn's own
+  access line went out whole.
+● Found by re-running the pipeline simulation: the platform runs the suite from the extracted
+  archive, which has no `.git`, so the behavioural ignore-rule guard failed there. It now skips
+  where nothing can be committed, and no longer asserts a belief about the runner that the
+  simulation itself disproves.

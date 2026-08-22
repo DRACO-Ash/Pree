@@ -57,12 +57,16 @@ done
 # files that carry no extension at all.
 #
 # .env.example is the one deliberate exception: it carries placeholders, and a test asserts so.
+# Every pattern is anchored on a PATH COMPONENT boundary, not on the end of the whole path.
+# Anchoring the extension list with `$` matched only the final component's tail, so
+# `deploy.key.txt` (a doubled extension) and `tls.pem/server.bundle` (the credential-shaped
+# part is a DIRECTORY) both shipped a real private key past a scan that reported clean.
 SUSPECT=$(unzip -Z1 "$OUT" \
   | grep -vE '(^|/)\.env\.example$' \
   | grep -iE \
-      '\.(env|pem|key|p12|pfx|jks|keystore|crt|cer|der|p8|pk8|asc|gpg|ppk|kdbx|ovpn)$'\
+      '\.(env|pem|key|p12|pfx|jks|keystore|crt|cer|der|p8|pk8|asc|gpg|ppk|kdbx|ovpn)(/|$|\.)'\
 '|(^|/)id_(rsa|dsa|ecdsa|ed25519)'\
-'|(^|/)(\.netrc|\.pgpass|\.npmrc|\.htpasswd|authorized_keys|known_hosts|shadow)$'\
+'|(^|/)(\.netrc|\.pgpass|\.npmrc|\.htpasswd|authorized_keys|known_hosts|shadow)(/|$)'\
 '|token|secret|cred|passwd|private.?key' \
   || true)
 if [ -n "$SUSPECT" ]; then
@@ -81,5 +85,29 @@ if [ -n "$LINKS" ]; then
   exit 1
 fi
 
-echo "package: archive clean: no banned directory, no credential-shaped path, no symlink"
+# And no HARD links either. -y stores a symlink as a link, so its target's bytes stay out of
+# the archive, but a hard link is an ordinary directory entry: zip reads it and writes the
+# content, so `notes-appendix.md` hard-linked to a private key shipped the key under a
+# harmless name with every name-based check clean. find is the only thing that can see it.
+HARDLINKS=$(find $INCLUDE -type f -links +1 -print 2>/dev/null || true)
+if [ -n "$HARDLINKS" ]; then
+  echo "package: these files have more than one hard link, so their name is not their only" >&2
+  echo "         name and the scan above cannot speak for their content:" >&2
+  echo "$HARDLINKS" >&2
+  exit 1
+fi
+
+# Names that are not what they look like. A Cyrillic small letter es renders as a Latin s, so
+# `\u0455ecret.md` reads as "secret.md" to a human and matches nothing as bytes. Anything
+# outside ASCII in a path is refused: this project ships no such name.
+NONASCII=$(unzip -Z1 "$OUT" | LC_ALL=C grep -nP '[^\x20-\x7e]' || true)
+if [ -n "$NONASCII" ]; then
+  echo "package: the archive carries non-ASCII paths, which can render as a name they are" >&2
+  echo "         not; refuse rather than guess:" >&2
+  echo "$NONASCII" >&2
+  exit 1
+fi
+
+echo "package: archive checks passed: no banned directory, no credential-shaped path,"
+echo "         no symlink, no multiply-linked file, no non-ASCII path"
 echo "package: note: the path scan reads names only; it cannot see inside an archived file"
