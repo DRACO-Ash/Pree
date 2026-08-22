@@ -583,3 +583,27 @@ Twenty-second review, three majors and four minors, all in the round-21 controls
   decay rule in the claim-unit splitter was implemented twice, the `INT` and `TERM` traps in the
   packaging script did not exit, and the same rationale was written out three times across the
   Dockerfile and two docstrings.
+
+Twenty-third security review, three majors and three minors:
+
+● A `@app.middleware("http")` layer answers before the router and appears in no route table, so
+  the categorical route refusal added the round before did not refuse it: nine lines returned the
+  team token to an unauthenticated caller with the whole loop green. The middleware stack is a
+  pinned literal now, class and dispatch, in both environments, with the order part of the pin.
+  The claim in the previous round's policy entry that anything unreadable is refused was false as
+  written; it described the route table only, and is corrected in place.
+● The PATH derivation matched `PATH=` as a SUBSTRING, and `PYTHONPATH` ends in `PATH`. Setting
+  both in one ENV made the test read PYTHONPATH and pass while the effective search path began
+  with an unguarded directory holding a planted `gunicorn`. Assignments are parsed and matched by
+  key equality now, exactly one PATH assignment is required, and the legacy space-separated ENV
+  form is refused rather than silently unread.
+● The guard covered executable directories and two site-packages leaves, and a venv interpreter
+  imports `sitecustomize` from the BASE prefix's standard library. One COPY into
+  `/usr/local/lib/python3.12/` was attacker code in the gunicorn master, both workers and the
+  health-check interpreter, needing no PATH manipulation. Both importable trees are guarded
+  wholesale, and the interpreter version is derived from the base image tag.
+● A destination that is an ancestor of a guarded directory was not flagged, so `COPY tree /usr`
+  wrote `/usr/bin/*` unseen. The two shipped COPYs that legitimately write over a guarded tree are
+  pinned by exact text.
+● Two claims in `docs/SECURITY.md` were false, one control row and one sentence of narrative.
+  Both restated to what the tests assert.

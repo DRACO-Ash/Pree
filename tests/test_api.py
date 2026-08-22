@@ -17,6 +17,7 @@ import pytest
 from fastapi import HTTPException, Request
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from pree.app import (
     DOC_PATHS,
@@ -1497,6 +1498,69 @@ def test_the_route_table_holds_nothing_but_api_routes_and_the_documentation() ->
                 served = {str(getattr(route, "path", "")) for route in _all_routes(app)}
                 overlap = served & EXPECTED_DOC_PATHS
                 assert not overlap, f"production serves a documentation path: {sorted(overlap)}"
+
+
+# The middleware stack, outermost first, pinned per environment. A layer is named by its class,
+# or by its dispatch function where the class is Starlette's BaseHTTPMiddleware, which is what
+# `@app.middleware("http")` registers.
+#
+# Pinned because a middleware is a registration mechanism the route walks cannot see AT ALL. Nine
+# lines below `app.add_middleware(BodySizeLimit)`, a `@app.middleware("http")` returning
+# `{"token": config.team_token}` for /v1/debug answered before the router, so it appeared in no
+# route table: the categorical route refusal, both gate walks and the token-in-body test each
+# iterate `app.routes` and saw nothing, the frame-guard position test stayed green because the
+# layer sits inside FrameGuard, and the whole verification loop passed while the production app
+# served the shared credential to any unauthenticated caller at `GET /v1/debug`. That is the same
+# capability as the route fabrication, through the mechanism this application uses six times.
+#
+# So the stack is a pinned literal, like the liveness paths and the exemption set. A new layer is
+# a deliberate diff a reviewer sees, and the ORDER is part of the pin because it is a security
+# property: the hardening headers must wrap every rejection, and the framing guard must sit above
+# CORS or a preflight is answered without reaching it.
+EXPECTED_MIDDLEWARE = {
+    "development": (
+        ("BaseHTTPMiddleware", "security_headers"),
+        ("FrameGuard", None),
+        ("BaseHTTPMiddleware", "coarse_rate_limit"),
+        ("BodySizeLimit", None),
+    ),
+    "production": (
+        ("BaseHTTPMiddleware", "security_headers"),
+        ("FrameGuard", None),
+        ("BaseHTTPMiddleware", "normalise_cors_rejection"),
+        ("CORSMiddleware", None),
+        ("BaseHTTPMiddleware", "coarse_rate_limit"),
+        ("BodySizeLimit", None),
+    ),
+}
+
+
+def _middleware_stack(app: Any) -> tuple[tuple[str, str | None], ...]:
+    """The registered stack, outermost first, as (class name, dispatch name) pairs."""
+    stack: list[tuple[str, str | None]] = []
+    for layer in app.user_middleware:
+        cls = layer.cls
+        options = getattr(layer, "kwargs", None) or getattr(layer, "options", {})
+        dispatch = options.get("dispatch") if cls is BaseHTTPMiddleware else None
+        stack.append((cls.__name__, getattr(dispatch, "__name__", None)))
+    return tuple(stack)
+
+
+def test_the_middleware_stack_is_exactly_the_pinned_one() -> None:
+    """A layer nobody declared is a layer nothing asserts, and it answers before the router.
+
+    The route table cannot see a middleware, so refusing an unreadable ROUTE closes one
+    mechanism and leaves this one open. Both environments, because the CORS pair exists only
+    when an origin is configured and pinning one environment leaves the other unexamined.
+    """
+    for env, expected in EXPECTED_MIDDLEWARE.items():
+        with _app_in(env) as app:
+            found = _middleware_stack(app)
+            assert found == expected, (
+                f"the {env} middleware stack is {found}, not the pinned {expected}. A layer "
+                "answers before the router and appears in no route table, so an undeclared one "
+                "is an ungated request handler"
+            )
 
 
 def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestClient) -> None:

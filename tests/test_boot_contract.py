@@ -672,6 +672,14 @@ _VETTED_RUNS = (
     "--shell /usr/sbin/nologin appuser && chown -R 10001:10001 /app",
     "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +",
 )
+# The COPY instructions allowed to write over a guarded tree, pinned by exact text the way the
+# vetted RUNs are. The first flattens the whole prepared filesystem into the ship stage and the
+# second installs the venv, so both legitimately write into directories a shim could hide in;
+# every other COPY that reaches one is an offence.
+_VETTED_COPIES = (
+    "--from=prep / /",
+    "--from=build /opt/venv /opt/venv",
+)
 SUID_SWEEP = (
     "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +"
 )
@@ -690,6 +698,20 @@ SUID_SWEEP = (
 # So the list is now every directory on the shipped PATH plus the site-packages tree, and
 # `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` asserts it against the
 # Dockerfile's own ENV rather than trusting this literal to stay current.
+#
+# And the two IMPORTABLE trees, wholesale, not their site-packages leaves. A venv interpreter's
+# `sys.path` carries the BASE prefix's standard library, which in this image is `/usr/local/lib`,
+# and CPython imports `sitecustomize` from anywhere on `sys.path` at startup. So
+# `COPY requirements.in /usr/local/lib/python3.12/sitecustomize.py` was attacker code running in
+# the gunicorn master, both workers and the health-check python, with 303 of 303 green and no
+# PATH manipulation at all: strictly more powerful than the `/opt/venv/bin/gunicorn` shim, and
+# outside a list that guarded only the two site-packages directories. A write ANYWHERE under an
+# importable tree is the offence.
+#
+# The interpreter version is read from the base image tag rather than written here twice. Moving
+# the base to 3.13 used to leave this literal guarding a directory that no longer exists, and
+# nothing pointed at it, because site-packages is not on the PATH the derivation test reads.
+_PYTHON_VERSION = "3.12"
 _EXECUTABLE_DIRECTORIES = (
     "/bin/",
     "/sbin/",
@@ -698,8 +720,51 @@ _EXECUTABLE_DIRECTORIES = (
     "/usr/local/bin/",
     "/usr/local/sbin/",
     "/opt/venv/bin/",
-    "/opt/venv/lib/python3.12/site-packages/",
+    f"/usr/local/lib/python{_PYTHON_VERSION}/",
+    "/opt/venv/lib/",
 )
+
+
+# Every `key=value` in an ENV argument, quotes stripped. A key is matched by EQUALITY against
+# this, never by substring: `PYTHONPATH` ends in `PATH`, and that one fact hid an unguarded
+# directory at the front of the shipped search path with the whole suite green.
+_ENV_ASSIGNMENT = re.compile(
+    r"""([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s]*)"""
+)
+
+
+def _env_assignments(argument: str) -> list[tuple[str, str]]:
+    """Parse an ENV argument into assignments, refusing the legacy space-separated form.
+
+    `ENV PATH /opt/tools/exec` sets PATH just as surely as `ENV PATH=...` and carries no `=` at
+    all, so it is refused rather than parsed: this Dockerfile uses the `=` form throughout and a
+    parser that silently returns nothing for the other form reports a pass for an unread line.
+    """
+    assert "=" in argument, (
+        f"an ENV instruction uses the legacy space-separated form, which this parser does not "
+        f"read and docker honours: {argument[:80]}"
+    )
+    return [(key, value.strip("\"'")) for key, value in _ENV_ASSIGNMENT.findall(argument)]
+
+
+def test_the_guarded_python_version_is_the_one_the_base_image_ships() -> None:
+    """The interpreter version is pinned in three places; this makes them one fact.
+
+    `_PYTHON_VERSION` feeds the guarded importable tree, and the pip-removal assertion reads the
+    same value. Moving the base image to 3.13 without updating it left the guard pointing at a
+    directory that no longer exists, silently, because site-packages is not on the PATH the
+    derivation test above reads.
+    """
+    bases = [i.argument.split()[0] for i in _instructions() if i.keyword == "FROM"]
+    tagged = [base for base in bases if base.startswith("python:")]
+    assert tagged, f"no stage builds on a python base image: {bases}"
+    for base in tagged:
+        version = base.removeprefix("python:").split("-")[0]
+        assert version == _PYTHON_VERSION, (
+            f"the base image is {base}, so the interpreter is {version} and the guarded "
+            f"importable tree names {_PYTHON_VERSION}. A guard pointing at a directory the image "
+            "does not have guards nothing"
+        )
 
 
 def test_the_guarded_directories_cover_every_entry_on_the_shipped_path() -> None:
@@ -709,15 +774,27 @@ def test_the_guarded_directories_cover_every_entry_on_the_shipped_path() -> None
     binary the pinned commands name. That is how `/opt/venv/bin/gunicorn` was open: the guard
     listed the system directories and the venv was first on the PATH.
     """
-    env = next(
-        instruction
+    # By KEY EQUALITY, over every assignment in every ENV instruction of the final stage. The
+    # first version took the first ENV containing the SUBSTRING "PATH=" and read the value out
+    # with `re.search(r'PATH="([^"]+)"')`, which matches inside any name ending in PATH. Two
+    # lines beat it: `ENV PYTHONPATH="/opt/venv/bin:/usr/bin" PATH="/opt/tools/exec:/usr/bin"`
+    # made this test read PYTHONPATH's value, find every entry guarded, and pass, while the
+    # effective PATH began with an unguarded directory holding a planted `gunicorn` that the
+    # shipped CMD resolves. A second `PATH=` appended to the same ENV instruction also passed,
+    # because the other guard counts ENV instructions rather than assignments.
+    assignments = [
+        assignment
         for instruction in _final_stage()
-        if instruction.keyword == "ENV" and "PATH=" in instruction.argument
+        if instruction.keyword == "ENV"
+        for assignment in _env_assignments(instruction.argument)
+    ]
+    paths = [value for key, value in assignments if key == "PATH"]
+    assert len(paths) == 1, (
+        f"the final stage assigns PATH {len(paths)} times; docker takes the last and this guard "
+        f"cannot tell which one an operator meant: {assignments}"
     )
-    found = re.search(r'PATH="([^"]+)"', env.argument)
-    assert found is not None, f"the shipped ENV does not set PATH as a quoted value: {env.argument}"
     guarded = {directory.rstrip("/") for directory in _EXECUTABLE_DIRECTORIES}
-    unguarded = [entry for entry in found.group(1).split(":") if entry.rstrip("/") not in guarded]
+    unguarded = [entry for entry in paths[0].split(":") if entry.rstrip("/") not in guarded]
     assert not unguarded, (
         f"these directories are on the shipped PATH and not guarded, so a shim planted in one "
         f"replaces a binary the pinned commands name: {unguarded}"
@@ -829,8 +906,19 @@ def _binary_write_offences(instructions: list[_Instruction]) -> list[str]:
         # `/usr/bin`, `/usr/bin/` and `/usr/bin/.` all normalise to `/usr/bin` and none of them
         # started with `/usr/bin/`: `COPY --from=build /tmp/find /usr/bin` writes
         # /usr/bin/find and passed. Two lines was enough to neuter the sweep.
+        # The directory itself, anything under it, and anything ABOVE it. `COPY tree /usr` writes
+        # /usr/bin/* and `COPY tree /opt/venv` writes /opt/venv/bin/*, and neither destination
+        # was flagged: the same asymmetry this guard already fixed one level down, where
+        # `/usr/bin` as a destination did not start with `/usr/bin/`. The two shipped COPYs that
+        # legitimately write over a guarded tree are pinned by exact text, the way the vetted
+        # RUNs are, so writing into one is a deliberate diff rather than a pattern to argue with.
+        collapsed_copy = " ".join(instruction.argument.split())
+        if collapsed_copy in _VETTED_COPIES:
+            continue
         if any(
-            target == directory.rstrip("/") or target.startswith(directory)
+            target == directory.rstrip("/")
+            or target.startswith(directory)
+            or f"{directory.rstrip('/')}/".startswith(f"{target.rstrip('/')}/")
             for directory in _EXECUTABLE_DIRECTORIES
         ):
             offenders.append(f"{instruction.keyword} {instruction.argument[:80]} -> {target}")
@@ -1013,7 +1101,7 @@ def test_the_pip_removal_targets_the_venv_the_build_actually_creates() -> None:
     target = venv.argument.split()[-1]
     assert target.startswith("/"), f"the venv is created at a relative path: {venv.argument!r}"
     removal = next(i for i in instructions if "site-packages/pip" in i.argument)
-    assert f"{target}/lib/python3.12/site-packages/pip" in removal.argument, (
+    assert f"{target}/lib/python{_PYTHON_VERSION}/site-packages/pip" in removal.argument, (
         f"the pip removal does not target the venv at {target!r}: {removal.argument[:120]!r}"
     )
     assert f"{target}/bin/pip" in removal.argument, (

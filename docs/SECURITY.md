@@ -126,7 +126,10 @@ the assessment store.
 | The upload archive is flat, with the source and the suite at its root | `scripts/package-appstore.sh` | `test_the_archive_is_flat_and_carries_the_files_the_platform_builds_from` |
 | The route table holds nothing the gate tests cannot read | `src/pree/app.py` | `test_the_route_table_holds_nothing_but_api_routes_and_the_documentation` |
 | The unauthenticated path set is pinned, not derived from the constant it polices | `src/pree/app.py` | `test_the_unauthenticated_path_set_is_the_one_the_tests_below_police` |
-| Every directory on the shipped PATH is guarded against a planted shim | `Dockerfile` | `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` |
+| Every directory on the shipped PATH is guarded, matched by key equality | `Dockerfile` | `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` |
+| The interpreter's importable trees are guarded, not their site-packages leaves | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
+| The guarded interpreter version is the base image's | `Dockerfile` | `test_the_guarded_python_version_is_the_one_the_base_image_ships` |
+| The middleware stack is exactly the pinned one, per environment | `src/pree/app.py` | `test_the_middleware_stack_is_exactly_the_pinned_one` |
 
 ## Deliberately accepted risks
 
@@ -1144,6 +1147,68 @@ into the fix for that finding, in the same file, minutes apart. The lesson is no
 carefully": it is that a control which enumerates what it accepts must refuse everything else by
 construction, and that a test must never read its expected value from the thing under test. Both
 are now true of this control, and both are assertions rather than intentions.
+
+Two sentences of that paragraph were still too confident, and the next review said so. "Anything
+the suite cannot read a gate from is refused outright" was false when written: it described the
+ROUTE table, and a middleware answers before the router and appears in no route table at all. See
+the twenty-third review below.
+
+### Twenty-third review: three majors, three minors
+
+The middleware finding is the one that matters, and it is a false claim of mine as much as a
+defect. Round 23's policy entry said "anything the suite cannot read a gate from is refused
+outright". That was true of the route table and nothing else. A `@app.middleware("http")` layer
+answers before the router, so it appears in no route table: the categorical refusal, both gate
+walks and the token-in-body test each iterate `app.routes` and saw nothing, the frame-guard
+position test stayed green because the planted layer sat inside FrameGuard, and the whole
+verification loop passed while the production app returned the shared credential to an
+unauthenticated `GET /v1/debug`. Nine lines of application code, through the mechanism this
+application itself uses six times. The stack is a pinned literal now, class name and dispatch
+function, in both environments, with the ORDER part of the pin because the order is a security
+property: the hardening headers must wrap every rejection and the framing guard must sit above
+CORS or a preflight is answered without reaching it.
+
+The PATH derivation added the round before was beaten by a substring. It took the first ENV
+containing `PATH=` and read the value with `re.search(r'PATH="([^"]+)"')`, and `PYTHONPATH` ends in
+`PATH`. So `ENV PYTHONPATH="/opt/venv/bin:/usr/bin" PATH="/opt/tools/exec:/usr/bin"` made the test
+read PYTHONPATH, find every entry guarded and pass, while the effective search path began with an
+unguarded directory holding a planted `gunicorn` that the shipped command resolves. A second
+`PATH=` appended to the same ENV instruction passed too, because the neighbouring guard counts ENV
+instructions rather than assignments. Assignments are parsed and matched by key equality now,
+exactly one PATH assignment is required, and the legacy space-separated ENV form is refused rather
+than silently unread. Worth naming: the reviewer's first attempt at this used `/opt/tools/bin` and
+was caught only because that string contains `/bin/`, which is the same accidental catch the
+previous round's own commit message complained about.
+
+The third major is a bigger capability than the one it sits beside. The guard covered executable
+directories and the two site-packages leaves, and a venv interpreter's `sys.path` carries the BASE
+prefix's standard library, which here is `/usr/local/lib/python3.12`. CPython imports
+`sitecustomize` from anywhere on `sys.path` at startup, so
+`COPY requirements.in /usr/local/lib/python3.12/sitecustomize.py` is attacker code executing in the
+gunicorn master, both workers and the health-check interpreter, with no PATH manipulation at all
+and 303 of 303 green. Strictly more powerful than the `/opt/venv/bin/gunicorn` shim closed one
+round earlier, and outside the list because the list guarded the venv's tree and not the
+interpreter's. Both importable trees are guarded wholesale now, and the interpreter version is read
+from the base image tag rather than written out a fourth time, because moving the base to 3.13 left
+the old literal guarding a directory that no longer existed.
+
+Three minors, all closed. A destination that is an ANCESTOR of a guarded directory was not flagged,
+so `COPY tree /usr` writes `/usr/bin/*` unseen: the same asymmetry this guard fixed one level down
+two rounds ago, and the two shipped COPYs that legitimately write over a guarded tree are pinned by
+exact text now, the way the vetted RUNs are. The version literal is derived. And two claims in this
+file were false: the control row asserting every PATH directory was guarded, and the sentence
+quoted at the end of the previous section. Both restated to what the tests actually assert.
+
+Nine rounds in, the shape of this is stable enough to state as a finding about the work rather than
+about the code. The application's boundaries have held under every probe for four consecutive
+rounds: the live matrix, the smuggling attempt, the limiter, the validation, the error bodies, the
+logs. Every defect in those four rounds has been in the proof layer, and the majority have been in
+controls written the round before to close a defect of the same shape. Three times now the fix has
+reproduced the flaw it was fixing: an enumerating filter, a test reading its expected value from
+the thing under test, and a claim of completeness that covered one mechanism. The countermeasure
+that has actually worked is narrow and worth keeping: refuse by construction rather than enumerate,
+pin the expected value as a literal, and invoke the control on synthetic input whose outcome is
+known. Where this round applied all three, the fabrications turned red on the first attempt.
 
 ## Not accepted, and why it is not a risk here
 
