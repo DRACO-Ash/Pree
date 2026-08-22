@@ -150,7 +150,10 @@ the assessment store.
 | A server that leaves the query in `raw_path` still cannot reach the audit field | `src/pree/app.py` | `test_a_server_that_puts_the_query_in_raw_path_still_cannot_reach_the_audit_field` |
 | The audited path EQUALS the recomputed scrub of the target, so nothing can be appended to it | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
 | Every boolean audit field is value-pinned on every kind that emits it, across the token axis | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it`, `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
-| Every closed-set value pin equals what the application can emit, in both directions | `tests/test_api.py` | `test_every_closed_set_pin_is_exactly_what_the_application_can_emit`, `test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit` |
+| Every closed-set value pin equals what the application can emit, in both directions, and a closed-set field is emitted as a literal | `tests/test_api.py` | `test_every_closed_set_pin_is_exactly_what_the_application_can_emit`, `test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit` |
+| No audit expression can read the deployment's configuration, so none can encode the credential | `src/pree/app.py` | `test_no_audit_expression_can_reach_the_deployed_credential`, `test_the_http_layer_never_reads_the_deployed_token_at_all` |
+| Every caller-influenced audit value is recomputed from the request, not shape-checked | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
+| Every boolean audit field names the test that correlates its value | `tests/test_api.py` | `test_every_boolean_audit_field_names_a_test_that_correlates_it` |
 | No truncated audit path can read as a route this app serves | `src/pree/security.py` | `test_no_truncated_path_record_can_read_as_a_route_this_app_serves` |
 | The audited path keeps its separator and carries no control character | `src/pree/app.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
 | A stage before the shipped one cannot mount over or de-privilege what the suid sweep visits | `Dockerfile` | `test_no_stage_declares_an_instruction_that_undoes_the_hardening` |
@@ -2248,17 +2251,89 @@ Three minors closed with them:
   `isinstance(rule, _Pattern)` of the wrapper, so wrapping removed `path` from both at once with
   nothing red. Both now reach through the wrapper.
 ● The changelog carried "Fourth security review of the audit layer" twice, for two different
-  reviews. Renumbered - and the ordinals are gone from THIS document's headings, which is the
-  actual fix. Two documents numbering the same sequence independently drift, and they had: the
-  register's headings and the changelog's rows no longer mapped one to one, so any renumbering
-  here would have been a guess presented as a fact. The headings now say what each review found,
-  which is what a reader is looking for anyway; the changelog keeps its ordinals, where they are
-  sequential within one list.
+  reviews. Renumbered - and the ordinals were dropped from the three AUDIT-LAYER headings in this
+  document, which is where the drift was. Two documents numbering the same sequence independently
+  drift, and those had: the register's audit-layer headings and the changelog's rows no longer
+  mapped one to one, so renumbering them here would have been a guess presented as a fact.
+  **This entry previously said the ordinals were gone from this document's headings, which was
+  false**: fourteen ordinal-numbered headings remain from the earlier review series, they have
+  never collided, and rewriting them would churn the record for no gain. Scoped rather than
+  swept, and said so.
 
 **And the register table rows for the previous round's controls were absent**, which the gate noted
 as an observation rather than a finding. Six rows are added here, including this round's. The row
 guard checks that a cited test EXISTS, not that it asserts what the row claims, so a row is only as
 good as the reader who writes it.
+
+### Closing the credential channel by SCOPE, after four rounds of sampling it
+
+This is the most important entry in this register, because it is where the approach changed rather
+than the code.
+
+**Four rounds sampled.** Two tokens, then five, then five plus a random draw, each asserting that a
+boolean or a string does not move when the token does. Every round the gate found a predicate the
+sample did not separate. The last round found several that survive a `token_urlsafe` draw with
+probability one: `"=" in token`, `"+" in token`, `len(token) < 64`. **A sample can only raise the
+cost of a channel; it cannot close one**, and "improbable rather than impossible" was the most that
+framing could ever honestly claim. It also mattered in practice, not just in principle:
+`_validate_production_auth` enforces length and non-repetition but not alphabet, so an operator
+token like `Bluestaq-2026!MissionCritical#42` boots and leaks one real bit per record to `"!" in t`.
+
+**So the channel is closed by scope.** Every expression whose value can reach an audit record was
+enumerated by AST, across both emitting modules, and exactly ONE of them reads the config object:
+the `origin_allowed` comparison against `allowed_origin`. The deployed credential is reachable in
+this application only through `config`, because a caller's presented token is their own disclosure
+(a recorded residual). So an audit expression that cannot read `config` cannot encode the
+credential, in any encoding, whatever the token looks like. A second rule closes the indirect
+route - the HTTP layer never reads `config.team_token` at all, so there is nothing in scope to bind
+to a variable - and its full config read set is pinned rather than one name refused, because a
+denylist of attribute names would be one short the moment a field is added. That is the same lesson
+the ENV name denylist taught seven rounds running before it became an allowlist.
+
+Every leaking mutation the gate demonstrated goes through `config`, and all eight are now refused:
+token hex appended to a `path`, hex split across the two halves of a `key`, 64 hex characters as an
+`actor` (exactly `MAX_ACTOR_LENGTH` and scrub-invariant, so the pin accepted the whole token), base64
+in a `reason`, four credential bytes in a `score` mantissa inside its `(0.0, 100.0)` bound, an
+attacker-indexed bit in a boolean, a conditional `outcome` inside a "closed" set, and a whole new
+boolean field. Several of those were additionally gated on `config.is_production` so that a
+development-only exercise could not see them; the gate is itself a `config` read, so that form is
+refused by the same rule.
+
+**Defence in depth, because a scope rule is a static check.** Alongside it, every caller-influenced
+value in every record is now RECOMPUTED from what the request carried rather than shape-checked:
+`path` against the target, `key` against the two validated ids, `actor` against the scrub of the
+header sent, `score` and `evidence_coverage` against the response body, `reason` against the
+handler's own literal. Verified independently of the scope rule with four leaks that read no config
+at all, each of which turns it red. And the exercise now runs in BOTH environments, since every
+audit test built through a fixture hard-coding development.
+
+**What is honest about the encoding sweep.** It covers verbatim, hex, base64, base64url, base32 and
+reversed, and a sweep enumerating encodings will always be one short - base64 is exactly what the
+gate used because the previous two-form sweep did not look for it. That is why the scope rule is the
+control and the sweep is the backstop, not the other way round.
+
+Three further gaps closed:
+
+● The drift walk proved which literals EXIST in a module, not which ones a record carries. The gate
+  widened the `outcome` pin, added two decoy literals so the walk collected them, and emitted
+  `"harvest" if ord(token[0]) & 1 else "ok"` - green, with a token bit inside a closed set. The walk
+  now collects only from emission sites and requires a closed-set field's expression to be a
+  literal, permitting a pass-through of an enclosing parameter. `kind` joins `action` and `outcome`,
+  which closes the phantom member the register row already claimed was impossible.
+● `AUDIT_BOOLEAN_FIELDS` was a literal, and the two correlations were bespoke matrices nothing bound
+  to it, so a third boolean was two table edits away. The set is now derived from a registry mapping
+  each field to the test that correlates it, so a new boolean cannot be named without naming a test.
+  Its limit is stated where it lives: it asserts the named test exists, not that it does what its
+  name says.
+● **Four defects in my own AST walk, found by running it rather than reading it.** A
+  dict-literal-only version found nothing at all; adding keyword arguments reported
+  `read_assessment` as permitted-but-unemitted when it is passed positionally; a
+  call-argument-only version missed the `audit` record entirely, because `audit.py` binds it to a
+  name before logging; and it counted `addHandler` and `setLevel` as unresolvable payloads,
+  refusing the very tree it was measuring. One error message hardcoded a module name while the walk
+  covered two, and reported an `audit.py` line as `app.py`. Every one of those would have passed for
+  the wrong reason, which is why the accessor now asserts it resolved something and refuses a
+  payload it cannot follow.
 
 ## Not accepted, and why it is not a risk here
 

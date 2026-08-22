@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import errno
 import inspect
 import io
@@ -11,6 +12,7 @@ import logging
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -527,6 +529,23 @@ def test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_
         assert path.isascii() and path.isprintable(), f"the logged path is not ASCII: {path!r}"
 
 
+# The probe identity and the ids the correlation drive uses. Named constants rather than inline
+# literals, because the assertions downstream recompute from these and an inline literal in two
+# places is two places for them to drift apart.
+ACTOR_HEADER = "x-pree-actor"
+# The literal each handler's reason begins with, so the field is recomputed rather than
+# charset-checked. `store_error` embeds a configured path after its prefix, which is why the
+# assertion accepts a prefix match for that one and equality for the rest.
+_EXPECTED_REASONS = {
+    "auth_reject": "token rejected",
+    "http_reject": "Not Found",
+    "store_error": "snapshot at ",
+}
+PROBE_ACTOR = "watch-floor.lead@example.test"
+PROBE_ASSET = "asset-probe-01"
+PROBE_CANDIDATE = "cand-probe-99"
+
+
 # The token axis, and what it can and cannot deliver, stated before it is used.
 #
 # TWO tokens does NOT refuse the class, and I claimed it did at three prose sites. Measured by the
@@ -588,36 +607,91 @@ def test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it
     """
     random_token = secrets.token_urlsafe(32)
     for token in (*_LEAK_PROBE_TOKENS, random_token):
-        for query, expected in (("?x=1", True), ("", False)):
-            label = f"{len(token)}-{token[:4]}-{expected}"
-            observed = _every_kind_with(tmp_path / label, token, query)
-            assert set(observed) == set(EXPECTED_AUDIT_KEYS) - {"audit"}, (
-                f"the exercise did not produce every rejection kind, so the kinds it missed are "
-                f"unpinned by value: {sorted(set(EXPECTED_AUDIT_KEYS) - {'audit'} - set(observed))}"
+        # BOTH environments. Every audit test built through `make_config`, which hard-codes
+        # development, so one `if config.is_production` gated every leak past the whole apparatus:
+        # the path attack, an attacker-indexed bit in a boolean, all of it, suite green. The
+        # scope closure refuses that class outright now, and this refuses the instance, which is
+        # the pair the review asked for rather than either alone.
+        for environment in ("development", "production"):
+            for query, expected in (("?x=1", True), ("", False)):
+                label = f"{environment}-{len(token)}-{token[:4]}-{expected}"
+                observed = _every_kind_with(tmp_path / label, token, query, environment)
+                assert set(observed) == set(EXPECTED_AUDIT_KEYS), (
+                    f"the exercise did not produce every record kind, so the kinds it missed are "
+                    f"unpinned by value: {sorted(set(EXPECTED_AUDIT_KEYS) - set(observed))}"
+                )
+                for kind, seen in observed.items():
+                    _assert_record_recomputes(kind, seen, token, query, expected)
+
+
+def _assert_record_recomputes(
+    kind: str, seen: dict[str, Any], token: str, query: str, expected_query: bool
+) -> None:
+    """Every caller-influenced value in one record, RECOMPUTED from what the request carried.
+
+    A shape check cannot see a value appended to a field that keeps its shape. The gate recovered
+    the whole credential from four separate fields that way, each inside its pin: hex appended to
+    `path`, hex split across the two halves of `key`, 64 hex characters as an `actor` (exactly
+    MAX_ACTOR_LENGTH and scrub-invariant), base64 in a `reason`, and four token bytes in a `score`
+    mantissa inside the (0.0, 100.0) bound. Every one of them is recomputed here.
+    """
+    record, target, body = seen["record"], seen["target"], seen["body"]
+    if kind != "audit":
+        assert record["had_query"] is expected_query, (
+            f"{kind} recorded had_query={record['had_query']!r} for query {query!r} under a token "
+            f"starting {token[:4]!r}; expected {expected_query}. A boolean whose value tracks "
+            f"anything but the request is a channel, not a fact about the request"
+        )
+        expected_path = sanitise_log_path(target.encode(), MAX_LOGGED_PATH)
+        assert record["path"] == expected_path, (
+            f"{kind} logged path {record['path']!r} for target {target!r}, which recomputes to "
+            f"{expected_path!r}. Anything appended to this field is inside the charset the rule "
+            f"checks, so a difference here is the field carrying something other than the path"
+        )
+    if kind == "audit":
+        assert record["actor"] == sanitise_actor(PROBE_ACTOR), (
+            f"the audited actor {record['actor']!r} is not the scrub of the header sent "
+            f"({PROBE_ACTOR!r}); 64 hex characters is exactly MAX_ACTOR_LENGTH and survives the "
+            f"scrub unchanged, so this field accepted the whole token under its own pin"
+        )
+        assert record["key"] == f"{PROBE_ASSET}:{PROBE_CANDIDATE}", (
+            f"the audited key {record['key']!r} is not the two validated ids and the colon "
+            f"between them; hex is inside STORE_KEY_PATTERN and each half fits in 64 characters"
+        )
+        for field in ("score", "evidence_coverage"):
+            assert record[field] == body[field], (
+                f"the audited {field} {record[field]!r} is not the value the response returned "
+                f"({body[field]!r}); a bound constrains the range and says nothing about the "
+                f"mantissa, which carries four credential bytes per write"
             )
-            for kind, seen in observed.items():
-                record, target = seen["record"], seen["target"]
-                assert record["had_query"] is expected, (
-                    f"{kind} recorded had_query={record['had_query']!r} for query {query!r} under "
-                    f"a token starting {token[:4]!r}; expected {expected}. A boolean whose value "
-                    f"tracks anything but the request is a channel, not a fact about the request"
-                )
-                expected_path = sanitise_log_path(target.encode(), MAX_LOGGED_PATH)
-                assert record["path"] == expected_path, (
-                    f"{kind} logged path {record['path']!r} for target {target!r}, which "
-                    f"recomputes to {expected_path!r}. Anything appended to this field is inside "
-                    f"the charset the rule checks, so a difference here is the field carrying "
-                    f"something other than the path"
-                )
-                assert token not in json.dumps(record), (
-                    f"the team token is in the {kind} record verbatim: {record}"
-                )
-                assert token.encode().hex() not in json.dumps(record), (
-                    f"the team token is in the {kind} record hex-encoded: {record}"
-                )
+    if "reason" in record:
+        assert record["reason"] == _EXPECTED_REASONS[kind] or record["reason"].startswith(
+            _EXPECTED_REASONS[kind]
+        ), (
+            f"the {kind} reason {record['reason']!r} does not begin with the handler's own text "
+            f"({_EXPECTED_REASONS[kind]!r}); this field permits 512 printable characters, which is "
+            f"room for the credential in any encoding on a record needing no token"
+        )
+    # EVERY encoding, not verbatim and hex. Base64 is what the gate used on `reason` precisely
+    # because the two-form sweep did not look for it, and a sweep enumerating forms will always be
+    # one short - so this is the honest limit of this assertion, and the scope closure above is
+    # what actually refuses the class.
+    rendered = json.dumps(record)
+    raw = token.encode()
+    for name, encoded in (
+        ("verbatim", token),
+        ("hex", raw.hex()),
+        ("base64", base64.b64encode(raw).decode()),
+        ("base64url", base64.urlsafe_b64encode(raw).decode()),
+        ("base32", base64.b32encode(raw).decode()),
+        ("reversed", token[::-1]),
+    ):
+        assert encoded not in rendered, f"the team token is in the {kind} record, {name}: {record}"
 
 
-def _every_kind_with(directory: Path, token: str, query: str) -> dict[str, dict[str, Any]]:
+def _every_kind_with(
+    directory: Path, token: str, query: str, environment: str = "development"
+) -> dict[str, dict[str, Any]]:
     """Drive one request per rejection kind, and return each kind's record beside its TARGET.
 
     One helper rather than five copies, because five copies of the drive are five places for a
@@ -631,18 +705,36 @@ def _every_kind_with(directory: Path, token: str, query: str) -> dict[str, dict[
     """
     stream = io.StringIO()
     config = make_config(
-        directory, PREE_TEAM_TOKEN=token, PREE_ALLOWED_ORIGIN="https://pree.example"
+        directory,
+        PREE_ENV=environment,
+        PREE_TEAM_TOKEN=token,
+        PREE_ALLOWED_ORIGIN="https://pree.example",
     )
-    auth = {"x-pree-token": token}
+    auth = {"x-pree-token": token, ACTOR_HEADER: PROBE_ACTOR}
     # The path each drive requests, WITHOUT the query, which is what `_raw_path` hands the scrub.
     targets = {
+        "audit": "/v1/assess",
         "auth_reject": "/v1/assessments/a:b",
         "validation_reject": "/v1/assess",
         "http_reject": "/nowhere-at-all",
         "cors_reject": "/v1/assess",
         "store_error": "/v1/assessments/a:b",
     }
+    body: dict[str, Any] = {}
     with build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0)) as probe:
+        # audit: the SUCCESS record, which no earlier version of this exercise reached, so its
+        # `key`, `actor`, `score` and `evidence_coverage` were shape-checked and never recomputed.
+        accepted = probe.post(
+            f"{targets['audit']}{query}",
+            headers=auth,
+            json={
+                "protected_asset_id": PROBE_ASSET,
+                "candidate_id": PROBE_CANDIDATE,
+                "indicators": {"closest_approach_km": 12.5, "relative_velocity_kms": 3.25},
+            },
+        )
+        assert accepted.status_code == 200, accepted.text
+        body = accepted.json()
         # auth_reject: a gated route with the wrong token, which needs no token at all.
         probe.get(f"{targets['auth_reject']}{query}", headers={"x-pree-token": "wrong"})
         # validation_reject: authenticated, body refused at the boundary.
@@ -662,12 +754,19 @@ def _every_kind_with(directory: Path, token: str, query: str) -> dict[str, dict[
         (config.data_dir / "assessments.json.bak").write_text("nor this", encoding="utf-8")
         probe.get(f"{targets['store_error']}{query}", headers=auth)
 
+    # EVERY record, not only the ones carrying `had_query`. Selecting on that field left the
+    # `audit` kind outside the correlation entirely, so its four caller-influenced values were
+    # shape-checked and never recomputed, and the gate recovered the whole credential from three
+    # of them.
     observed: dict[str, dict[str, Any]] = {}
     for line in stream.getvalue().splitlines():
-        if '"had_query"' not in line:
+        if not line.strip():
             continue
         record = json.loads(line)
-        observed[record["kind"]] = {"record": record, "target": targets[record["kind"]]}
+        kind = record.get("kind")
+        if kind not in targets:
+            continue
+        observed[kind] = {"record": record, "target": targets[kind], "body": body}
     return observed
 
 
@@ -2835,12 +2934,27 @@ _LOG_PART_SCRUBBED = _ScrubIdempotent(sanitise_log_part, "sanitise_log_part")
 # The BOOLEAN audit fields. A bool carries one bit, which is a covert channel across enough
 # records, and the value scan returned early on every one of them. Naming them is the floor; the
 # handler-level test asserts what each one actually reports.
+# Each boolean audit field, and the test that asserts its VALUE against the request. A boolean is a
+# one-bit channel and the value scan cannot see inside one, so a pinned NAME with an unpinned value
+# is a free bit: the gate shipped `preflight_seen` on `cors_reject` with two table edits and nothing
+# red. Deriving the field set from this registry means a new boolean cannot be named without naming
+# the test that correlates it, which is this project's own rule applied to data instead of prose.
+#
+# The honest limit: nothing here proves the named test does what its name says. That gap is the one
+# the register-row guard has, and it is closed differently - by
+# `test_no_audit_expression_can_reach_the_deployed_credential`, which refuses a token-derived value
+# in ANY audit field regardless of what pins it.
+_BOOLEAN_CORRELATIONS = {
+    "origin_allowed": "test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited",
+    "had_query": "test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it",
+}
+
 # `had_query` joins `origin_allowed`, and it needs the same two-token treatment for the same
 # reason: a boolean is a one-bit channel per record and the value scan cannot see inside one, so a
 # pinned NAME with an unpinned value shipped a token bit per refused preflight once already. It is
 # asserted in both directions on every kind that emits it, and the two-token axis is what makes
 # that a class check rather than a member check.
-AUDIT_BOOLEAN_FIELDS = frozenset({"origin_allowed", "had_query"})
+AUDIT_BOOLEAN_FIELDS = frozenset(_BOOLEAN_CORRELATIONS)
 
 AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     "kind": _OneOf(
@@ -3415,6 +3529,31 @@ PERMITTED_AUDIT_CONFIG_READ = ("origin_allowed", "allowed_origin")
 # reviewer sees in the diff, which is the point: this list is short because the layer needs little,
 # and `team_token` is deliberately not on it.
 EXPECTED_CONFIG_READS = frozenset({"allowed_origin", "is_production", "data_dir"})
+
+
+def test_every_boolean_audit_field_names_a_test_that_correlates_it() -> None:
+    """A boolean pinned by name only is a free bit, so the set is derived from a registry.
+
+    The gate shipped `preflight_seen` on `cors_reject` carrying a token bit with two table edits and
+    nothing red, because `AUDIT_BOOLEAN_FIELDS` was a literal and the two correlations were bespoke
+    matrices nothing bound to it. Deriving the set from `_BOOLEAN_CORRELATIONS` means a new boolean
+    cannot be registered without naming the test that checks its value.
+
+    This asserts the named test EXISTS, which is existence and not aboutness - the same gap the
+    control-register guard has. It is worth having anyway, because it turns "add a boolean and edit
+    two tables" into "add a boolean and write a test", and the credential channel it used to open is
+    closed independently by the scope rule below.
+    """
+    module = sys.modules[__name__]
+    for field, test_name in _BOOLEAN_CORRELATIONS.items():
+        assert hasattr(module, test_name), (
+            f"the boolean audit field {field!r} names {test_name!r} as its correlation, and "
+            f"no such test exists in this module"
+        )
+    assert frozenset(_BOOLEAN_CORRELATIONS) == AUDIT_BOOLEAN_FIELDS, (
+        "the boolean field set is no longer derived from the correlation registry, so a field can "
+        "be pinned by name with nothing asserting its value"
+    )
 
 
 def test_no_audit_expression_can_reach_the_deployed_credential() -> None:

@@ -1051,3 +1051,43 @@ Sixth security review of the audit layer, two majors and three minors:
   wrapping removed `path` from both at once. Both now reach through it.
 ● The changelog carried "Fourth security review of the audit layer" twice, for two different
   reviews, and six control-register rows for recent controls were missing. Both corrected.
+
+Seventh security review of the audit layer, two majors and four minors, and the round where the
+approach changed rather than the code:
+
+● Four rounds sampled the token axis and each was defeated. The last round's set left predicates
+  that survive a `token_urlsafe` draw with probability one, and an operator token like
+  `Bluestaq-2026!MissionCritical#42` boots and leaks a real bit per record to `"!" in token`. A
+  sample raises the cost of a channel; it cannot close one. So the channel is closed by SCOPE: every
+  expression that can reach an audit record is enumerated by AST across both emitting modules, and
+  exactly one may read the config object, the `origin_allowed` comparison. The credential is
+  reachable only through `config`, so an expression that cannot read `config` cannot encode it in
+  any encoding. A second rule closes the indirect route, since the HTTP layer never reads
+  `config.team_token` at all, and its whole config read set is pinned rather than one name refused.
+● All eight leaks the gate demonstrated go through `config` and are refused: hex on a `path`, hex
+  split across a `key`, 64 hex characters as an `actor`, base64 in a `reason`, four token bytes in a
+  `score` mantissa, an attacker-indexed bit in a boolean, a conditional `outcome` inside a closed
+  set, and a whole new boolean. Several were gated on `config.is_production` so a development-only
+  exercise could not see them; the gate is itself a config read.
+● Defence in depth, since a scope rule is static: every caller-influenced value is now recomputed
+  from the request rather than shape-checked - `path` against the target, `key` against the validated
+  ids, `actor` against the scrub of the header, `score` and `evidence_coverage` against the response,
+  `reason` against the handler's literal. Verified with four leaks that read no config at all. The
+  exercise runs in both environments now, and the encoding sweep covers six forms with its limit
+  stated: enumerating encodings will always be one short, which is why scope is the control.
+● The drift walk proved which literals exist, not which a record carries: the gate widened the
+  `outcome` pin, added two decoys, and emitted a conditional carrying a token bit, green. It now
+  collects only from emission sites and requires a closed-set field to be a literal, permitting a
+  pass-through of an enclosing parameter. `kind` joins `action` and `outcome`.
+● `AUDIT_BOOLEAN_FIELDS` is derived from a registry naming each field's correlating test, so a third
+  boolean cannot be added with two table edits. It asserts the named test exists, not that it does
+  what its name says, and that limit is recorded where it lives.
+● Four defects in my own AST walk, found by running it rather than reading it: a dict-only version
+  found nothing; adding keywords called `read_assessment` unemitted when it is passed positionally; a
+  call-argument-only version missed the `audit` record because `audit.py` binds it to a name first;
+  and it counted `addHandler` as an unresolvable payload, refusing the tree it measured. An error
+  message hardcoded one module while the walk covered two. The accessor now asserts it resolved
+  something and refuses a payload it cannot follow.
+● The claim that ordinals were "gone from" the security register was false: fourteen remain from the
+  earlier series. They have never collided, so the sweep is scoped to the three audit-layer headings
+  and the entry says so.
