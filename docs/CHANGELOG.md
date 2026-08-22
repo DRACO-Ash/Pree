@@ -714,3 +714,24 @@ Twenty-ninth security review, five blockers and one major:
   passed. It is pinned exactly, with the token asserted absent.
 ● MAJOR: the ENV allowlist inverted names and not values, so `ENV PYTHONUNBUFFERED="<credential>"`
   shipped. The flag variables take exactly `1`, and PATH is guarded in every stage.
+
+Thirtieth security review, three blockers, one major and three minors:
+
+● BLOCKER: the header control was a permitted-name list plus a substring search, so
+  `vary: base64(token)` served the credential to unauthenticated 401s and 404s on every non-probe
+  path. Every header VALUE is pinned now: an exact literal, a bounded pattern, or a validated method
+  list, with anything left over equal to the hardening set. The pin found two real exemptions on its
+  first run, the documentation pages' CSP exemption and the fact that `/docs/oauth2-redirect` is not
+  in `DOC_PATHS` and keeps the full set.
+● BLOCKER: `EXPECTED_AUDIT_KEYS` pinned field names, not values, so `key + "#" + base64(token)` put
+  the credential in the pod log on every write. Every string-valued field is an exact set member or
+  a bounded pattern.
+● BLOCKER: two of the six pinned record kinds were never produced by the test that owns the pin, so
+  their field lists were literals nothing compared. The walk now configures an origin and refuses a
+  preflight, corrupts both snapshots to force a store error, and issues a conditional read to reach
+  the 304 branch whose headers were outside every pin. An unobserved pinned kind now fails.
+● The `/diagnostics` mapping, the documentation pages and the `content-length` exclusion are all
+  closed or honestly recorded; the exclusion is not a disclosure, because h11 refuses a bad length
+  on the wire, but it would hide an unservable probe response from an in-process client.
+● Two of five fabrication runs reported zero failures because the plant had not landed. Both were
+  checked rather than counted, and both were red once applied.

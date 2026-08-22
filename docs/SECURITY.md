@@ -119,7 +119,7 @@ the assessment store.
 | A RUN building a path opaquely is refused, glob and brace included | `tests/test_boot_contract.py` | `test_the_write_guard_refuses_a_path_built_opaquely` |
 | Every route outside the probe set carries the token gate | `src/pree/app.py` | `test_every_route_outside_the_probe_set_carries_the_token_gate` |
 | No route answers an unauthenticated caller outside the probe set | `src/pree/app.py` | `test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set` |
-| The team token reaches no response body and no log record | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
+| The team token reaches no response body, header or log record | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_header_or_log_record` |
 | The 405 Allow set is derived from the route table, not a hand-written map | `src/pree/app.py` | `test_every_method_not_allowed_names_the_methods_that_are` |
 | A colon sentence pairs with the bullet, fence or row that follows it | `tests/test_boot_contract.py` | `test_the_claim_unit_splitter_pairs_a_colon_sentence_with_what_follows` |
 | A refused package run leaves no uploadable artefact | `scripts/package-appstore.sh` | `test_a_refused_tree_leaves_no_archive_at_the_upload_path` |
@@ -137,9 +137,9 @@ the assessment store.
 | The LISTENER executes each route's own endpoint, by identity and by source file | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
 | The LISTENER refuses every unauthenticated caller outside the probe set | `src/pree/main.py` | `test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set` |
 | The LISTENER's unauthenticated paths hold their EXACT body and no unpinned header | `src/pree/main.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
-| No response header is unpinned, and none carries the token, on every route and every error shape | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
-| The probe paths' header mapping is exact, not a permitted-name list | `src/pree/app.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
-| Every audit record's kind and field set is pinned | `src/pree/audit.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
+| Every response header VALUE is pinned, on every route and every error shape | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_header_or_log_record` |
+| The probe paths' headers and bodies are both exact | `src/pree/app.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
+| Every audit record's kind, fields and string values are pinned, and every kind is produced | `src/pree/audit.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
 | The boot line is pinned exactly and carries no token | `src/pree/main.py` | `test_boot_wires_a_serving_app_and_seeds_the_store` |
 | Every permitted ENV name has a pinned value, and PATH is guarded in every stage | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | The storage 503 body discloses the errno and the directory, nothing else | `src/pree/health.py` | `test_the_storage_failure_body_discloses_the_errno_and_nothing_else` |
@@ -1488,6 +1488,61 @@ Three of the new pins found a legitimate field on their first honest run: `etag`
 on the conditional read, and `score`, `confidence` and `evidence_coverage` in the audit record. All
 five were real, correct and unasserted by anything, which is the clearest evidence that an exact pin
 buys something a presence check does not.
+
+### Thirtieth review: three blockers, one major, three minors
+
+The reviewer named the defect class precisely enough to quote, and it is worth keeping: every
+finding for four rounds has been "a literal that is a name list where it needs to be a value, or a
+literal that is never compared at all". All four of this round's were one or the other.
+
+The header control was a permitted-NAME list plus a raw substring search, and that lost to the same
+evasion twice: `vary: base64(token)` uses a permitted name and an encoded value, so it passed both
+halves at once and served the production credential to unauthenticated 401s and 404s on every path
+outside the ten probe paths. The fix is not a longer list. Every header VALUE is now pinned - an
+exact literal, a bounded pattern, or a validated method list - and whatever remains must equal the
+hardening set exactly. A credential can only live in a value, and there is no longer a value that
+is merely present. The ETag is pinned by shape rather than value, because it is a SHA-256 over the
+record and 64 hex characters cannot encode a token.
+
+Two things that pin found on its first honest run are worth recording, because both are real: the
+three documentation pages in `DOC_PATHS` carry no Content-Security-Policy, which is the documented
+exemption for pages that load their own script and style, and `/docs/oauth2-redirect` is NOT in that
+constant and therefore keeps the full hardening set. The exemption is keyed on the constant rather
+than on "looks like a documentation page", and it is now named where a reader can audit it.
+
+The audit channel had the same shape of hole one level down. `EXPECTED_AUDIT_KEYS` pinned field
+NAMES, and the only value control was a raw substring search, so `key = key + "#" + base64(token)`
+put the shared credential in the pod log store on every write and passed. Every string-valued field
+is now an exact set member or a bounded pattern; numbers are left to the field list because a number
+cannot encode a token.
+
+And two of the six pinned record kinds were never produced by the test that owns the pin. The walk
+configured no allowed origin, so the CORS layer was a no-op and no `cors_reject` record existed, and
+no store failure was forced, so no `store_error` record existed. A raw token in either wrote the
+credential to the pod log on an event any unauthenticated caller can trigger at will, with the suite
+green. That is the dead-literal class again, and it is the same failure as last round's
+never-appended-to header list. The walk now configures an origin, refuses a preflight, corrupts both
+snapshots to force the store error, and issues a conditional read to reach the 304 branch, whose
+response headers were outside every pin. Any pinned kind that is not observed is now itself a
+failure.
+
+The major closed the last gap in the ENV allowlist, and three minors closed the diagnostics mapping,
+the documentation pages, and an honest statement of what excluding `content-length` permits: not a
+disclosure, because h11 refuses a non-numeric or mismatched length on the wire, but an unservable
+probe response that the in-process client would accept while every real liveness check got nothing.
+That is recorded as a limit of an in-process test rather than papered over.
+
+Two process notes, both of which cost me a measurement this round. The oversized test was split
+because `ruff` refused it, and the split immediately made the two controls it holds legible.
+And two of my five fabrication runs reported zero failures because the plant had not landed - one
+had a duplicate keyword argument, one referenced a name out of scope. I checked each rather than
+counting the zero, which is the discipline last round's dead assertion taught. Both were red once
+they actually applied.
+
+On the application itself: nine rounds, no finding, thirteen live attacks this round. The reviewer's
+judgement, which I share and record here rather than paraphrase, is that further rounds aimed at
+`src/pree/` are buying very little, and that the remaining review budget belongs on the completeness
+of the pins.
 
 ## Not accepted, and why it is not a risk here
 

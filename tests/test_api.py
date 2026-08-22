@@ -1838,51 +1838,15 @@ def test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set
             )
 
 
-# The header names a response may carry. The hardening set plus what the framework adds. Pinned
-# because NO test in this repository read `response.headers` until this one: every token-disclosure
-# assertion read a body or a log stream, so one line in `security_headers`,
-# `response.headers.setdefault("x-pree-build-token", config.team_token)`, served the production
-# token to an unauthenticated caller on all six exempt paths with the whole loop green and the leak
-# confirmed over the wire. `Set-Cookie` and `Location` are the same channel.
+# EVERY header value, pinned. Not a permitted-name list: that was the control here for two rounds
+# and it lost twice to the same evasion, because a name list cannot see what a value carries.
+# `vary: base64(token)` used a permitted name on every non-probe path and served the production
+# credential to unauthenticated 401s and 404s with the suite green.
 #
-# This project's own docstring already named a header leak as a known attack and closed it by
-# pinning `app.router.dependencies == []`: the wiring, never the property. That is the fourth
-# consecutive round of exactly that error.
-EXPECTED_RESPONSE_HEADERS = frozenset(
-    {
-        "content-security-policy",
-        "x-content-type-options",
-        "x-frame-options",
-        "referrer-policy",
-        "cross-origin-opener-policy",
-        "content-type",
-        "content-length",
-        "date",
-        "server",
-        "vary",
-        "allow",
-        "retry-after",
-        "access-control-allow-origin",
-        "access-control-allow-credentials",
-        "access-control-expose-headers",
-        # The conditional-read pair on /v1/assessments/{key}. Found by this very pin on its
-        # first honest run, which is the check doing its job rather than a concession to it.
-        "etag",
-        "cache-control",
-    }
-)
-
-
-# The EXACT header mapping an unauthenticated probe response carries. A name allowlist plus a
-# substring search is not a pin: `vary: base64(token)` used a permitted name and an encoded value,
-# so it passed both halves at once and disclosed the credential on every liveness path. That is the
-# same evasion that beat the key-set body check one round earlier, reproduced one layer up, which
-# is why these ten paths get a mapping rather than a list.
-#
-# content-length is excluded because it varies with the body, and the body is pinned exactly
-# alongside this. Everything else is fixed by SECURITY_HEADERS and by the JSON media type.
-EXPECTED_PROBE_HEADERS = {
-    "content-type": "application/json",
+# So each value is an exact literal, a pattern, or a method list, and anything left over must equal
+# the hardening set exactly. A credential can only live in a value, and there is no longer a value
+# that is merely present.
+HARDENING_HEADERS = {
     "content-security-policy": (
         "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
     ),
@@ -1891,30 +1855,100 @@ EXPECTED_PROBE_HEADERS = {
     "referrer-policy": "no-referrer",
     "cross-origin-opener-policy": "same-origin",
 }
+PERMITTED_CONTENT_TYPES = frozenset(
+    {"application/json", "text/plain; charset=utf-8", "text/html; charset=utf-8"}
+)
+# The development documentation pages, which legitimately load their own script and style and are
+# therefore exempt from the Content-Security-Policy by design. They do not exist in production, so
+# the exemption cannot reach a deployed app. Named here because this pin found the exemption on its
+# first run and an exemption that is not named is an exemption nobody can audit.
+#
+# The exemption follows `DOC_PATHS`, which is THREE paths: `/docs/oauth2-redirect` is served by
+# FastAPI and is not in that constant, so it keeps the full hardening set. The pin found that
+# distinction too, and it is the reason the flag is keyed on `DOC_PATHS` rather than on "looks like
+# a documentation page".
+DOC_HEADERS = {
+    name: value for name, value in HARDENING_HEADERS.items() if name != "content-security-policy"
+}
+# The conditional-read pair. The ETag is a SHA-256 over the record, so its shape is pinned rather
+# than its value; 64 hex characters cannot encode a token.
+ETAG_PATTERN = re.compile(r'^"[0-9a-f]{64}"$')
+CACHE_CONTROL = "private, max-age=0, must-revalidate"
+HTTP_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+# The CORS set, by exact value. `vary` is here because it is a CORS header and because pinning it
+# to "Origin" is what closes the evasion above.
+CORS_HEADER_VALUES = {
+    "vary": "Origin",
+    "access-control-allow-credentials": "true",
+    "access-control-max-age": "600",
+}
 
 
-def _header_mapping(response: Any) -> dict[str, str]:
-    """The response's headers, less the length, which follows the body."""
-    return {
+def _header_complaints(
+    response: Any, secret: str, where: str, origin: str = "", *, docs: bool = False
+) -> list[str]:
+    """Every complaint about a response's headers: a bad value, or the secret in one."""
+    actual = {
         name.lower(): value
         for name, value in response.headers.items()
+        # content-length follows the body, and the body is pinned separately. Excluding it is
+        # not a disclosure channel: h11 refuses a non-numeric or mismatched length on the wire,
+        # so a header carrying a secret there is a response no client ever receives. What it
+        # WOULD hide is an unservable probe response, which the container's own health check
+        # catches behaviourally.
         if name.lower() != "content-length"
     }
-
-
-def _header_findings(response: Any, secret: str, where: str) -> list[str]:
-    """Every complaint about a response's headers: an unpinned name, or the secret in a value."""
-    findings = [
-        f"{where}: unexpected header {name!r}"
-        for name in response.headers
-        if name.lower() not in EXPECTED_RESPONSE_HEADERS
-    ]
-    findings += [
+    complaints = [
         f"{where}: header {name!r} carries the credential"
-        for name, value in response.headers.items()
-        if secret in value
+        for name, value in actual.items()
+        if secret and secret in value
     ]
-    return findings
+    remainder = dict(actual)
+
+    content_type = remainder.pop("content-type", None)
+    if content_type is not None and content_type not in PERMITTED_CONTENT_TYPES:
+        complaints.append(f"{where}: content-type is {content_type!r}")
+
+    allowed = remainder.pop("allow", None)
+    if allowed is not None:
+        advertised = {method.strip() for method in allowed.split(",")}
+        if not advertised or advertised - HTTP_METHODS:
+            complaints.append(f"{where}: Allow advertises {allowed!r}")
+
+    etag = remainder.pop("etag", None)
+    if etag is not None and not ETAG_PATTERN.match(etag):
+        complaints.append(f"{where}: ETag is {etag!r}, not a SHA-256 in quotes")
+
+    cache = remainder.pop("cache-control", None)
+    if cache is not None and cache != CACHE_CONTROL:
+        complaints.append(f"{where}: cache-control is {cache!r}")
+
+    for name, expected in CORS_HEADER_VALUES.items():
+        value = remainder.pop(name, None)
+        if value is not None and value != expected:
+            complaints.append(f"{where}: {name} is {value!r}, not {expected!r}")
+
+    echoed = remainder.pop("access-control-allow-origin", None)
+    if echoed is not None and echoed != origin:
+        complaints.append(f"{where}: allow-origin echoes {echoed!r}, not {origin!r}")
+    for name in ("access-control-allow-methods", "access-control-allow-headers"):
+        value = remainder.pop(name, None)
+        if value is not None and (
+            not value or any(part.strip() == "" for part in value.split(","))
+        ):
+            complaints.append(f"{where}: {name} is {value!r}")
+
+    pinned: dict[str, str] = DOC_HEADERS if docs else HARDENING_HEADERS
+    if remainder != pinned:
+        complaints.append(f"{where}: unpinned headers {remainder}")
+    return complaints
+
+
+def _header_findings(
+    response: Any, secret: str, where: str, origin: str = "", *, docs: bool = False
+) -> list[str]:
+    """Retained name for the call sites; the pin is exact now, per value."""
+    return _header_complaints(response, secret, where, origin, docs=docs)
 
 
 def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Path) -> None:
@@ -1957,12 +1991,6 @@ def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Pa
                             "followed redirect hides"
                         )
                         complaints += _header_findings(response, PRODUCTION_TOKEN, where)
-                        # The MAPPING, exactly. See EXPECTED_PROBE_HEADERS: a permitted name
-                        # carrying an encoded value defeated the name list and the substring
-                        # search together.
-                        assert _header_mapping(response) == EXPECTED_PROBE_HEADERS, (
-                            f"{where} headers are {_header_mapping(response)}"
-                        )
                         if method == "HEAD":
                             assert response.content == b"", f"{where} carried a body"
                             continue
@@ -1998,7 +2026,9 @@ def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Pa
                     where = f"{env}: GET {path}"
                     response = probe.get(path, follow_redirects=False)
                     assert response.status_code == 200, f"{where} gave {response.status_code}"
-                    complaints += _header_findings(response, PRODUCTION_TOKEN, where)
+                    complaints += _header_findings(
+                        response, PRODUCTION_TOKEN, where, docs=path in DOC_PATHS
+                    )
                     assert PRODUCTION_TOKEN not in response.text, (
                         f"{where} body carries the team token"
                     )
@@ -2187,6 +2217,31 @@ def test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set(
 # The fields each audit record kind may carry. Pinned because nothing pinned them: a record is a
 # disclosure channel with no body and no header, and `token=config.team_token` added to the success
 # audit call wrote the shared credential into the pod log store on every write with the suite green.
+# Every string-valued audit field, by exact set or bounded pattern. A number cannot carry a base64
+# credential; a string can, which is why these and not the numeric fields.
+AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str]] = {
+    "kind": frozenset(
+        {
+            "audit",
+            "auth_reject",
+            "validation_reject",
+            "http_reject",
+            "cors_reject",
+            "store_error",
+        }
+    ),
+    "action": frozenset({"assess", "read_assessment"}),
+    "actor": re.compile(r"^[A-Za-z0-9 ._:@-]{0,64}$"),
+    "outcome": frozenset(
+        {"ok", "created", "disclosed", "not_found", "not_modified", "error", "refused"}
+    ),
+    "confidence": frozenset({"low", "medium", "high"}),
+    "key": re.compile(r"^[A-Za-z0-9:._-]{1,129}$"),
+    "path": re.compile(r"^[!-~]{1,160}$"),
+    "reason": re.compile(r"^[ -~]{0,512}$"),
+}
+
+
 EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
     "audit": {
         "kind",
@@ -2211,10 +2266,14 @@ EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
 }
 
 
-def test_the_team_token_reaches_no_response_body_and_no_log_record(
+def _exercise_every_surface(
     tmp_path: Path, prober: StorageProber
-) -> None:
-    """The credential is compared, never echoed, and never logged, on any path.
+) -> tuple[list[str], list[str], str]:
+    """Drive every response shape and every log channel once, and return what came back.
+
+    A helper rather than a test, because the two controls it feeds are separate: nothing may
+    disclose the credential, and every audit record must match its pinned shape. Sharing the
+    exercise keeps them measuring the same traffic.
 
     /diagnostics reports the token's LENGTH and whether it is set, deliberately, so a caller can
     confirm the deployment without learning the value. This walks every route, in both the
@@ -2231,16 +2290,23 @@ def test_the_team_token_reaches_no_response_body_and_no_log_record(
     take the store key out of the audit trail.
     """
     stream = io.StringIO()
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    # An allowed origin, so `register_cors` is actually installed. Without it the CORS layer is a
+    # no-op and no `cors_reject` record can exist, which is what made that record's pinned field
+    # list a literal nothing compared.
+    config = make_config(
+        tmp_path,
+        PREE_TEAM_TOKEN=TEST_TOKEN,
+        PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
+    )
     logger = build_logger(stream)
     with build_client(config, logger, prober) as probe:
         bodies: list[str] = []
         leaked_headers: list[str] = []
 
-        def record(answer: Any, where: str) -> None:
+        def record(answer: Any, where: str, *, docs: bool = False, origin: str = "") -> None:
             """Both channels of one response. The header half used to be missing entirely."""
             bodies.append(answer.text)
-            leaked_headers.extend(_header_findings(answer, TEST_TOKEN, where))
+            leaked_headers.extend(_header_findings(answer, TEST_TOKEN, where, origin, docs=docs))
 
         for route in _all_routes(probe.app):
             target = getattr(route, "path", "").replace("{key}", "probe:key")
@@ -2252,6 +2318,7 @@ def test_the_team_token_reaches_no_response_body_and_no_log_record(
                             method, target, headers=headers, json={}, follow_redirects=False
                         ),
                         f"{method} {target}",
+                        docs=target in DOC_PATHS,
                     )
         # And the shapes that reflect caller input back: a validation failure whose detail
         # echoes the rejected body, and the token in a query string, which is the documented
@@ -2289,22 +2356,103 @@ def test_the_team_token_reaches_no_response_body_and_no_log_record(
         read = probe.get(f"/v1/assessments/{key}", headers=AUTH)
         assert read.status_code == 200, read.text
         record(read, "read success")
+        # And the CONDITIONAL read, whose 304 branch sets its own headers and was outside every
+        # header pin: a raw token header there shipped undetected because nothing in the suite sent
+        # an If-None-Match while reading headers.
+        conditional = probe.get(
+            f"/v1/assessments/{key}",
+            headers={**AUTH, "if-none-match": read.headers["etag"]},
+        )
+        assert conditional.status_code == 304, conditional.status_code
+        record(conditional, "304 read")
+        # A refused preflight, which produces the `cors_reject` record.
+        refused = probe.options(
+            "/v1/assess",
+            headers={
+                "origin": "https://evil.example",
+                "access-control-request-method": "POST",
+            },
+        )
+        assert refused.status_code == 400, refused.status_code
+        record(refused, "cors reject")
+        # And a store failure, which produces the `store_error` record. Injected by making the
+        # snapshot unreadable rather than by patching, so the real error path runs.
+        snapshot = config.data_dir / "assessments.json"
+        snapshot.write_text("{ not json at all", encoding="utf-8")
+        (config.data_dir / "assessments.json.bak").write_text("also not json", encoding="utf-8")
+        broken = probe.get(f"/v1/assessments/{key}", headers=AUTH)
+        assert broken.status_code == 503, f"a corrupt snapshot answered {broken.status_code}"
+        record(broken, "store error")
+    return bodies, leaked_headers, stream.getvalue()
+
+
+def test_the_team_token_reaches_no_response_body_header_or_log_record(
+    tmp_path: Path, prober: StorageProber
+) -> None:
+    """The credential is compared, never echoed, never logged, in any channel.
+
+    /diagnostics reports the token's LENGTH and whether it is set, deliberately, so a caller can
+    confirm the deployment without learning the value.
+    """
+    bodies, leaked_headers, log = _exercise_every_surface(tmp_path, prober)
     leaked = [body for body in bodies if TEST_TOKEN in body]
     assert not leaked, f"a response body carried the team token: {leaked}"
-    assert not leaked_headers, f"a response header carried the team token: {leaked_headers}"
-    assert TEST_TOKEN not in stream.getvalue(), "the audit log carried the team token"
-    # And the SHAPE of every record, not only the absence of one string. Nothing in this suite
-    # pinned an audit record's key set, so any new field rode along unasserted, and a substring
-    # search cannot see an encoded value.
-    emitted = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+    assert not leaked_headers, (
+        f"a response header is unpinned or carries the token: {leaked_headers}"
+    )
+    assert TEST_TOKEN not in log, "the audit log carried the team token"
+
+
+def test_every_audit_record_matches_its_pinned_shape_and_values(
+    tmp_path: Path, prober: StorageProber
+) -> None:
+    """A log line is a disclosure channel with no body and no header.
+
+    Nothing in this suite pinned an audit record's fields until recently, and then the field list
+    was pinned while the values were not, so an encoded credential inside a permitted field passed.
+    Both halves are asserted here, and so is the requirement that every pinned kind is actually
+    produced by the exercise: two of the six were not, which made their field lists literals that
+    nothing compared.
+    """
+    _, _, log = _exercise_every_surface(tmp_path, prober)
+    emitted = [json.loads(line) for line in log.splitlines() if line.strip()]
     assert emitted, "the walk produced no audit records at all, so this greps an empty stream"
     # An unknown KIND is itself a finding, not a record to skip: a new record shape is a new
     # disclosure channel, and `.get(kind, set())` on a missing key would have waved it through.
-    unknown = sorted({found.get("kind", "<none>") for found in emitted} - set(EXPECTED_AUDIT_KEYS))
+    observed = {found.get("kind", "<none>") for found in emitted}
+    unknown = sorted(observed - set(EXPECTED_AUDIT_KEYS))
     assert not unknown, f"an audit record kind is not pinned: {unknown}"
+    # And every pinned kind must actually be PRODUCED here, or its field list is a literal nothing
+    # compares. Two of the six were not: this walk configured no allowed origin, so `register_cors`
+    # was a no-op and no `cors_reject` record existed, and no store failure was forced, so no
+    # `store_error` record existed. A raw token in either wrote the shared credential to the pod log
+    # on an event any unauthenticated caller can trigger at will, with the suite green. Same
+    # dead-literal class as the header assertion that was never appended to.
+    missing = sorted(set(EXPECTED_AUDIT_KEYS) - observed)
+    assert not missing, (
+        f"these record kinds are pinned and never produced here, so their field lists assert "
+        f"nothing: {missing}"
+    )
     unexpected = [
         f"{found['kind']}: {sorted(set(found) - EXPECTED_AUDIT_KEYS[found['kind']])}"
         for found in emitted
         if set(found) - EXPECTED_AUDIT_KEYS[found["kind"]]
     ]
     assert not unexpected, f"an audit record carries a field no test pins: {unexpected}"
+    # The VALUES, not only the field names. `EXPECTED_AUDIT_KEYS` pinned names, and the only value
+    # control on this channel was a raw substring search, so `key=key + "#" + base64(token)` put
+    # the credential in the pod log store on every write and passed. Every string-valued field is
+    # now an exact set member or a bounded pattern; a number cannot encode a token.
+    offending: list[str] = []
+    for found in emitted:
+        for field, value in found.items():
+            if not isinstance(value, str):
+                continue
+            allowed = AUDIT_STRING_VALUES.get(field)
+            if allowed is None:
+                offending.append(f"{found['kind']}.{field} is a string no rule pins: {value!r}")
+            elif isinstance(allowed, re.Pattern) and not allowed.match(value):
+                offending.append(f"{found['kind']}.{field}={value!r} fails {allowed.pattern}")
+            elif isinstance(allowed, frozenset) and value not in allowed:
+                offending.append(f"{found['kind']}.{field}={value!r} outside {sorted(allowed)}")
+    assert not offending, f"an audit record string value is unpinned: {offending}"
