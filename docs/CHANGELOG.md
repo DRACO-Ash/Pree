@@ -1007,7 +1007,12 @@ Fourth security review of the audit layer, one major and five minors:
   ASGI scope. The bit is described as a NON-EMPTY query string.
 ● `_raw_path` now partitions on `?` itself. The exclusion held under h11, httptools and the
   TestClient, but it rested on their convention, and a server placing the full target in `raw_path`
-  would write query values into the field that once held the team token in cleartext.
+  would write query values into the field that once held the team token in cleartext. My own canary
+  then showed the partition was unobservable under the shipped stack, so the hostile server is
+  simulated by a middleware and the query and token are asserted absent from the record. The same
+  canary showed the fallback arm's partition could never fire, since Starlette's parser splits the
+  query before `.path` exists, so that one is removed: a check that cannot fail reads as a control
+  and is not one.
 ● The truncation claims had no canary: the test probed permitted bytes only, which truncate 1:1, so
   the wrong unit could be restored with nothing red. The 54-byte threshold and
   `MAX_LOGGED_PATH > 16 + STORE_KEY_MAX_LENGTH` are asserted, the second being what keeps truncation

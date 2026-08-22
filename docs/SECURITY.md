@@ -2170,6 +2170,16 @@ Five minors closed with it:
   this policy records as having held the team token in cleartext. `_raw_path` now partitions on `?`
   itself: no behaviour change under the shipped stack, and the control no longer depends on a
   dependency for a property this policy asserts.
+  ● And my own canary caught the consequence of that, which is worth recording because it is the
+    third time in this range the same shape has appeared. Removing the partition left the whole
+    suite green, because under the shipped stack it cuts nothing and no mutation of it is
+    observable. A defence with no reachable failure is a defence nobody can verify. So the server
+    is SIMULATED: a middleware puts the full target in `raw_path`, and
+    `test_a_server_that_puts_the_query_in_raw_path_still_cannot_reach_the_audit_field` asserts the
+    query and the token still do not reach the record. The same canary showed the partition on the
+    FALLBACK arm could never fire - Starlette's URL parser splits the query out before `.path`
+    exists, measured - so that one is removed rather than kept as decoration, because a check that
+    cannot fail reads as a control and is not one.
 ● The corrected truncation claims had no canary. The truncation test probed with permitted bytes
   only, which truncate 1:1, so the wrong unit could be restored with nothing red. Both the 54-byte
   all-escaping threshold and the relation `MAX_LOGGED_PATH > 16 + STORE_KEY_MAX_LENGTH` are now

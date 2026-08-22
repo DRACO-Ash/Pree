@@ -639,6 +639,55 @@ def test_the_query_string_aliases_and_the_record_says_a_query_was_present(
     )
 
 
+def test_a_server_that_puts_the_query_in_raw_path_still_cannot_reach_the_audit_field(
+    tmp_path: Path,
+) -> None:
+    """The defensive partition, exercised against the server it defends against.
+
+    Removing the partition leaves the whole suite green, and that is not a hole in this test: h11,
+    httptools and Starlette's TestClient all split the target before the scope exists, so under the
+    shipped stack the partition cuts nothing and no mutation of it is observable. A defence with no
+    reachable failure is a defence nobody can verify, which is how the last four rounds of this
+    control were defeated in prose.
+
+    So the server is SIMULATED. This middleware puts the full request target in `raw_path`, which is
+    what an ASGI implementation or an upstream middleware is free to do, and asserts the query still
+    does not reach the audited field. `src/pree/audit.py` records why that field matters: a query
+    string carrying the team token was written verbatim into the pod log store, the only time this
+    application has held the credential in cleartext.
+    """
+    stream = io.StringIO()
+    logger = build_logger(stream)
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+
+    class _RawPathCarriesTheQuery:
+        def __init__(self, app: Any) -> None:
+            self._app = app
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] == "http" and scope.get("query_string"):
+                scope["raw_path"] = scope["path"].encode() + b"?" + scope["query_string"]
+            await self._app(scope, receive, send)
+
+    store = JsonStore(config.data_dir)
+    store.seed()
+    app = create_app(config, store, logger=logger, prober=StorageProber(cache_seconds=0.0))
+    with TestClient(_RawPathCarriesTheQuery(app)) as hostile:
+        refused = hostile.get(
+            f"/diagnostics?x-pree-token={TEST_TOKEN}", headers={"x-pree-token": "wrong"}
+        )
+        assert refused.status_code == 401, refused.text
+
+    trail = stream.getvalue()
+    records = [json.loads(line) for line in trail.splitlines() if '"path"' in line]
+    assert records, "the rejection was not audited"
+    assert records[0]["path"] == "/diagnostics", (
+        f"the query string reached the audited path field through raw_path: {records[0]['path']!r}"
+    )
+    assert records[0]["had_query"] is True, "the query bit did not survive the partition"
+    assert TEST_TOKEN not in trail, "the team token reached the audit stream through raw_path"
+
+
 @pytest.mark.parametrize("supplied", [None, "str", "bytearray"])
 def test_the_audited_path_falls_back_when_no_usable_raw_path_is_supplied(
     tmp_path: Path, supplied: str | None

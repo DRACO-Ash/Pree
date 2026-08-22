@@ -372,7 +372,13 @@ def _raw_path(request: Request) -> bytes:
         # `audit.py` records as having held the team token in cleartext. One line, no behaviour
         # change under the shipped stack, and the control stops depending on a dependency.
         return raw.partition(b"?")[0]
-    return request.url.path.encode("utf-8", "surrogatepass").partition(b"?")[0]
+    # NO partition on this arm, deliberately. Starlette's URL parser splits the query out before
+    # `.path` exists - measured: a scope whose `path` is `/diagnostics?x=1` still yields
+    # `/diagnostics` - so a partition here can never fire, and no test can reach it. A defensive
+    # check with no reachable failure is worse than its absence, because it reads as a control and
+    # is not one. The arm above IS reachable, by a server that leaves the query in `raw_path`, and
+    # test_a_server_that_puts_the_query_in_raw_path_still_cannot_reach_the_audit_field drives it.
+    return request.url.path.encode("utf-8", "surrogatepass")
 
 
 def _had_query(request: Request) -> bool:
