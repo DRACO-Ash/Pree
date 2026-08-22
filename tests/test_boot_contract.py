@@ -533,15 +533,18 @@ _PLATFORM_INJECTED = frozenset(
 # Inverted, the burden lands where it belongs: this image needs four environment variables, so a
 # fifth is a decision somebody makes and a reviewer sees in the diff. A credential cannot be baked
 # under ANY name, because no new name is permitted at all.
-_ALLOWED_ENV_NAMES = frozenset(
-    {
-        "PYTHONDONTWRITEBYTECODE",
-        "PIP_NO_CACHE_DIR",
-        "PIP_DISABLE_PIP_VERSION_CHECK",
-        "PATH",
-        "PYTHONUNBUFFERED",
-    }
-)
+# And their VALUES, because a permitted name with an arbitrary value is still a place to freeze a
+# credential into a layer: `ENV PYTHONUNBUFFERED="Ab3-Cd6-Ef9-..."` still unbuffers, still ships,
+# and was allowed by the name allowlist and by both hook rules, all of which match on names. The
+# flag variables take exactly "1". PATH is checked separately against the guarded directories,
+# because its value is a list rather than a constant.
+_ALLOWED_ENV_VALUES = {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PIP_NO_CACHE_DIR": "1",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PYTHONUNBUFFERED": "1",
+}
+_ALLOWED_ENV_NAMES = frozenset({*_ALLOWED_ENV_VALUES, "PATH"})
 
 
 def test_no_stage_sets_an_environment_variable_outside_the_allowlist() -> None:
@@ -556,9 +559,24 @@ def test_no_stage_sets_an_environment_variable_outside_the_allowlist() -> None:
     for instruction in _instructions():
         if instruction.keyword not in {"ENV", "ARG"}:
             continue
-        for name, _value in _env_assignments(instruction.argument):
+        for name, value in _env_assignments(instruction.argument):
             if name not in _ALLOWED_ENV_NAMES:
                 unexpected.append(f"{instruction.keyword} {name}")
+            elif name in _ALLOWED_ENV_VALUES and value != _ALLOWED_ENV_VALUES[name]:
+                unexpected.append(f"{instruction.keyword} {name}=[REDACTED:value]")
+            elif name == "PATH":
+                # EVERY stage, not only the shipped one. A neutered PATH in the prep stage is not
+                # exploitable today, because the sweep names absolute binaries and every RUN and
+                # COPY is allowlisted, but nothing read it at all and the guard that reads the
+                # shipped stage says nothing about the stage that does the hardening.
+                guarded = {directory.rstrip("/") for directory in _EXECUTABLE_DIRECTORIES}
+                stray = [
+                    entry
+                    for entry in value.split(":")
+                    if entry and entry != "$PATH" and entry.rstrip("/") not in guarded
+                ]
+                if stray:
+                    unexpected.append(f"{instruction.keyword} PATH carries {stray}")
     assert not unexpected, (
         f"these environment names are set in the image and are not on the allowlist: "
         f"{unexpected}. An image-level value beats the platform's injection and can freeze a "

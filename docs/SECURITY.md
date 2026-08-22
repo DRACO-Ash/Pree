@@ -137,7 +137,11 @@ the assessment store.
 | The LISTENER executes each route's own endpoint, by identity and by source file | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
 | The LISTENER refuses every unauthenticated caller outside the probe set | `src/pree/main.py` | `test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set` |
 | The LISTENER's unauthenticated paths hold their EXACT body and no unpinned header | `src/pree/main.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
-| No response header is unpinned, and none carries the token | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
+| No response header is unpinned, and none carries the token, on every route and every error shape | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
+| The probe paths' header mapping is exact, not a permitted-name list | `src/pree/app.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
+| Every audit record's kind and field set is pinned | `src/pree/audit.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
+| The boot line is pinned exactly and carries no token | `src/pree/main.py` | `test_boot_wires_a_serving_app_and_seeds_the_store` |
+| Every permitted ENV name has a pinned value, and PATH is guarded in every stage | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | The storage 503 body discloses the errno and the directory, nothing else | `src/pree/health.py` | `test_the_storage_failure_body_discloses_the_errno_and_nothing_else` |
 | Every ENV and ARG name is on an allowlist, so no credential can be baked under any name | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | No credential is baked into an ENV or ARG assignment | `Dockerfile` | `test_no_credential_is_baked_into_an_env_assignment` |
@@ -1439,6 +1443,51 @@ all five liveness paths, so a header leak there was doubly invisible; both verbs
 
 The running application was probed again and holds. Seven rounds with no finding in it, against
 seven rounds of findings in the layer built to prove it holds.
+
+### Twenty-ninth review: five blockers, one major
+
+**The first blocker is mine to own before anything else.** Last round I reported the header channel
+closed. It was not. `leaked_headers` was declared and asserted and **never appended to**: the first
+of my two edits failed to match its anchor, only the declaration and the assertion landed, and I
+did not re-read the result before reporting. So the one test that walks every route in the
+authenticated, wrong-token and no-token cases read no headers at all, the assertion was dead, and I
+put a row in this file naming it as the header control. A token header scoped to `/v1/*` and
+`/diagnostics` handed the production credential to every unauthenticated 401 with the loop green.
+That is the sixth false claim of mine in this session and the second to reach this file's control
+table. The lesson is narrow and practical: an edit that reports success is not an edit that landed,
+and a fabrication run is the only thing that tells them apart. Every control in this round was
+mutation-proved before the row was written, and one of my seven measurements this round was
+similarly void because the plant failed to apply. I re-ran it rather than counting the zero.
+
+The second blocker is the same evasion as the previous round's, one layer up. A permitted-name list
+plus a substring search is not a pin: `vary: base64(token)` used a permitted name and an encoded
+value and passed both halves at once, on every liveness path. The ten unauthenticated paths now
+assert the header MAPPING exactly, the way the liveness body is asserted exactly, less
+`content-length` which follows the body.
+
+Third, the storage bodies were still key sets while the liveness body next to them had been pinned
+exactly in the same commit: `errno_name = base64(token)` disclosed the credential on that
+unauthenticated path with zero statement misses. Both the 200 and the 503 are exact now, with the
+measured duration bounded rather than pinned.
+
+Fourth and fifth are the two channels with no body and no header. **No test in this repository
+pinned an audit record's field set**, and the token walk never made a successful gated call, so only
+rejection lines were ever grepped: `token=config.team_token` in the success audit call wrote the
+shared credential into the pod log store on every write. And the boot line, which the platform
+aggregates, was asserted by three substring `in` checks with no negative assertion, so appending the
+token to it passed. Both are pinned exactly now, the record kinds included, and an unrecognised
+kind is itself a failure rather than a record to skip.
+
+The major closes the value half of the ENV allowlist. Names were inverted last round and values
+were not, so `ENV PYTHONUNBUFFERED="Ab3-Cd6-..."` still unbuffers, still ships, and was allowed by
+the name allowlist and by both hook rules, all of which match on names. The four flag variables now
+take exactly `1`, and `PATH` is checked against the guarded directories in EVERY stage rather than
+only the shipped one.
+
+Three of the new pins found a legitimate field on their first honest run: `etag` and `cache-control`
+on the conditional read, and `score`, `confidence` and `evidence_coverage` in the audit record. All
+five were real, correct and unasserted by anything, which is the clearest evidence that an exact pin
+buys something a presence check does not.
 
 ## Not accepted, and why it is not a risk here
 

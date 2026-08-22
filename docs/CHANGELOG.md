@@ -695,3 +695,22 @@ Twenty-eighth security review, three blockers and one major:
 ● Every probe now uses `follow_redirects=False` and asserts no Location header, because
   `TestClient` follows by default and a 307 carrying the token in Location read as a 200; and both
   GET and HEAD are asked, since HEAD is served on all five liveness paths.
+
+Twenty-ninth security review, five blockers and one major:
+
+● BLOCKER, and my error: `leaked_headers` was declared and asserted and never appended to. My edit
+  last round failed to match its anchor, only the declaration landed, and I reported the header
+  channel closed and put a control row in the policy naming a dead assertion. A token header on
+  `/v1/*` and `/diagnostics` reached every unauthenticated 401 with the loop green. Wired in now,
+  across every route, every header case, every error shape and the CORS preflight.
+● A permitted-name list plus a substring search is not a pin: `vary: base64(token)` passed both
+  halves at once. The ten unauthenticated paths assert the header mapping exactly.
+● The storage 200 and 503 bodies were key sets while the liveness body beside them was exact, so
+  `errno_name = base64(token)` disclosed the credential on an unauthenticated path. Both exact now.
+● No test pinned an audit record's field set, and the token walk never made a successful gated
+  call, so only rejection lines were grepped: the token in the success audit record reached the pod
+  log store on every write. Record kinds and fields are pinned, and an unknown kind fails.
+● The boot line was three substring checks with no negative assertion, so appending the token to it
+  passed. It is pinned exactly, with the token asserted absent.
+● MAJOR: the ENV allowlist inverted names and not values, so `ENV PYTHONUNBUFFERED="<credential>"`
+  shipped. The flag variables take exactly `1`, and PATH is guarded in every stage.

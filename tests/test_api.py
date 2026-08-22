@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import inspect
 import io
 import json
@@ -193,20 +194,31 @@ def test_diagnostics_reports_secrets_as_a_boolean_and_a_length_only(
     assert body["team_token_present"] is True
     assert body["team_token_length"] == len(TEST_TOKEN)
     assert TEST_TOKEN not in response.text
-    for field in (
+    # The EXACT key set, not a presence check per field. A presence loop cannot see a field that
+    # is ADDED, so a new one shipped unasserted, and this route reports lengths and booleans about
+    # the credential: exactly the shape where one extra field is the value itself. The impact is
+    # bounded, since the caller already holds the token to get here, which is why this was a minor
+    # rather than a blocker; the fix is the same either way.
+    assert set(body) == {
         "build_id",
         "environment",
         "port",
         "auth_enabled",
+        "team_token_present",
+        "team_token_length",
         "allowed_origin_present",
         "allowed_origin_is_wildcard",
+        "allowed_origin_length",
+        "data_dir",
         "data_dir_is_absolute",
+        "data_dir_was_configured",
         "storage_writable",
+        "storage_errno",
         "storage_errno_name",
         "identity_uid",
+        "identity_gid",
         "identity_is_root",
-    ):
-        assert field in body, f"diagnostics is missing {field}"
+    }, f"diagnostics reports {sorted(body)}"
 
 
 def test_assess_requires_the_token(client: TestClient) -> None:
@@ -1853,8 +1865,41 @@ EXPECTED_RESPONSE_HEADERS = frozenset(
         "access-control-allow-origin",
         "access-control-allow-credentials",
         "access-control-expose-headers",
+        # The conditional-read pair on /v1/assessments/{key}. Found by this very pin on its
+        # first honest run, which is the check doing its job rather than a concession to it.
+        "etag",
+        "cache-control",
     }
 )
+
+
+# The EXACT header mapping an unauthenticated probe response carries. A name allowlist plus a
+# substring search is not a pin: `vary: base64(token)` used a permitted name and an encoded value,
+# so it passed both halves at once and disclosed the credential on every liveness path. That is the
+# same evasion that beat the key-set body check one round earlier, reproduced one layer up, which
+# is why these ten paths get a mapping rather than a list.
+#
+# content-length is excluded because it varies with the body, and the body is pinned exactly
+# alongside this. Everything else is fixed by SECURITY_HEADERS and by the JSON media type.
+EXPECTED_PROBE_HEADERS = {
+    "content-type": "application/json",
+    "content-security-policy": (
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    ),
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    "cross-origin-opener-policy": "same-origin",
+}
+
+
+def _header_mapping(response: Any) -> dict[str, str]:
+    """The response's headers, less the length, which follows the body."""
+    return {
+        name.lower(): value
+        for name, value in response.headers.items()
+        if name.lower() != "content-length"
+    }
 
 
 def _header_findings(response: Any, secret: str, where: str) -> list[str]:
@@ -1912,6 +1957,12 @@ def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Pa
                             "followed redirect hides"
                         )
                         complaints += _header_findings(response, PRODUCTION_TOKEN, where)
+                        # The MAPPING, exactly. See EXPECTED_PROBE_HEADERS: a permitted name
+                        # carrying an encoded value defeated the name list and the substring
+                        # search together.
+                        assert _header_mapping(response) == EXPECTED_PROBE_HEADERS, (
+                            f"{where} headers are {_header_mapping(response)}"
+                        )
                         if method == "HEAD":
                             assert response.content == b"", f"{where} carried a body"
                             continue
@@ -1922,14 +1973,22 @@ def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Pa
                                 "version": __version__,
                             }, f"{where} body is {response.json()}"
                         else:
-                            assert set(response.json()) == {
-                                "status",
-                                "storage_writable",
-                                "errno",
-                                "errno_name",
-                                "probe_duration_ms",
-                                "probe_timeout_ms",
-                            }, f"{where} body keys are {sorted(response.json())}"
+                            # EXACTLY, apart from the measured duration. The key set alone let
+                            # `errno_name = base64(token)` disclose the credential on this
+                            # unauthenticated path with the suite green: the liveness body next
+                            # to it was pinned exactly in the same commit and this one was not.
+                            body = response.json()
+                            duration = body.pop("probe_duration_ms", None)
+                            assert body == {
+                                "status": "ready",
+                                "storage_writable": True,
+                                "errno": None,
+                                "errno_name": None,
+                                "probe_timeout_ms": 1500,
+                            }, f"{where} body is {body}"
+                            assert isinstance(duration, int) and 0 <= duration < 1500, (
+                                f"{where} reports a probe duration of {duration}"
+                            )
                         assert PRODUCTION_TOKEN not in response.text, (
                             f"{where} body carries the team token"
                         )
@@ -1980,16 +2039,19 @@ def test_the_storage_failure_body_discloses_the_errno_and_nothing_else(tmp_path:
         f"a data directory under a regular file answered {response.status_code}; the failure "
         "branch of the storage body is unreachable and therefore unasserted"
     )
-    assert set(response.json()) == {
-        "status",
-        "storage_writable",
-        "errno",
-        "errno_name",
-        "probe_duration_ms",
-        "probe_timeout_ms",
-        "data_dir",
-    }, f"the 503 body keys are {sorted(response.json())}"
-    assert response.json()["storage_writable"] is False
+    body = response.json()
+    duration = body.pop("probe_duration_ms", None)
+    assert body == {
+        "status": "unready",
+        "storage_writable": False,
+        "errno": errno.ENOTDIR,
+        "errno_name": "ENOTDIR",
+        "probe_timeout_ms": 1500,
+        "data_dir": str(blocker / "nested"),
+    }, f"the 503 body is {body}"
+    assert isinstance(duration, int) and 0 <= duration < 1500, (
+        f"the 503 reports a probe duration of {duration}"
+    )
     assert PRODUCTION_TOKEN not in response.text, "the 503 body carries the team token"
     assert not _header_findings(response, PRODUCTION_TOKEN, "storage 503")
 
@@ -2122,6 +2184,33 @@ def test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set(
     assert not answered, f"a gated route answered without a token: {answered}"
 
 
+# The fields each audit record kind may carry. Pinned because nothing pinned them: a record is a
+# disclosure channel with no body and no header, and `token=config.team_token` added to the success
+# audit call wrote the shared credential into the pod log store on every write with the suite green.
+EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
+    "audit": {
+        "kind",
+        "action",
+        "actor",
+        "duration_ms",
+        "outcome",
+        "key",
+        "indicator_count",
+        # The assessment's own summary, which the operator needs in the trail. Each of these was
+        # found by this pin on its first honest run, which is the pin working: the fields are
+        # legitimate and were nonetheless unasserted by anything.
+        "score",
+        "confidence",
+        "evidence_coverage",
+    },
+    "auth_reject": {"kind", "path", "reason"},
+    "validation_reject": {"kind", "path", "error_count", "errors"},
+    "http_reject": {"kind", "path", "reason", "status"},
+    "cors_reject": {"kind", "path", "reason", "origin_allowed"},
+    "store_error": {"kind", "path", "reason"},
+}
+
+
 def test_the_team_token_reaches_no_response_body_and_no_log_record(
     tmp_path: Path, prober: StorageProber
 ) -> None:
@@ -2147,18 +2236,75 @@ def test_the_team_token_reaches_no_response_body_and_no_log_record(
     with build_client(config, logger, prober) as probe:
         bodies: list[str] = []
         leaked_headers: list[str] = []
+
+        def record(answer: Any, where: str) -> None:
+            """Both channels of one response. The header half used to be missing entirely."""
+            bodies.append(answer.text)
+            leaked_headers.extend(_header_findings(answer, TEST_TOKEN, where))
+
         for route in _all_routes(probe.app):
             target = getattr(route, "path", "").replace("{key}", "probe:key")
             methods = (getattr(route, "methods", None) or set()) - {"HEAD", "OPTIONS"}
             for method in sorted(methods):
                 for headers in (AUTH, {"x-pree-token": "wrong-token-value"}, {}):
-                    bodies.append(probe.request(method, target, headers=headers, json={}).text)
+                    record(
+                        probe.request(
+                            method, target, headers=headers, json={}, follow_redirects=False
+                        ),
+                        f"{method} {target}",
+                    )
         # And the shapes that reflect caller input back: a validation failure whose detail
         # echoes the rejected body, and the token in a query string, which is the documented
         # operator mistake the access-log filter redacts.
-        bodies.append(probe.post("/v1/assess", headers=AUTH, json={"bad": TEST_TOKEN}).text)
-        bodies.append(probe.get(f"/healthz?token={TEST_TOKEN}").text)
+        record(probe.post("/v1/assess", headers=AUTH, json={"bad": TEST_TOKEN}), "422 assess")
+        record(probe.get(f"/healthz?token={TEST_TOKEN}"), "query string")
+        # EVERY error shape, because the walk above only ever produces 401s and 422s and each of
+        # these is built by a different handler. A header set on one of them would have been
+        # invisible to a walk over the happy and rejected paths alone.
+        record(probe.request("DELETE", "/v1/assess", headers=AUTH), "405")
+        record(probe.get("/nowhere-at-all", headers=AUTH), "404")
+        record(
+            probe.post("/v1/assess", headers=AUTH, content=b"x" * (MAX_BODY_BYTES + 1)),
+            "413",
+        )
+        record(
+            probe.options(
+                "/v1/assess",
+                headers={
+                    "origin": "https://evil.example",
+                    "access-control-request-method": "POST",
+                },
+            ),
+            "cors preflight",
+        )
+        # A SUCCESSFUL privileged call, so a success audit record reaches the stream. The walk
+        # above sends `json={}` everywhere, which is a 422, so only REJECTION lines were ever
+        # greped: `token=config.team_token` in the success audit call wrote the shared credential
+        # into the pod log store on every write with the suite green.
+        created = probe.post("/v1/assess", headers=AUTH, json=FULL_BODY)
+        assert created.status_code == 200, created.text
+        record(created, "assess success")
+        # The store key is `<asset>:<candidate>`, which the response does not echo.
+        key = f"{FULL_BODY['protected_asset_id']}:{FULL_BODY['candidate_id']}"
+        read = probe.get(f"/v1/assessments/{key}", headers=AUTH)
+        assert read.status_code == 200, read.text
+        record(read, "read success")
     leaked = [body for body in bodies if TEST_TOKEN in body]
     assert not leaked, f"a response body carried the team token: {leaked}"
     assert not leaked_headers, f"a response header carried the team token: {leaked_headers}"
     assert TEST_TOKEN not in stream.getvalue(), "the audit log carried the team token"
+    # And the SHAPE of every record, not only the absence of one string. Nothing in this suite
+    # pinned an audit record's key set, so any new field rode along unasserted, and a substring
+    # search cannot see an encoded value.
+    emitted = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+    assert emitted, "the walk produced no audit records at all, so this greps an empty stream"
+    # An unknown KIND is itself a finding, not a record to skip: a new record shape is a new
+    # disclosure channel, and `.get(kind, set())` on a missing key would have waved it through.
+    unknown = sorted({found.get("kind", "<none>") for found in emitted} - set(EXPECTED_AUDIT_KEYS))
+    assert not unknown, f"an audit record kind is not pinned: {unknown}"
+    unexpected = [
+        f"{found['kind']}: {sorted(set(found) - EXPECTED_AUDIT_KEYS[found['kind']])}"
+        for found in emitted
+        if set(found) - EXPECTED_AUDIT_KEYS[found["kind"]]
+    ]
+    assert not unexpected, f"an audit record carries a field no test pins: {unexpected}"
