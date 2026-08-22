@@ -339,8 +339,16 @@ def _first_refused(limiter: RateLimiter, keys: tuple[str, ...]) -> str | None:
     return refused
 
 
-def _raw_target(request: Request) -> bytes:
-    """The request target as the client sent it, in bytes, for the audit `path` field.
+def _raw_path(request: Request) -> bytes:
+    """The raw request PATH off the wire, in bytes, for the audit `path` field.
+
+    The path, NOT the full request target. uvicorn's h11 implementation partitions the target on
+    `?` before the scope is built, so `raw_path` never carries the query string. This function was
+    once named `_raw_target` and its docstring said "as the client sent it": both were false, and
+    the consequence was that `GET /v1/assessments/a:b?x=1` and `?x=2` wrote one identical record.
+    The query is deliberately not recovered, for the reason `audit.py` gives: a query string has
+    carried the team token, and putting it in an audited field would re-open that in the forensic
+    channel. `_had_query` records that one WAS present without recording what it said.
 
     ONE accessor for all five call sites, because five copies of the fallback are five places for
     it to differ, and the fallback is the interesting half.
@@ -349,13 +357,27 @@ def _raw_target(request: Request) -> bytes:
     both set it, and a server that does not leaves the decoded path as the only thing available.
     Falling back to it is a loss of injectivity, not of safety, because `sanitise_log_path` escapes
     whatever it is given; the record is then as good as the decoded path allows and no worse than
-    every version of this field before this one. Encoded UTF-8 so the fallback and the normal path
-    hand the scrub the same type.
+    every version of this field before this one. The `isinstance` check is load-bearing rather than
+    defensive: a `str` reaching the scrub's `f"%{byte:02X}"` is a TypeError, so a server supplying
+    one would turn every audited rejection into a 500. Encoded UTF-8 so the fallback and the normal
+    path hand the scrub the same type.
     """
     raw = request.scope.get("raw_path")
     if isinstance(raw, bytes):
         return raw
     return request.url.path.encode("utf-8", "surrogatepass")
+
+
+def _had_query(request: Request) -> bool:
+    """Whether the request carried a query string, without recording what it carried.
+
+    One bit, and it exists because `raw_path` excludes the query: without it, two requests
+    differing only in their query are indistinguishable in the trail, and an analyst cannot even
+    see that one of them had a query at all. It does NOT restore injectivity, and nothing here
+    claims it does: two DIFFERENT queries still share a record. The value is never logged, because
+    a query string has carried the team token in this application's history.
+    """
+    return bool(request.scope.get("query_string"))
 
 
 def _peer_key(request: Request) -> str:
@@ -413,7 +435,8 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "auth_reject",
-                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_path(request), MAX_LOGGED_PATH),
+                    "had_query": _had_query(request),
                     "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
@@ -438,7 +461,8 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "validation_reject",
-                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_path(request), MAX_LOGGED_PATH),
+                    "had_query": _had_query(request),
                     "errors": [
                         {
                             # SCRUBBED, not merely capped: each part is a caller-supplied field
@@ -498,7 +522,8 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "http_reject",
-                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_path(request), MAX_LOGGED_PATH),
+                    "had_query": _had_query(request),
                     "status": exc.status_code,
                     "reason": str(exc.detail)[:MAX_LOGGED_REASON],
                 },
@@ -523,7 +548,8 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "store_error",
-                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_path(request), MAX_LOGGED_PATH),
+                    "had_query": _had_query(request),
                     "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
@@ -818,7 +844,8 @@ def register_cors(
                 json.dumps(
                     {
                         "kind": "cors_reject",
-                        "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
+                        "path": sanitise_log_path(_raw_path(request), MAX_LOGGED_PATH),
+                        "had_query": _had_query(request),
                         # The ACTUAL reason. This field said origin_allowed=false for every 400
                         # on a preflight, including one raised for the allowed origin by a
                         # different control, so the only record of the event misstated it.

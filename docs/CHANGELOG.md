@@ -968,3 +968,27 @@ Third security review of the audit layer, one major and five minors:
   maximum was 4,696, not 4,402.
 ● Recorded rather than fixed: the actor label and the rejected field name still alias, deliberately,
   because both are read by a human and neither names a route.
+
+Fourth security review of the audit layer, one major and three minors:
+
+● "The request target as bytes off the wire" was FALSE, and a real request found it. uvicorn's h11
+  implementation partitions the target on `?` before the scope exists, so `raw_path` is the raw PATH
+  and never the full target: `GET /v1/assessments/a:b?x=1`, `?x=2` and the bare path wrote one
+  identical record, unauthenticated and well under the cap. The accessor was named `_raw_target`, a
+  control row claimed "two distinct request TARGETS", and the end-to-end test asserted that
+  universal while all eight of its probes differed in the path, so its body could not see it.
+● The query is NOT recovered, deliberately. `audit.py` records that a query string once carried the
+  team token into the pod log store, which is why the access log drops every one; putting it into an
+  audited field would re-open that in the forensic channel. The scope is corrected instead: the
+  accessor is `_raw_path`, the guarantee is over paths rather than targets, the test name says
+  "whose paths differ", and a `had_query` bit records that a query was present without recording
+  what it said. Two different queries still share a record, and the bit does not claim otherwise.
+  The value is asserted absent from the stream.
+● The truncation threshold was in the wrong unit. The escape expands 3:1, so truncation starts at 54
+  raw bytes, not 160. No truncated record can read as a real route, since a truncated one is exactly
+  160 characters and the longest legitimate path is 145.
+● The astral proxy used `any`, which a list index or a numerically named field would satisfy with no
+  astral name present; it asserts the count of five. The fallback test covered the absent-key branch
+  only, and the `isinstance(raw, bytes)` guard is load-bearing rather than defensive: weakening it
+  to `raw is not None` left the whole suite green while a `str` would make every audited rejection a
+  500. Three cases now: absent, `str`, `bytearray`.

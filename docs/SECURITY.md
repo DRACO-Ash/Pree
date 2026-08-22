@@ -145,7 +145,8 @@ the assessment store.
 | Every ENV and ARG name is on an allowlist with a pinned value, so no credential and no platform default can be baked | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | The ENV allowlist cannot admit a platform-injected or credential-shaped name | `Dockerfile` | `test_the_environment_allowlist_cannot_admit_a_platform_or_credential_name` |
 | The suid sweep narrows by nothing and clears both bits, as a property | `Dockerfile` | `test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits` |
-| Two distinct request targets cannot share one audit record, below the truncation cap | `src/pree/security.py` | `test_two_distinct_unauthenticated_requests_cannot_share_one_audit_record`, `test_the_path_scrub_is_injective_over_every_single_byte` |
+| Two request targets whose PATHS differ cannot share one audit record, below the escaped-form cap | `src/pree/security.py` | `test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_record`, `test_the_path_scrub_is_injective_over_every_single_byte` |
+| The query string is excluded from the audit record, and a bit says one was present | `src/pree/app.py` | `test_the_query_string_aliases_and_the_record_says_a_query_was_present` |
 | The audited path keeps its separator and carries no control character | `src/pree/app.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
 | A stage before the shipped one cannot mount over or de-privilege what the suid sweep visits | `Dockerfile` | `test_no_stage_declares_an_instruction_that_undoes_the_hardening` |
 | A refused preflight records whether the ORIGIN was allowed, by value | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
@@ -2063,11 +2064,38 @@ one of them.
   `/v1/assessments/a%2Fb:c` decodes to `/v1/assessments/a/b:c`, which reads as a route of a
   different shape. A comment claimed a literal `%` "can only have arrived as `%25`". False.
 
-**The fix is upstream of all three.** The field now takes `raw_path`, the request target as bytes off
-the wire, and escapes every byte outside a permitted ASCII set. Injective by construction up to the
-truncation cap, with no `.strip()` anywhere in the path, and the honest limit stated: truncation
-cannot be injective. Where an ASGI server omits `raw_path`, one accessor falls back to the decoded
-path, which loses injectivity and not safety, and that branch is exercised.
+**The fix is upstream of all three.** The field now takes `raw_path` and escapes every byte outside a
+permitted ASCII set. Where an ASGI server omits `raw_path`, or supplies it as something other than
+bytes, one accessor falls back to the decoded path, which loses injectivity and not safety; all
+three cases are exercised, and the `isinstance` check is load-bearing rather than defensive, because
+a `str` reaching the scrub's `f"%{byte:02X}"` is a TypeError and therefore a 500 on every audited
+rejection.
+
+**This paragraph said "the request target as bytes off the wire", and that was FALSE.** The next
+review found it with a real request. uvicorn's h11 implementation partitions the target on `?`
+before the scope is built, so `raw_path` is the raw PATH and never the full target, and
+`GET /v1/assessments/a:b?x=1`, `?x=2` and the bare path all wrote one identical record,
+unauthenticated and well under the cap. The accessor was named `_raw_target`, the control row above
+claimed "two distinct request TARGETS", and the end-to-end test asserted the same universal while
+every one of its eight probes differed in the path, so its body could not see what its name claimed.
+That is the defect this range keeps finding, one level up from wherever it last found it.
+
+**The query is not recovered, and that is a decision rather than an omission.** `src/pree/audit.py`
+records why: `GET /diagnostics?x-pree-token=<the real token>` was refused for authentication and then
+written verbatim into the pod log store, the only time this application has held the credential in
+cleartext, which is why the access log drops every query string. Putting the query back into an
+audited field would re-open exactly that in the forensic channel, and that is a worse trade than the
+aliasing. So the scope is corrected instead: the accessor is `_raw_path`, the guarantee is stated over
+paths rather than targets, the test name carries "whose paths differ", and `had_query` records that a
+query was PRESENT without recording what it said. Two different queries still share a record, and
+nothing here claims the bit restores injectivity.
+
+**And the truncation threshold was stated in the wrong unit.** The escape expands 3:1, so truncation
+begins at 54 raw bytes when every byte needs escaping, not at 160: `b"/" + b"\xff" * 53 + b"\x01"`
+and the same with `\x02` produce one record. The claim that "a target shorter than the cap cannot be
+made to read as a different one" was false in wire bytes and is corrected to the escaped form. No
+truncated record can be made to read as a real route, because a truncated one is exactly 160
+characters and the longest legitimate path is 145.
 
 **One thing the canaries found in my own fix, worth stating because it is the same defect one level
 up.** A test I wrote was named `..._never_deletes_and_never_strips`, and reintroducing a `.strip()`

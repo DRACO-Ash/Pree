@@ -99,16 +99,27 @@ def sanitise_actor(value: str | None) -> str:
 #
 # Every one of those is an unauthenticated caller putting a route they never requested into the
 # audit trail, which is the one thing this field exists to get right. Taking `raw_path` removes the
-# whole class rather than the instance: the wire bytes are what the client asked for, and escaping
-# every byte outside the permitted set is injective by construction, so distinct requests cannot
-# share a record. There is no `.strip()` here, deliberately.
+# whole class rather than the instance: the wire bytes are the PATH the client asked for, and
+# escaping every byte outside the permitted set is injective by construction, so two requests whose
+# PATHS differ cannot share a record. There is no `.strip()` here, deliberately.
+#
+# Two requests differing only in their QUERY STRING do share one record, and that is deliberate.
+# uvicorn's h11 implementation partitions the target on `?` before it ever reaches the scope, so
+# `raw_path` is the path and never the full target; a comment here once said "the request target as
+# the client sent it", and that was false. The query is not recovered, because `audit.py` records
+# why: `GET /diagnostics?x-pree-token=<the real token>` was refused for authentication and then
+# written verbatim into the pod log store, the one channel in this application that ever held the
+# credential in cleartext. Putting the query back into an audited field would re-open that in the
+# forensic channel, which is a worse trade than the aliasing. The distinction that IS recoverable
+# without the value - whether a query was present at all - is recorded as a boolean beside the
+# path. Two DIFFERENT queries still share a record; the boolean does not claim otherwise.
 _PERMITTED_PATH_BYTES = frozenset(
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./@:-"
 )
 
 
 def sanitise_log_path(raw_path: bytes, limit: int) -> str:
-    """Escape the raw request target to ASCII, at the path's own length bound.
+    """Escape the raw request PATH to ASCII, at the path's own length bound.
 
     `%` is deliberately NOT permitted, so it appears in the output only as an escape introducer and
     the mapping stays unambiguous: a literal `%` on the wire is written `%25`.
@@ -118,11 +129,13 @@ def sanitise_log_path(raw_path: bytes, limit: int) -> str:
     capping a path at the actor's 64 would truncate a real key out of every rejection record and
     destroy the diagnosis those records exist to give.
 
-    Injective UP TO the cap, and only up to it. Truncation cannot be injective, and pretending
-    otherwise would be the same class of claim this function exists to correct: two targets
-    agreeing on their first `limit` characters after escaping still produce one record. What this
-    buys is that a target SHORTER than the cap cannot be made to read as a different one, which is
-    the case an unauthenticated caller controls.
+    Injective in the ESCAPED form up to `limit` characters, and the unit matters, because the
+    escape expands 3:1. Truncation begins at 54 raw bytes when every byte needs escaping, not at
+    160: `b"/" + b"\xff" * 53 + b"\x01"` and the same with `\x02` produce one record, and an
+    earlier version of this docstring said "a target SHORTER than the cap cannot be made to read as
+    a different one", which is false in wire bytes. No truncated record can be made to read as a
+    real route, because a truncated one is exactly `limit` characters and the longest legitimate
+    path is 145, so the forgery this function exists to stop stays stopped either way.
     """
     escaped = "".join(
         chr(byte) if byte in _PERMITTED_PATH_BYTES else f"%{byte:02X}" for byte in raw_path

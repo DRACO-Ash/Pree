@@ -447,9 +447,16 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
         # declared-field errors before extras, which is stable under the hash-locked pin today
         # and could move under a bump, silently re-opening the hole this test exists to close.
         # A single scrubbed astral name is one digit, the index that survives the scrub.
-        assert any(part.isdigit() for item in record["errors"] for part in item["loc"]), (
-            f"no astral field name reached the logged window, so the charset assertion below "
-            f"asserts nothing: {[item['loc'] for item in record['errors']]}"
+        # The COUNT, not `any`. A digit-only `loc` part is a scrubbed astral name today, and there
+        # are five of them by construction of the payload, but a list index or a numerically named
+        # field added later would satisfy `any` with no astral name present and silently restore
+        # the vacuity this assertion closes. Five is the number sent, so the assertion moves only
+        # when the payload does.
+        digits = sum(1 for item in record["errors"] for part in item["loc"] if part.isdigit())
+        assert digits == 5, (
+            f"expected the five scrubbed astral names in the logged window, found {digits}; the "
+            f"charset assertion below is vacuous without them: "
+            f"{[item['loc'] for item in record['errors']]}"
         )
         for item in record["errors"]:
             for part in item["loc"]:
@@ -464,7 +471,7 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
                 )
 
 
-def test_two_distinct_unauthenticated_requests_cannot_share_one_audit_record(
+def test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_record(
     tmp_path: Path,
 ) -> None:
     """END TO END, because the unit property held while the application still aliased.
@@ -475,6 +482,12 @@ def test_two_distinct_unauthenticated_requests_cannot_share_one_audit_record(
     `GET /v1/assessments/a:b`, and `GET /v1/%assess` shared a record with `GET /v1/%25assess`, both
     unauthenticated and needing no token. This drives real requests through the real handler and
     compares the records, which is the only version of the assertion the call site cannot escape.
+
+    "WHOSE PATHS DIFFER" is in the name because the previous name asserted a universal that a real
+    request defeats. uvicorn partitions the target on `?` before the scope exists, so `raw_path`
+    carries no query string and `?x=1` and `?x=2` share a record. Every probe here differed in its
+    path, so the body could not see it: the name claimed what the body did not check, which is the
+    defect this file keeps finding one level up from wherever it last found it.
     """
     stream = io.StringIO()
     logger = build_logger(stream)
@@ -500,48 +513,104 @@ def test_two_distinct_unauthenticated_requests_cannot_share_one_audit_record(
         f"expected one audited record per request, got {len(logged)}: {logged}"
     )
     assert len(set(logged)) == len(targets), (
-        f"two distinct requests produced one audit record, so an unauthenticated caller can put a "
-        f"route they never requested into the trail: "
+        f"two requests with distinct paths produced one audit record, so an unauthenticated caller "
+        f"can put a route they never requested into the trail: "
         f"{sorted({path for path in logged if logged.count(path) > 1})}"
     )
     for path in logged:
         assert path.isascii() and path.isprintable(), f"the logged path is not ASCII: {path!r}"
 
 
-def test_the_audited_path_falls_back_when_the_server_supplies_no_raw_target(
+def test_the_query_string_aliases_and_the_record_says_a_query_was_present(
     tmp_path: Path,
 ) -> None:
-    """`raw_path` is an ASGI extension, not a guaranteed key, so the fallback is reachable code.
+    """The ACCEPTED limit, asserted so it cannot be rediscovered as a surprise or overclaimed.
+
+    `raw_path` excludes the query string, so `?x=1` and `?x=2` genuinely share one `path` value.
+    The query is not recovered on purpose: `audit.py` records that
+    `GET /diagnostics?x-pree-token=<the real token>` was refused for authentication and then
+    written verbatim into the pod log store, which is the only time this application held the
+    credential in cleartext. Re-adding the query to an audited field would put that back in the
+    forensic channel.
+
+    What IS recorded is one bit: a query was present. This asserts both halves - that the aliasing
+    is real, and that the bit distinguishes the query-bearing request from the bare one - so
+    nobody reads the boolean as a claim that injectivity was restored. It was not.
+    """
+    stream = io.StringIO()
+    logger = build_logger(stream)
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
+        for target in ("/v1/assessments/a:b?x=1", "/v1/assessments/a:b?x=2", "/v1/assessments/a:b"):
+            assert bounded.get(target, headers={"x-pree-token": "wrong"}).status_code == 401
+
+    records = [
+        json.loads(line) for line in stream.getvalue().splitlines() if '"auth_reject"' in line
+    ]
+    assert len(records) == 3, f"expected three audited rejections, got {len(records)}"
+    assert {record["path"] for record in records} == {"/v1/assessments/a:b"}, (
+        f"the query string reached the audited path field, where a team token has been seen "
+        f"before: {[record['path'] for record in records]}"
+    )
+    assert [record["had_query"] for record in records] == [True, True, False], (
+        f"the had_query bit does not distinguish a query-bearing request from a bare one: "
+        f"{[record['had_query'] for record in records]}"
+    )
+    # And the VALUE never appears anywhere in the stream, which is the whole reason it is a bit.
+    assert "x=1" not in stream.getvalue() and "x=2" not in stream.getvalue(), (
+        "a query string value reached the audit stream"
+    )
+
+
+@pytest.mark.parametrize("supplied", [None, "str", "bytearray"])
+def test_the_audited_path_falls_back_when_no_usable_raw_path_is_supplied(
+    tmp_path: Path, supplied: str | None
+) -> None:
+    """`raw_path` is an ASGI extension, not a guaranteed key, and not a guaranteed TYPE either.
 
     Asserted rather than assumed, because an unexercised fallback is where a crash waits: an
     accessor that raises on a missing key would turn every audited rejection into a 500 under a
     server that omits it. What the fallback loses is injectivity, not safety, and it is no worse
-    than every version of this field before the raw target was used.
+    than every version of this field before the raw path was used.
+
+    THREE cases, because the first version of this test popped the key and nothing else, so it
+    covered one of the accessor's two guards. The `isinstance(raw, bytes)` check is load-bearing
+    and not defensive: a `str` reaching the scrub's `f"%{byte:02X}"` is a TypeError, so a server
+    supplying one would turn every audited rejection into a 500, and weakening the check to
+    `raw is not None` left the whole suite green. A `bytearray` is the same shape of surprise from
+    the other direction: it iterates to ints and would work, but it is not what the guard admits,
+    so pinning the behaviour stops the guard being loosened to "anything iterable".
     """
     stream = io.StringIO()
     logger = build_logger(stream)
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
 
-    class _StripRawPath:
+    class _ReplaceRawPath:
         def __init__(self, app: Any) -> None:
             self._app = app
 
         async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
             if scope["type"] == "http":
-                scope.pop("raw_path", None)
+                if supplied is None:
+                    scope.pop("raw_path", None)
+                elif supplied == "str":
+                    scope["raw_path"] = scope["path"]
+                else:
+                    scope["raw_path"] = bytearray(scope["path"].encode())
             await self._app(scope, receive, send)
 
     store = JsonStore(config.data_dir)
     store.seed()
     app = create_app(config, store, logger=logger, prober=StorageProber(cache_seconds=0.0))
-    with TestClient(_StripRawPath(app)) as stripped:
+    with TestClient(_ReplaceRawPath(app)) as stripped:
         refused = stripped.get("/diagnostics", headers={"x-pree-token": "wrong"})
         assert refused.status_code == 401, refused.text
 
     records = [json.loads(line) for line in stream.getvalue().splitlines() if '"path"' in line]
-    assert records, "the rejection was not audited when raw_path was absent"
+    assert records, f"the rejection was not audited with raw_path as {supplied}"
     assert records[0]["path"] == "/diagnostics", (
-        f"the fallback did not name the decoded path: {records[0]['path']!r}"
+        f"the fallback did not name the decoded path with raw_path as {supplied}: "
+        f"{records[0]['path']!r}"
     )
 
 
@@ -2529,7 +2598,12 @@ _LOG_PART_SCRUBBED = _ScrubIdempotent(sanitise_log_part, "sanitise_log_part")
 # The BOOLEAN audit fields. A bool carries one bit, which is a covert channel across enough
 # records, and the value scan returned early on every one of them. Naming them is the floor; the
 # handler-level test asserts what each one actually reports.
-AUDIT_BOOLEAN_FIELDS = frozenset({"origin_allowed"})
+# `had_query` joins `origin_allowed`, and it needs the same two-token treatment for the same
+# reason: a boolean is a one-bit channel per record and the value scan cannot see inside one, so a
+# pinned NAME with an unpinned value shipped a token bit per refused preflight once already. It is
+# asserted in both directions on every kind that emits it, and the two-token axis is what makes
+# that a class check rather than a member check.
+AUDIT_BOOLEAN_FIELDS = frozenset({"origin_allowed", "had_query"})
 
 AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     "kind": _OneOf(
@@ -2620,15 +2694,15 @@ EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
         "confidence",
         "evidence_coverage",
     },
-    "auth_reject": {"kind", "path", "reason"},
-    "validation_reject": {"kind", "path", "error_count", "errors"},
-    "http_reject": {"kind", "path", "reason", "status"},
+    "auth_reject": {"kind", "path", "had_query", "reason"},
+    "validation_reject": {"kind", "path", "had_query", "error_count", "errors"},
+    "http_reject": {"kind", "path", "had_query", "reason", "status"},
     # NO "reason". The CORS handler emits kind, path and origin_allowed only, so a pinned name that
     # is never produced is not a pin: it is a standing exemption, and `reason` permits 512
     # printable characters on a record any unauthenticated caller triggers with one refused
     # preflight. Measured: base64 of the team token in that field, the whole suite green.
-    "cors_reject": {"kind", "path", "origin_allowed"},
-    "store_error": {"kind", "path", "reason"},
+    "cors_reject": {"kind", "path", "had_query", "origin_allowed"},
+    "store_error": {"kind", "path", "had_query", "reason"},
 }
 
 
