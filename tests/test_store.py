@@ -15,6 +15,8 @@ from typing import Any
 import pytest
 
 from pree import store as store_module
+from pree.api_models import AssessResponse, ContributionOut
+from pree.scoring import ThreatIndicators, assess
 from pree.store import (
     SCHEMA_VERSION,
     JsonStore,
@@ -532,6 +534,60 @@ def test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing(tmp_path: Pa
         JsonStore(data_dir).read()
 
 
+def _measure_max_record_bytes(samples: int = 40) -> int:
+    """The marginal snapshot cost of the largest record THIS APP CAN PRODUCE.
+
+    Built from the real scoring path, not invented. The first version of this helper made up a
+    record with eight 40-character indicator names and measured 2,354 bytes, which is the
+    largest record the STORE could hold and not one the scorer will ever write. That is the
+    wrong bound: it would have forced the sheet to publish a figure 38% above anything real.
+
+    Maximum here means every field the app controls at its limit: 64-character identifiers, a
+    64-character actor, and every indicator supplied so no contribution is dropped from the
+    weighting and the missing-indicator list stays empty.
+    """
+    result = assess(
+        ThreatIndicators(
+            closest_approach_km=0.5,
+            relative_velocity_kms=0.05,
+            manoeuvres_in_window=12,
+            baseline_manoeuvres=1.0,
+            photometric_sigma=4.5,
+            rf_emissions_detected=True,
+        )
+    )
+    record = AssessResponse(
+        protected_asset_id="a" * 64,
+        candidate_id="b" * 64,
+        score=result.score,
+        confidence=str(result.confidence),
+        evidence_coverage=result.evidence_coverage,
+        missing_indicators=result.missing_indicators,
+        contributions=[
+            ContributionOut(
+                indicator=c.indicator,
+                weight=c.weight,
+                normalised=c.normalised,
+                rationale=c.rationale,
+            )
+            for c in result.contributions
+        ],
+        schema_version=store_module.SCHEMA_VERSION,
+    ).model_dump()
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        store = JsonStore(root)
+        store.seed()
+        snapshot = root / "assessments.json"
+        before = snapshot.stat().st_size
+        for index in range(samples):
+            store.upsert(f"{'a' * 60}{index:04d}:{'b' * 64}", record)
+        after = snapshot.stat().st_size
+    # Round up, so the published figure can never be a fraction of a byte under the real cost.
+    return -(-(after - before) // samples)
+
+
 def test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget() -> None:
     """Every other cap test monkeypatches the constant, so the SHIPPED value was unpinned.
 
@@ -556,12 +612,16 @@ def test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget() -> 
     # planning number, which was a best case presented as a worst case and understated the
     # volume by a third. The snapshot is rewritten whole on every upsert and a backup sits
     # beside it, so the directory holds up to three copies at the moment of a write.
-    measured_bytes_per_record = 1705
+    # MEASURED here, not asserted equal to itself. The previous version compared a hardcoded
+    # 1705 against the same 1705 in the sheet, so the comment claimed a measurement the test
+    # never took and any schema growth would leave the sheet, the test and the volume request
+    # agreeing while all three understated reality.
+    measured_bytes_per_record = _measure_max_record_bytes()
     stated_size = re.search(r"\*\*(\d+) bytes\*\* for a maximum-length", sheet)
     assert stated_size is not None, "the sheet publishes no maximum-length per-record figure"
-    assert int(stated_size.group(1)) == measured_bytes_per_record, (
-        f"the sheet publishes {stated_size.group(1)} bytes per maximum-length record; this "
-        f"test was calibrated against {measured_bytes_per_record}"
+    assert int(stated_size.group(1)) >= measured_bytes_per_record, (
+        f"a maximum-length record costs {measured_bytes_per_record} bytes on this build, above "
+        f"the {stated_size.group(1)} the sheet publishes for planning"
     )
     requested = re.search(r"volume of at least\s+\*\*(\d+) MiB\*\*", sheet)
     assert requested is not None, "the sheet requests no volume size, so no cap can be checked"

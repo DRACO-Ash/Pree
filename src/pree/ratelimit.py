@@ -100,7 +100,20 @@ class RateLimiter:
             return self._evict_if_needed(now, key)
 
     def retry_after_seconds(self, key: str) -> int:
-        """Seconds until the oldest hit in the window expires, for the Retry-After header."""
+        """Seconds until the oldest hit in the window expires, for the Retry-After header.
+
+        Under the same lock as `allow`. This is called from the thread pool immediately after
+        `allow` returns False, on the same key, and it reads the same shared deque: between the
+        emptiness test and `bucket[0]` another thread's prune could empty it, giving IndexError
+        where a 429 with a Retry-After belongs. I could not reproduce it (8 threads, 160,000
+        calls: zero exceptions) because it needs a whole window to elapse inside a two-bytecode
+        gap, but it is the same class as the bug fixed one function above, and "I could not hit
+        it" is not a reason to leave a read-modify-write unguarded.
+        """
+        with self._guard:
+            return self._retry_after_locked(key)
+
+    def _retry_after_locked(self, key: str) -> int:
         bucket = self._hits.get(key)
         if not bucket:
             # A refused key whose bucket was evicted by the fail-closed branch has no history,

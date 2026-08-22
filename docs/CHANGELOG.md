@@ -297,3 +297,25 @@ Twelfth security review, four majors, one of them in the application:
   archive, which has no `.git`, so the behavioural ignore-rule guard failed there. It now skips
   where nothing can be committed, and no longer asserts a belief about the runner that the
   simulation itself disproves.
+
+Thirteenth security review, two majors, the first defeated live against a running server:
+
+● **Both rate-limit tiers were bypassable with a caller-chosen `X-Forwarded-For`.** uvicorn
+  installs its proxy-header middleware unconditionally and gunicorn's trust list defaults to
+  loopback plus `FORWARDED_ALLOW_IPS`, so the peer address both tiers key on was replaced before
+  the app ran. Measured: 300 requests with a rotating header all admitted where 60 are refused
+  once pinned, and 60 of 60 writes accepted against a limit of 20. The launch command now pins
+  `--forwarded-allow-ips=255.255.255.255`, and an explicit flag beats the environment default,
+  so `FORWARDED_ALLOW_IPS=*` cannot reopen it. Accepted risk 4 claimed no forwarded header was
+  trusted; that was false as shipped and is corrected in place rather than quietly edited.
+● The suid sweep guard was a denylist against `find`'s open-ended predicate grammar, and four
+  more neutering forms passed it. The command is now asserted literally.
+● Nothing tied the access-log filter to the app: removing the factory's call left the suite
+  green. The filter also did not bound the mapping shape gunicorn's own access logger emits,
+  measured at 15,056 bytes untruncated.
+● `retry_after_seconds` read the shared deque outside the lock added one function above it.
+● The error handler returned a JSON body for statuses that must not carry one.
+● Five more credential-shaped paths shipped: the word list had `passwd` but not `password`, and
+  `key` only as a dotted extension.
+● The store's per-record figure was asserted equal to itself. The test now measures the largest
+  record the scorer can emit and requires the published figure to be at least that.

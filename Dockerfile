@@ -64,4 +64,21 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["/opt/venv/bin/python", "-c", "import os,sys,urllib.request;p=os.environ.get('PORT','8080');sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz/storage',timeout=3).status==200 else 1)"]
 # No ENV PORT and no ENV PREE_DATA_DIR anywhere in this file. The platform injects both and an
 # image-level default would beat the code fallback chain. exec so SIGTERM reaches gunicorn.
-CMD ["sh","-c","exec gunicorn 'pree.main:build()' --pythonpath /app/src -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8080} --workers 2 --timeout 60 --access-logfile - --error-logfile -"]
+#
+# --forwarded-allow-ips is pinned to 255.255.255.255, the limited broadcast address, which can
+# never be the source of a TCP connection. gunicorn validates the value as an IP or network, so
+# a non-IP sentinel refuses to start; an empty value also works but reads as "unset". uvicorn
+# installs ProxyHeadersMiddleware unconditionally and gunicorn's default trust list is
+# os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1,::1"), so as shipped the middleware rewrote
+# scope["client"] from a caller-supplied X-Forwarded-For before the app ran. Both rate-limit
+# tiers key on that value: measured against the running server, 400 requests with a rotating
+# header were all admitted where 240 admitted and 160 refused with a fixed one, and 60 of 60
+# writes to /v1/assess were accepted where 20 should have been. A sidecar ingress forwarding
+# over loopback is trusted by that default, and FORWARDED_ALLOW_IPS=* is a common platform
+# value, so the environment alone could turn the limiter off. An explicit flag beats the
+# environment default, so the trust list cannot be widened from outside the image.
+#
+# If operations later needs real client addresses, the correct change is to set this to the
+# ingress address specifically. Do not set it to "*": that trusts every peer and hands the
+# limiter's key space to the caller.
+CMD ["sh","-c","exec gunicorn 'pree.main:build()' --pythonpath /app/src -k uvicorn.workers.UvicornWorker -b 0.0.0.0:${PORT:-8080} --workers 2 --timeout 60 --forwarded-allow-ips=255.255.255.255 --access-logfile - --error-logfile -"]

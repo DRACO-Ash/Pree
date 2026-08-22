@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from pree.app import (
@@ -366,6 +367,31 @@ def test_every_rejection_uses_one_error_contract_and_is_audited(tmp_path: Path) 
     assert len(audited) == 2, f"expected one audit line per rejection, got {audited}"
 
 
+def test_a_bodiless_status_stays_bodiless(tmp_path: Path) -> None:
+    """204 and 304 carry no body, and h11 refuses a Content-Length on them.
+
+    Nothing in the app raises those as exceptions today, so returning JSON for one was a trap
+    set for the next handler rather than a live fault: the intended status would have become a
+    500. Asserted by raising one directly, because a control with no test is a claim.
+    """
+    config = make_config(tmp_path)
+    logger = build_logger(io.StringIO())
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    app = create_app(config, store, logger=logger, prober=StorageProber(cache_seconds=0.0))
+
+    @app.get("/test-only/no-content")
+    async def _no_content() -> None:
+        raise HTTPException(status_code=204)
+
+    with TestClient(app) as client:
+        response = client.get("/test-only/no-content", headers=AUTH)
+
+    assert response.status_code == 204
+    assert response.content == b"", f"a 204 carried a body: {response.content!r}"
+    assert "content-length" not in response.headers
+
+
 def test_both_rate_limit_tiers_answer_identically_and_keep_retry_after(tmp_path: Path) -> None:
     """The fine tier raised an HTTPException and the coarse tier built a response by hand."""
     config = make_config(tmp_path)
@@ -382,6 +408,31 @@ def test_both_rate_limit_tiers_answer_identically_and_keep_retry_after(tmp_path:
         assert refused.status_code == 429, kwargs
         assert refused.json() == {"error": "rate limited"}, (kwargs, refused.text)
         assert int(refused.headers["retry-after"]) >= 1, kwargs
+
+
+def test_the_factory_installs_the_access_log_filter(tmp_path: Path) -> None:
+    """Tie the filter to the app, not just to itself.
+
+    The three filter tests each called `bound_access_log()` first, so they verified the filter
+    and never the wiring: replacing the factory's call with `pass` left all 250 tests green.
+    That is the same "asserted to exist, never joined to what ships" shape as the suid sweep two
+    rounds ago, and the hole it leaves is a 620 MB-a-minute access log.
+    """
+    access = logging.getLogger("uvicorn.access")
+    gunicorn_access = logging.getLogger("gunicorn.access")
+    access.filters = []
+    gunicorn_access.filters = []
+
+    build_client(
+        make_config(tmp_path), build_logger(io.StringIO()), StorageProber(cache_seconds=0.0)
+    )
+
+    for logger in (access, gunicorn_access):
+        installed = [f for f in logger.filters if type(f).__name__ == "_TruncateRequestPath"]
+        assert len(installed) == 1, (
+            f"building the app left {len(installed)} truncating filters on {logger.name}; the "
+            "access log is unbounded in every worker that imports the factory"
+        )
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:

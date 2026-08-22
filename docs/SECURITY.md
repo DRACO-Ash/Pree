@@ -72,12 +72,17 @@ the assessment store.
 | Every hardening step runs in the stage that actually ships | `Dockerfile` | `test_every_hardening_step_runs_in_the_stage_that_actually_ships` |
 | The shipped collection cap matches the sheet and the volume | `src/pree/store.py` | `test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget` |
 | The access log cannot be sized by an unauthenticated caller | `src/pree/audit.py` | `test_the_access_log_filter_bounds_the_request_line` |
-| The suid sweep covers the whole filesystem, unnarrowed | `Dockerfile` | `test_the_suid_sweep_actually_sweeps_the_whole_filesystem` |
+| The suid sweep is exactly the vetted command | `Dockerfile` | `test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit` |
+| No forwarded header can rewrite the rate-limit key | `Dockerfile` | `test_the_launch_command_refuses_to_trust_a_forwarded_client_address` |
 | The pip removal targets the venv the build creates | `Dockerfile` | `test_the_pip_removal_targets_the_venv_the_build_actually_creates` |
 | The runtime user is created unprivileged | `Dockerfile` | `test_the_numeric_user_is_created_unprivileged` |
 | Every rejection uses one error contract and is audited | `src/pree/app.py` | `test_every_rejection_uses_one_error_contract_and_is_audited` |
 | Both rate-limit tiers answer identically and keep Retry-After | `src/pree/app.py` | `test_both_rate_limit_tiers_answer_identically_and_keep_retry_after` |
 | The limiter never turns a 429 into a 500 under concurrency | `src/pree/ratelimit.py` | `test_concurrent_callers_never_turn_a_429_into_a_500` |
+| The access-log filter is installed by the factory, not by its own test | `src/pree/app.py` | `test_the_factory_installs_the_access_log_filter` |
+| The access log is bounded in the mapping shape gunicorn emits | `src/pree/audit.py` | `test_the_access_log_filter_bounds_the_mapping_shape_gunicorn_emits` |
+| Retry-After is read under the same lock as the count | `src/pree/ratelimit.py` | `test_the_retry_after_read_happens_under_the_same_lock_as_the_count` |
+| A bodiless status never carries a body | `src/pree/app.py` | `test_a_bodiless_status_stays_bodiless` |
 
 ## Deliberately accepted risks
 
@@ -105,6 +110,20 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    address, so they share a bucket. Accepted for a single watch floor. Third, no forwarded
    header is trusted, because the proxy chain is not verified; keying on a spoofable header
    would be worse than sharing a bucket.
+
+   That third sentence was FALSE as shipped for two rounds, and it is worth saying so rather
+   than editing it quietly. uvicorn installs its proxy-header middleware unconditionally and
+   gunicorn's trust list defaults to loopback plus whatever `FORWARDED_ALLOW_IPS` holds, so the
+   peer address the limiter keys on was being replaced by a caller-supplied `X-Forwarded-For`
+   before the application ran. Measured against the running server: 300 requests with a
+   rotating header were all admitted, where 60 are refused once the trust list is pinned, and
+   60 of 60 writes to `/v1/assess` were accepted where 20 is the limit. A sidecar ingress
+   forwarding over loopback is trusted by that default, and `FORWARDED_ALLOW_IPS=*` is a common
+   platform value, so the environment alone could have turned both tiers off. The launch command
+   now pins `--forwarded-allow-ips=255.255.255.255`, the limited broadcast address, which can
+   never be the source of a TCP connection; an explicit flag beats the environment default, so
+   this cannot be widened from outside the image. If operations later needs real client
+   addresses, set it to the ingress address specifically, never to `*`.
 5. **Scoring weights and thresholds are operational judgements, not calibrated constants.** Each
    is named and documented at its definition in `src/pree/scoring.py`. They are a starting point
    for the watch floor to tune against real outcomes, and they are stated as such rather than
@@ -375,6 +394,56 @@ unreachable statements in the new access-log filter, and the reason was that `lo
 string. The filter's guard tested the type and not the emptiness, so the pre-formatted branch
 could never run, and gunicorn's own access logger formats its line before logging it. A
 coverage figure is not a test, and this is the case for reading it anyway.
+
+Thirteenth review: two majors, and the first was defeated live against a running server rather
+than reasoned about, which is why it is the most serious finding in this project's history.
+
+Both rate-limit tiers key on the peer address, and the peer address was caller-controlled.
+uvicorn installs ProxyHeadersMiddleware unconditionally; gunicorn's trust list defaults to
+loopback plus whatever `FORWARDED_ALLOW_IPS` holds; and the middleware rewrites the client
+address before the application sees the request, so nothing in the application could tell. 300
+requests with a rotating `X-Forwarded-For` were all admitted where 60 should have been refused,
+and 60 of 60 writes to the scoring path were accepted against a limit of 20. Accepted risk 4
+asserted that no forwarded header was trusted; it was false as shipped, and it stayed false for
+two rounds while three separate reviews looked at the limiter. The fix is in the launch command,
+because the application cannot recover a peer address that was overwritten above it: the trust
+list is pinned to the limited broadcast address, an explicit flag beats the environment default,
+and a test asserts the flag on the resolved CMD. Verified the same way it was broken, under the
+real launch command, including with `FORWARDED_ALLOW_IPS=*` set: 0 of 300 refused before, 60 of
+300 after, and the environment variable could not reopen it.
+
+The second major was the sweep guard, for the third round running. It refused eight neutering
+tokens and the reviewer found four more, each leaving every test green while the sweep cleared
+nothing: `-not -perm /6000`, `-newer /etc/hostname`, `-regex ".*/no-match"` and `-uid 4242`, two
+of them confirmed against a real fixture carrying 4755 and 2755 files. `find`'s predicate
+grammar is open-ended, so a denylist was always going to lose. The command is now asserted
+literally, as an allowlist of one, and changing the sweep means changing the literal too.
+
+Six minors. Nothing tied the access-log filter to the app, so replacing the factory's call with
+`pass` left the whole suite green, which is the same shape as the sweep defect a round earlier.
+The filter did not bound the record shape gunicorn's own access logger actually emits, a format
+string plus a mapping, measured at 15,056 bytes untruncated, while a docstring of mine claimed
+both shapes were covered. `retry_after_seconds` read the shared deque outside the lock added one
+function above it. The handler returned a JSON body for statuses that must not carry one. The
+packaging word list had "passwd" but not "password" and "key" only as a dotted extension, so
+five more credential-shaped paths shipped. And the store's per-record figure was asserted equal
+to itself: the comment said "measured through the real scoring path" and the test measured
+nothing, so any schema growth would have left the sheet, the test and the volume request
+agreeing while all three understated reality. It now measures, and asserts the published figure
+is never below the measured one.
+
+Two of my own guard fixes this round were wrong before they were right, and both are recorded
+because the pattern matters more than the individual errors. The token-floor guard was rewritten
+to check every integer in a line mentioning the token, on the reviewer's own suggestion, and
+that read a seventy-row control table as a single claim and produced pages of noise: a guard
+that cries wolf gets relaxed, so it is worse than the hole it closes. It now bounds a unit to a
+line or a pair of adjacent table rows and allows up to two words between the figure and the size
+word, which catches all eighteen fabrications tried against it. The exemption list that came
+with it was itself the hole in the next attempt: 20 is the per-actor rate limit and also a
+plausible wrong floor, so exempting it admitted "no fewer than twenty printable characters". The
+list is gone rather than trimmed. And the first measurement helper for the per-record figure
+invented a record larger than the scorer can emit, 2,354 bytes against a real maximum of 1,679,
+which would have forced the sheet to publish a number 38% above anything real.
 
 Each of these now has a named regression test in the control table above.
 

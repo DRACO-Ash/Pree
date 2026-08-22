@@ -8,6 +8,7 @@ the platform runner that gates the deploy, because the platform commits its own 
 from __future__ import annotations
 
 import importlib
+import itertools
 import os
 import re
 import shutil
@@ -236,6 +237,13 @@ def test_no_stage_bakes_the_port_or_the_data_directory() -> None:
     assert not baked, f"platform-injected values baked into the image: {baked}"
 
 
+def _resolved_launch_command() -> str:
+    """The single CMD of the shipped stage, as docker would resolve it."""
+    commands = [i.argument for i in _final_stage() if i.keyword == "CMD"]
+    assert len(commands) == 1, f"expected exactly one CMD in the final stage, found {commands}"
+    return commands[0]
+
+
 def test_the_effective_launch_command_binds_every_interface_and_execs() -> None:
     """Asserted on the resolved CMD, not on the file.
 
@@ -251,9 +259,7 @@ def test_the_effective_launch_command_binds_every_interface_and_execs() -> None:
     assert not [i for i in _instructions() if i.keyword == "ONBUILD"], (
         "ONBUILD defers an instruction to a downstream build, where none of these assertions apply"
     )
-    commands = [i.argument for i in final if i.keyword == "CMD"]
-    assert len(commands) == 1, f"expected exactly one CMD in the final stage, found {commands}"
-    command = commands[0]
+    command = _resolved_launch_command()
     assert "0.0.0.0:" in command, f"the launch command does not bind every interface: {command}"
     assert "127.0.0.1" not in command, f"the launch command binds loopback: {command}"
     assert "exec gunicorn" in command, (
@@ -310,30 +316,56 @@ def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
     assert not misplaced, misplaced
 
 
-def test_the_suid_sweep_actually_sweeps_the_whole_filesystem() -> None:
-    """Being in the right stage says nothing about what the command does.
+SUID_SWEEP = "find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec chmod a-s {} +"
 
-    Presence was asserted by the substring `-perm /6000` alone, so three one-token mutations
-    each left the suite green while every setuid binary the base image carries shipped:
-    `find /app` scoped the search to a subtree with no setuid bits, a leading `-false`
-    short-circuited the predicate, and a trailing `|| true` tolerated a sweep that failed. With
-    no docker daemon in the loop this text is the ONLY verification of a hard rule, so the
-    resolved command is checked rather than a fragment of it.
+
+def test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit() -> None:
+    """An ALLOWLIST of one. `find`'s predicate grammar is open-ended, so a denylist loses.
+
+    The previous version refused eight neutering tokens and the reviewer found four more that
+    each left every boot-contract test green while the sweep cleared nothing: `-not -perm /6000`
+    (always false), `-newer /etc/hostname`, `-regex ".*/no-match"` and `-uid 4242`. Two of those
+    were confirmed against a real fixture carrying 4755 and 2755 files: the bits survived, where
+    the shipped command clears them. Chasing predicates is unwinnable, and with no docker daemon
+    in the loop this text is the ONLY verification of a hard rule, so the command must be the
+    command. Changing the sweep now means changing this literal too, deliberately.
     """
     sweep = next(i for i in _instructions() if "-perm /6000" in i.argument)
-    command = " ".join(sweep.argument.split())
-    assert command.startswith("find / -xdev -perm /6000 "), (
-        f"the sweep does not start at the filesystem root with -xdev: {command!r}"
+    assert " ".join(sweep.argument.split()) == SUID_SWEEP, (
+        f"the sweep is not the exact vetted command.\n  shipped: {sweep.argument}\n  vetted:  "
+        f"{SUID_SWEEP}"
     )
-    assert command.endswith("-exec chmod a-s {} +"), (
-        f"the sweep does not clear the bits it finds: {command!r}"
+    # And exactly one of them, so a second, narrower find cannot sit beside it.
+    sweeps = [i for i in _instructions() if "-perm /6000" in i.argument]
+    assert len(sweeps) == 1, f"{len(sweeps)} instructions mention the suid mask; expected one"
+
+
+def test_the_launch_command_refuses_to_trust_a_forwarded_client_address() -> None:
+    """Both rate-limit tiers key on scope["client"], which a proxy header can rewrite.
+
+    uvicorn installs ProxyHeadersMiddleware unconditionally and gunicorn's default trust list
+    is os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1,::1"), so as shipped the middleware
+    replaced the peer address with a caller-supplied X-Forwarded-For before the app ran.
+    Measured against the running server: 0 of 300 requests refused with a rotating header,
+    against 60 of 300 refused once the flag is pinned, and FORWARDED_ALLOW_IPS="*" in the
+    environment could not reopen it because an explicit flag beats the environment default.
+
+    255.255.255.255 is the limited broadcast address and can never be the source of a TCP
+    connection. It is asserted rather than merely present because "*" in this flag hands the
+    limiter's whole key space to the caller.
+    """
+    command = _resolved_launch_command()
+    flags = [part for part in command.split() if part.startswith("--forwarded-allow-ips")]
+    assert flags, (
+        "the launch command does not pin --forwarded-allow-ips, so the trust list falls back to "
+        "gunicorn's default of loopback plus whatever FORWARDED_ALLOW_IPS is set to, and both "
+        "rate-limit tiers become caller-controlled"
     )
-    for neutering in ("-false", "-true", "-name", "-path", "-prune", "-maxdepth", "||", "&&"):
-        assert f" {neutering} " not in f" {command} ", (
-            f"the sweep is narrowed or its failure tolerated by {neutering!r}: {command!r}"
-        )
-    assert ";" not in command and "|" not in command, (
-        f"the sweep shares its RUN with another command: {command!r}"
+    assert len(flags) == 1, f"the flag is given more than once, and the last wins: {flags}"
+    value = flags[0].partition("=")[2]
+    assert value == "255.255.255.255", (
+        f"the forwarded trust list is {value!r}; only the limited broadcast address is vetted "
+        "here, and '*' or a loopback value trusts a header the caller writes"
     )
 
 
@@ -414,34 +446,39 @@ def test_the_sonar_configuration_scopes_sources_to_src() -> None:
 
 
 def _claim_units(path: Path) -> list[str]:
-    """One unit per line, except that contiguous table rows become a single unit.
+    """One unit per line, plus each ADJACENT PAIR of table rows.
 
-    Treating every line separately fixed a floor stated inside one table row and created a
-    two-row version of the same hole: `| Token floor |` on one line and `| at least 24
-    characters |` on the next put the subject and the figure in different units, and neither
-    unit had both.
+    Three shapes had to be handled and the first two attempts each broke on the third. Treating
+    every line separately missed a floor split over two rows of a table. Joining every
+    contiguous run of rows into one unit swallowed the whole 70-row control table, so any
+    integer anywhere in it read as a claim about the token and the guard became unusable noise.
+    Pairs of adjacent rows cover the split-row case and can never grow past two rows.
     """
-    units: list[str] = []
-    table: list[str] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        collapsed = re.sub(r"\s+", " ", raw).strip()
-        if collapsed.startswith("|"):
-            table.append(collapsed)
-            continue
-        if table:
-            units.append(" ".join(table))
-            table = []
-        units.append(collapsed)
-    if table:
-        units.append(" ".join(table))
+    lines = [
+        re.sub(r"\s+", " ", raw).strip() for raw in path.read_text(encoding="utf-8").splitlines()
+    ]
+    units = [line.strip(" ●■") for line in lines if line]
+    units += [
+        f"{first} {second}"
+        for first, second in itertools.pairwise(lines)
+        if first.startswith("|") and second.startswith("|")
+    ]
     return units
 
 
-def _figures_in(unit: str, patterns: tuple[str, ...]) -> list[int]:
-    """Every number attached to a size word in this unit, digits or words."""
-    found: list[int] = []
+def _sizes_claimed_in(unit: str, size: str) -> list[int]:
+    """Every number this unit attaches to a size word, in either order.
+
+    The joiner allows up to two intervening words, because "24 printable characters", "16 or
+    more characters" and "8 (eight) characters" all walked through a punctuation-only joiner.
+    Two words is the limit: three starts matching across clause boundaries, which is how the
+    previous attempt at generality ended up reading a 70-row table as one claim.
+    """
     lowered = unit.lower()
-    for pattern in patterns:
+    gap = r"(?:[\s:=~,()-]{0,3}(?:[a-z(]{1,12}[)\s]{1,3}){0,2}[\s:=~,()-]{0,3})"
+    number = r"(?:\d[\d,]*\+?|" + "|".join(sorted(_WORD_NUMBERS, key=len, reverse=True)) + r")"
+    found: list[int] = []
+    for pattern in (rf"\b({number}){gap}{size}\b", rf"\b{size}{gap}({number})\b"):
         for raw in re.findall(pattern, lowered):
             cleaned = raw.replace(",", "").rstrip("+")
             value = int(cleaned) if cleaned.isdigit() else _WORD_NUMBERS.get(cleaned)
@@ -476,15 +513,6 @@ def test_no_document_states_a_character_figure_for_the_token_but_the_enforced_on
     # A size word, whatever unit it claims. A floor stated in bytes is still a floor, and
     # "at least 16 bytes" was admitted by a guard that only understood characters.
     size = r"(?:char(?:acter)?s?|bytes?|bits?|digits?|long|length|minimum|floor)"
-    number = r"(?:\d[\d,]*\+?|" + "|".join(sorted(_WORD_NUMBERS, key=len, reverse=True)) + r")"
-    joiner = r"[\s:=~-]{0,3}"
-    # Two patterns, matched in SEPARATE passes. Combining them into one alternation let the
-    # first branch consume the size word as if it were the figure, which advanced the scan past
-    # it, so "PREE_TEAM_TOKEN length: 24" matched "token length" and never saw the 24.
-    patterns = (
-        rf"\b({number}){joiner}{size}\b",
-        rf"\b{size}{joiner}({number})\b",
-    )
     for path in scanned:
         if not path.is_file():
             continue
@@ -496,10 +524,16 @@ def test_no_document_states_a_character_figure_for_the_token_but_the_enforced_on
                 phrase in lowered for phrase in _RETIRED_TOKEN_RULES
             ):
                 retired.append(f"{path.name}: {unit}")
-            for value in _figures_in(unit, patterns):
+            # No exemption list. There was one, and it was the hole: 20 is the per-actor rate
+            # limit AND a plausible wrong floor, so exempting it admitted "no fewer than twenty
+            # printable characters". Adjacency to a size word already localises the claim, which
+            # is what an exemption list was standing in for, so the list is gone rather than
+            # trimmed. A number next to "characters" in a line about the token is a claim about
+            # the token's size, and there is no second reading.
+            for value in _sizes_claimed_in(unit, size):
                 checked += 1
                 if value != floor:
-                    wrong.append(f"{path.name}: {unit} (states {value})")
+                    wrong.append(f"{path.name}: {unit[:160]} (states {value})")
 
     # The constant by name, wherever it appears with a value. A fenced block is prose to the
     # reader and its own line to the scan above, but `MIN_PRODUCTION_TOKEN_LENGTH` has no word

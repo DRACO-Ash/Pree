@@ -61,13 +61,20 @@ done
 # Anchoring the extension list with `$` matched only the final component's tail, so
 # `deploy.key.txt` (a doubled extension) and `tls.pem/server.bundle` (the credential-shaped
 # part is a DIRECTORY) both shipped a real private key past a scan that reported clean.
+#
+# The word list is a word list, and it had "passwd" but not "password", and "key" only as a
+# dotted extension: `passwords.txt`, `apikey.txt`, `krb5.keytab`, `deploy_key` and
+# `service-account.json` each shipped a real key body while the script reported clean. A
+# component ending in "key" or "keys" is now refused whatever its extension.
 SUSPECT=$(unzip -Z1 "$OUT" \
   | grep -vE '(^|/)\.env\.example$' \
   | grep -iE \
       '\.(env|pem|key|p12|pfx|jks|keystore|crt|cer|der|p8|pk8|asc|gpg|ppk|kdbx|ovpn)(/|$|\.)'\
 '|(^|/)id_(rsa|dsa|ecdsa|ed25519)'\
 '|(^|/)(\.netrc|\.pgpass|\.npmrc|\.htpasswd|authorized_keys|known_hosts|shadow)(/|$)'\
-'|token|secret|cred|passwd|private.?key' \
+'|token|secret|cred|passwd|password|private.?key|api.?key|keytab|kubeconfig|pypirc'\
+'|service.?account'\
+'|(^|/)[a-z0-9][a-z0-9_.-]*keys?(/|$)' \
   || true)
 if [ -n "$SUSPECT" ]; then
   echo "package: the archive carries paths shaped like credentials:" >&2

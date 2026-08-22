@@ -237,3 +237,62 @@ def test_the_access_log_filter_also_bounds_a_pre_formatted_line() -> None:
     assert "[truncated]" in written, "the pre-formatted path was not truncated"
     assert len(written) < MAX_ACCESS_PATH * 4 + 200, f"the line is {len(written)} bytes"
     assert "/healthz" in written
+
+
+def test_the_access_log_filter_bounds_the_mapping_shape_gunicorn_emits() -> None:
+    """gunicorn logs a format string plus a MAPPING of atoms, never a formatted string.
+
+    glogging.py calls `access_log.info(access_log_format, safe_atoms)`. A dict is not a tuple,
+    and record.msg is only the short format string, so this shape went out whole: measured at
+    15,056 bytes with no truncation marker. UvicornWorker does not use that path today, so it
+    was latent rather than live, and a docstring of mine claimed it was covered when it was not.
+    """
+    bound_access_log()
+    access = logging.getLogger("gunicorn.access")
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    access.handlers = [handler]
+    access.setLevel(logging.INFO)
+    access.propagate = False
+    atoms = {"h": "10.0.0.1", "r": "GET /healthz?" + "x" * 15_000 + " HTTP/1.1", "s": "200"}
+    access.info('%(h)s "%(r)s" %(s)s', atoms)
+
+    written = buffer.getvalue()
+    assert "[truncated]" in written, "the mapping shape was not truncated"
+    assert len(written) < MAX_ACCESS_PATH + 200, f"the access line is {len(written)} bytes"
+    assert "/healthz" in written and "200" in written
+
+
+def test_the_retry_after_read_happens_under_the_same_lock_as_the_count() -> None:
+    """A structural assertion, because this race cannot be forced deterministically.
+
+    `retry_after_seconds` is called from the thread pool immediately after `allow` returns
+    False, on the same key, and it reads the same shared deque: between the emptiness test and
+    `bucket[0]` another thread's prune could empty it, giving IndexError where a 429 with a
+    Retry-After belongs. Forcing it needs a whole window to elapse inside a two-bytecode gap,
+    so 160,000 concurrent calls produced nothing. The control is the critical section, so the
+    critical section is what gets asserted: an unguarded read is the defect, whether or not this
+    machine is fast enough to show it.
+    """
+    limiter = RateLimiter(limit=1, window_seconds=60.0)
+    acquisitions: list[str] = []
+    real = limiter._guard
+
+    class SpyLock:
+        def __enter__(self) -> None:
+            acquisitions.append("in")
+            real.acquire()
+
+        def __exit__(self, *_: object) -> None:
+            real.release()
+
+    limiter._guard = SpyLock()  # type: ignore[assignment]
+    assert limiter.allow("peer") is True
+    assert limiter.allow("peer") is False
+    before = len(acquisitions)
+    assert limiter.retry_after_seconds("peer") >= 1
+    assert len(acquisitions) > before, (
+        "retry_after_seconds read the shared key table without taking the lock that allow() "
+        "takes, so a concurrent prune can empty the deque between its two reads"
+    )

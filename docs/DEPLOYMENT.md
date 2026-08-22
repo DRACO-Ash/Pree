@@ -85,10 +85,13 @@ Storage growth is bounded by construction: the assessment collection is capped a
 records, dropping the oldest and never the record just written, so the volume cannot fill
 through ordinary accumulation.
 
-Measured through the real scoring path on this build: **1339 bytes** for a minimal record and
-**1705 bytes** for a maximum-length one, meaning 64-character identifiers, a 64-character
-actor and every indicator present. Plan on the maximum, which is **8.1 MiB** of steady state.
-An earlier version of this sheet published 1258 bytes as the planning figure; that was a
+Measured through the real scoring path on this build: about **1339 bytes** for a minimal record
+and **1705 bytes** for a maximum-length one, meaning 64-character identifiers and every
+indicator supplied so no contribution is dropped. Plan on the maximum, which is **8.1 MiB** of
+steady state. The published maximum is a planning ceiling and the suite measures the real figure
+on every run, asserting the published one is never below it.
+
+An earlier version of this sheet published 1258 bytes as the planning figure. That was a
 best-case measurement presented as a worst case, and it understated the volume by a third.
 
 The snapshot is rewritten whole on every upsert and a backup copy sits beside it, so the

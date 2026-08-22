@@ -22,6 +22,13 @@ ACCESS_LOGGER_NAMES = ("uvicorn.access", "gunicorn.access")
 MAX_ACCESS_PATH = 160
 
 
+def _clip(value: object) -> object:
+    """Clip one field of an access record, leaving non-strings alone."""
+    if isinstance(value, str) and len(value) > MAX_ACCESS_PATH:
+        return value[:MAX_ACCESS_PATH] + "[truncated]"
+    return value
+
+
 class _TruncateRequestPath(logging.Filter):
     """Truncate the caller-sized part of an access record, in place, before formatting.
 
@@ -33,18 +40,26 @@ class _TruncateRequestPath(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        # `if args`, not `isinstance(args, tuple)`. logging sets record.args to an EMPTY TUPLE
-        # when a caller logs an already-formatted string, so the isinstance test was true, the
-        # loop ran over nothing, and the pre-formatted branch below was unreachable: gunicorn's
-        # own access logger formats its line before logging it, and that line went out whole.
-        # Coverage found this, not a test.
-        if args and isinstance(args, tuple):
-            record.args = tuple(
-                value[:MAX_ACCESS_PATH] + "[truncated]"
-                if isinstance(value, str) and len(value) > MAX_ACCESS_PATH
-                else value
-                for value in args
-            )
+        # Three record shapes, because three producers exist and which one reaches the logger
+        # depends on the worker class and on gunicorn's configuration, neither of which a test
+        # can pin from inside the app:
+        #
+        #   tuple   uvicorn's access logger: (client_addr, method, path, http_version, status).
+        #   dict    gunicorn's own access logger, glogging.py: a format string plus a mapping of
+        #           atoms. `isinstance(args, tuple)` is False for a mapping and record.msg is
+        #           only the short format string, so this shape went out WHOLE: measured at
+        #           15,056 bytes with no truncation marker. UvicornWorker does not use it today,
+        #           which made it latent rather than live, and a test docstring claimed it was
+        #           covered when it was not.
+        #   neither an already-formatted string. logging sets record.args to an EMPTY TUPLE in
+        #           that case, not to None, so the guard must test emptiness and not type.
+        #
+        # Every string is clipped, not only the path: the client address is caller-sized the
+        # moment a forwarded header is trusted, and the method comes off the wire too.
+        if args and isinstance(args, dict):
+            record.args = {key: _clip(value) for key, value in args.items()}
+        elif args and isinstance(args, tuple):
+            record.args = tuple(_clip(value) for value in args)
         elif isinstance(record.msg, str) and len(record.msg) > MAX_ACCESS_PATH * 4:
             record.msg = record.msg[: MAX_ACCESS_PATH * 4] + "[truncated]"
         return True

@@ -63,6 +63,9 @@ RATE_LIMITED_ERROR = "rate limited"
 # included, becomes the generic error: a handler that passes through an arbitrary detail is a
 # reflection primitive, and one of those details already differed between two tiers of the
 # same control.
+# Statuses that must never carry a body. h11 rejects a Content-Length on these, so returning
+# JSON for one turns the intended status into a 500.
+BODILESS_STATUSES = frozenset({204, 304})
 OWN_ERROR_DETAILS = frozenset({GENERIC_CLIENT_ERROR, STORE_UNAVAILABLE_ERROR, RATE_LIMITED_ERROR})
 # Generous for this schema, which is a handful of numbers and two short identifiers, and small
 # enough that an unauthenticated caller cannot exhaust memory before the token gate runs.
@@ -293,7 +296,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         )
 
     @app.exception_handler(StarletteHTTPException)
-    async def handle_http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def handle_http_error(request: Request, exc: StarletteHTTPException) -> Response:
         """Bring every framework-raised HTTP error inside the app's own contract.
 
         Two rejections escaped it. A 5,000-digit integer exceeds CPython's int_max_str_digits,
@@ -320,6 +323,12 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
                 sort_keys=True,
             )
         )
+        # 204 and 304 carry no body by definition, and h11 refuses a Content-Length on them, so
+        # a JSONResponse would turn the intended status into a 500. Nothing raises those as
+        # exceptions today, which makes this a trap set for the next handler rather than a live
+        # fault, and the cost of closing it is two lines.
+        if exc.status_code in BODILESS_STATUSES:
+            return Response(status_code=exc.status_code, headers=exc.headers)
         # exc.headers carries Retry-After for a 429; dropping it tells a compliant client to
         # retry immediately, in a tight loop.
         return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
