@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import errno
 import inspect
 import io
@@ -9,6 +10,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -41,7 +43,7 @@ from pree.app import (
     _limit_keys,
     create_app,
 )
-from pree.audit import build_logger
+from pree.audit import audit, build_logger
 from pree.health import StorageProber
 from pree.main import build
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
@@ -52,6 +54,7 @@ from pree.security import (
     AuthError,
     sanitise_actor,
     sanitise_log_part,
+    sanitise_log_path,
 )
 from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, PRODUCTION_TOKEN, TEST_TOKEN, build_client, make_config
@@ -522,6 +525,35 @@ def test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_
         assert path.isascii() and path.isprintable(), f"the logged path is not ASCII: {path!r}"
 
 
+# The token axis, and what it can and cannot deliver, stated before it is used.
+#
+# TWO tokens does NOT refuse the class, and I claimed it did at three prose sites. Measured by the
+# gate: `bool(_had_query(request) and "-" in (config.team_token or ""))` was green, because BOTH
+# fixture tokens contain a hyphen, and the same conjunct on `origin_allowed` was green too, so two
+# real bits of the deployed credential shipped per refused preflight with nothing red. A two-sample
+# axis catches only a predicate that DISAGREES between those two samples; any predicate constant
+# across them survives. The related claim, that "a single-token version of this test passes against
+# the leaking expression", was also false: that expression is request-independent, so the
+# both-directions axis alone kills it, single token or not.
+#
+# What this set delivers instead: for a character-class predicate over the token to survive, it must
+# agree across every member. The fixed members are chosen so the obvious classes each split them -
+# hyphen, underscore, digit, dot, tilde, case, and the parity of the first byte - and the random
+# member makes an unanticipated class improbable rather than merely unlisted. IMPROBABLE, not
+# impossible: a predicate can still be constant by luck, so this raises the cost of the channel and
+# does not close it, and that is the honest statement of what the axis is worth.
+_LEAK_PROBE_TOKENS = (
+    TEST_TOKEN,
+    PRODUCTION_TOKEN,
+    # No hyphen, no underscore, no dot, no tilde, no digit, all one case.
+    "abcdefghijklmnopqrstuvwxyzabcdefgh",
+    # Digits only, so every alphabetic class flips.
+    "9182736450918273645091827364509182",
+    # Leading byte of the opposite parity to the two fixtures, and every separator at once.
+    "Bc4-De7_Fg1.Hi3~Jk6Lm9No2Pq5Rs8Tu",
+)
+
+
 def test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it(
     tmp_path: Path,
 ) -> None:
@@ -538,47 +570,86 @@ def test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it
     left the whole suite green while handing an unauthenticated caller one bit of the team token
     per refused preflight.
 
-    So: EVERY kind, BOTH directions, and TWO TOKENS. The two-token axis is the decisive one and not
-    a flourish: any token-derived expression changes when the token changes while the request does
-    not, so the matrix catches the class rather than the member. A single-token version of this
-    test passes against the leaking expression above.
+    EVERY kind, BOTH directions, and the token axis described above `_LEAK_PROBE_TOKENS`, whose
+    limits are stated there rather than overstated here.
+
+    And the PATH is recomputed, not charset-checked, which is the second half of the same lesson.
+    The `path` rule is a charset of word characters, dot, slash, percent, at, colon and hyphen, and
+    hex is inside it, so
+
+        sanitise_log_path(...) + "/" + config.team_token.encode().hex()
+
+    at the CORS site put the WHOLE credential into a record any unauthenticated caller can trigger,
+    240 a minute on the coarse allowance, with all 331 tests green and `TEST_TOKEN not in log` still
+    true because the value was hex. A charset cannot see an appended value; recomputation can, and
+    this exercise knows every target it drove.
     """
-    for token in (TEST_TOKEN, PRODUCTION_TOKEN):
+    random_token = secrets.token_urlsafe(32)
+    for token in (*_LEAK_PROBE_TOKENS, random_token):
         for query, expected in (("?x=1", True), ("", False)):
-            observed = _every_kind_with(tmp_path / f"{len(token)}{expected}", token, query)
+            label = f"{len(token)}-{token[:4]}-{expected}"
+            observed = _every_kind_with(tmp_path / label, token, query)
             assert set(observed) == set(EXPECTED_AUDIT_KEYS) - {"audit"}, (
                 f"the exercise did not produce every rejection kind, so the kinds it missed are "
                 f"unpinned by value: {sorted(set(EXPECTED_AUDIT_KEYS) - {'audit'} - set(observed))}"
             )
-            for kind, bit in observed.items():
-                assert bit is expected, (
-                    f"{kind} recorded had_query={bit!r} for query {query!r} under a token of "
-                    f"length {len(token)}; expected {expected}. A boolean whose value tracks "
-                    f"anything but the request is a channel, not a fact about the request"
+            for kind, seen in observed.items():
+                record, target = seen["record"], seen["target"]
+                assert record["had_query"] is expected, (
+                    f"{kind} recorded had_query={record['had_query']!r} for query {query!r} under "
+                    f"a token starting {token[:4]!r}; expected {expected}. A boolean whose value "
+                    f"tracks anything but the request is a channel, not a fact about the request"
+                )
+                expected_path = sanitise_log_path(target.encode(), MAX_LOGGED_PATH)
+                assert record["path"] == expected_path, (
+                    f"{kind} logged path {record['path']!r} for target {target!r}, which "
+                    f"recomputes to {expected_path!r}. Anything appended to this field is inside "
+                    f"the charset the rule checks, so a difference here is the field carrying "
+                    f"something other than the path"
+                )
+                assert token not in json.dumps(record), (
+                    f"the team token is in the {kind} record verbatim: {record}"
+                )
+                assert token.encode().hex() not in json.dumps(record), (
+                    f"the team token is in the {kind} record hex-encoded: {record}"
                 )
 
 
-def _every_kind_with(directory: Path, token: str, query: str) -> dict[str, bool]:
-    """Drive one request per rejection kind, and return each kind's `had_query` bit.
+def _every_kind_with(directory: Path, token: str, query: str) -> dict[str, dict[str, Any]]:
+    """Drive one request per rejection kind, and return each kind's record beside its TARGET.
 
     One helper rather than five copies, because five copies of the drive are five places for a
     kind to be quietly dropped and read as "not emitted" instead of "not asserted".
+
+    The target is returned WITH the record because a charset check on a field cannot see a value
+    appended to it, and recomputation can. `path` was pinned by charset alone, and hex is inside
+    that charset, so appending `config.team_token.encode().hex()` at the CORS site put the whole
+    credential into a record any unauthenticated caller can trigger, 240 a minute on the coarse
+    allowance, with the whole suite green and `TEST_TOKEN not in log` still true.
     """
     stream = io.StringIO()
     config = make_config(
         directory, PREE_TEAM_TOKEN=token, PREE_ALLOWED_ORIGIN="https://pree.example"
     )
     auth = {"x-pree-token": token}
+    # The path each drive requests, WITHOUT the query, which is what `_raw_path` hands the scrub.
+    targets = {
+        "auth_reject": "/v1/assessments/a:b",
+        "validation_reject": "/v1/assess",
+        "http_reject": "/nowhere-at-all",
+        "cors_reject": "/v1/assess",
+        "store_error": "/v1/assessments/a:b",
+    }
     with build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0)) as probe:
         # auth_reject: a gated route with the wrong token, which needs no token at all.
-        probe.get(f"/v1/assessments/a:b{query}", headers={"x-pree-token": "wrong"})
+        probe.get(f"{targets['auth_reject']}{query}", headers={"x-pree-token": "wrong"})
         # validation_reject: authenticated, body refused at the boundary.
-        probe.post(f"/v1/assess{query}", headers=auth, json={"bad": 1})
+        probe.post(f"{targets['validation_reject']}{query}", headers=auth, json={"bad": 1})
         # http_reject: a route that does not exist.
-        probe.get(f"/nowhere-at-all{query}", headers=auth)
+        probe.get(f"{targets['http_reject']}{query}", headers=auth)
         # cors_reject: a preflight from a disallowed origin.
         probe.options(
-            f"/v1/assess{query}",
+            f"{targets['cors_reject']}{query}",
             headers={
                 "Origin": "https://evil.test",
                 "Access-Control-Request-Method": "POST",
@@ -587,14 +658,14 @@ def _every_kind_with(directory: Path, token: str, query: str) -> dict[str, bool]
         # store_error: a corrupt snapshot AND a corrupt backup, so the real 503 path runs.
         (config.data_dir / "assessments.json").write_text("{ not json", encoding="utf-8")
         (config.data_dir / "assessments.json.bak").write_text("nor this", encoding="utf-8")
-        probe.get(f"/v1/assessments/a:b{query}", headers=auth)
+        probe.get(f"{targets['store_error']}{query}", headers=auth)
 
-    observed: dict[str, bool] = {}
+    observed: dict[str, dict[str, Any]] = {}
     for line in stream.getvalue().splitlines():
         if '"had_query"' not in line:
             continue
         record = json.loads(line)
-        observed[record["kind"]] = record["had_query"]
+        observed[record["kind"]] = {"record": record, "target": targets[record["kind"]]}
     return observed
 
 
@@ -1050,7 +1121,11 @@ def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path
     # The decisive axis is TWO DISTINCT TOKENS. Any token-derived expression changes when the token
     # changes while the origin does not, so the matrix catches the class rather than the member.
     # This is the same correlate-do-not-name reasoning the project already applied to duration_ms.
-    for token in (TEST_TOKEN, PRODUCTION_TOKEN):
+    # The SAME axis as `had_query`, and for the same measured reason. Two fixture tokens both
+    # contain a hyphen, so `... and "-" in (config.team_token or "")` on this field stayed green
+    # while shipping one real bit of the deployed credential per refused preflight. Two samples
+    # catch only a predicate that disagrees between them.
+    for token in (*_LEAK_PROBE_TOKENS, secrets.token_urlsafe(32)):
         for origin, allowed in (("https://pree.example", True), ("https://evil.test", False)):
             for extra in ({}, {"Access-Control-Request-Headers": "x-not-permitted"}):
                 probe_stream = io.StringIO()
@@ -2680,8 +2755,31 @@ class _OneOf(_ValueRule):
         super().__init__(f"one of {sorted(permitted)}")
         self._permitted = frozenset(permitted)
 
+    @property
+    def permitted(self) -> frozenset[str]:
+        """Readable, so a drift guard can compare the pin against the application's own literals.
+
+        A rule that can only answer "do you reject this?" cannot be asked "what do you permit that
+        nothing emits?", and that second direction is the one the `confidence` pin failed in.
+        """
+        return self._permitted
+
     def rejects(self, value: str) -> bool:
         return value not in self._permitted
+
+
+def _pattern_within(rule: _ValueRule) -> _Pattern | None:
+    """The `_Pattern` a rule ultimately applies, through any marker wrapper, or None.
+
+    One accessor so the newline sweep and its own completeness check ask the same question. They
+    both asked `isinstance(rule, _Pattern)`, so wrapping the `path` pattern in a marker removed it
+    from the sweep AND from the check that every pattern is swept, in one edit, with nothing red.
+    """
+    if isinstance(rule, _Pattern):
+        return rule
+    if isinstance(rule, _MarkerOr):
+        return _pattern_within(rule.inner)
+    return None
 
 
 class _MarkerOr(_ValueRule):
@@ -2699,6 +2797,17 @@ class _MarkerOr(_ValueRule):
 
     def rejects(self, value: str) -> bool:
         return value != self._marker and self._inner.rejects(value)
+
+    @property
+    def inner(self) -> _ValueRule:
+        """The delegate, so wrapping a rule in a marker cannot exempt it from the canary sweep.
+
+        Wrapping the `path` pattern in this class made it stop being a `_Pattern` by identity, so
+        the trailing-newline sweep skipped it silently and the sweep's own completeness check
+        agreed, because both asked `isinstance(rule, _Pattern)` of the wrapper. A marker changes
+        which values are accepted; it does not change whether the delegate anchors correctly.
+        """
+        return self._inner
 
 
 class _ScrubIdempotent(_ValueRule):
@@ -2768,7 +2877,11 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     # letter the scrub exists to strip and could not have caught the charset regression that
     # `test_a_long_request_path_cannot_write_an_unbounded_audit_line` did. A pin wider than what
     # the application can emit is not a pin.
-    "path": _Pattern(r"^(?a:[\w./%@:-]{1,160})$"),
+    # `_MarkerOr`, mirroring `loc`, because `sanitise_log_path` returns UNPRINTABLE_MARKER for an
+    # empty target and `[`/`]` are outside this charset, so the rule refused a value the
+    # application can emit. Latent (it needs a server supplying an empty `raw_path`) and it failed
+    # closed, but it is the other half of the pin-versus-code divergence swept this round.
+    "path": _MarkerOr(UNPRINTABLE_MARKER, _Pattern(r"^(?a:[\w./%@:-]{1,160})$")),
     "reason": _Pattern(r"^[ -~]{0,512}$"),
     # Inside `validation_reject.errors`, which the flat scan never reached. `loc` echoes a
     # caller-supplied field name and the application scrubs each part, so the same derivation
@@ -3136,6 +3249,67 @@ AUDIT_RULE_CANARIES: dict[str, str] = {
 }
 
 
+def test_every_closed_set_pin_is_exactly_what_the_application_can_emit() -> None:
+    """The CLASS, not just the `confidence` instance the review found.
+
+    `kind`, `action`, `outcome` and `confidence` are each an exact literal set. `kind` was already
+    backstopped by `EXPECTED_AUDIT_KEYS`, which fails on an unknown kind; the other three were
+    literals nothing cross-checked, so adding a member the canary table does not happen to use is a
+    silent one-of-N channel. `confidence` proved the risk is not theoretical: it permitted `medium`,
+    which the enum has never had, and omitted two values the application does emit.
+
+    The application's own literals are read from the SOURCE rather than imported, deliberately.
+    Importing them would make the pin derived, so it would move with any mutation of the code it
+    exists to constrain; reading the string literals the handlers actually pass is an independent
+    measurement of the same fact.
+    """
+    source = Path(app_module.__file__ or "").resolve().read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    emitted: dict[str, set[str]] = {"action": set(), "outcome": set()}
+
+    def collect(name: object, value: ast.expr) -> None:
+        if not isinstance(name, str) or name not in emitted:
+            return
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            emitted[name].add(value.value)
+
+    # THREE forms, because the application uses all three and each earlier version of this walk
+    # found a subset and drew a confident wrong conclusion from it. A dict-literal-only walk found
+    # NOTHING (a check that silently finds nothing passes for the wrong reason, which is why the
+    # emptiness is asserted below). Adding keyword arguments found `assess` and reported the pin's
+    # `read_assessment` as permitted-but-unemitted, which was false: it is emitted POSITIONALLY at
+    # three call sites. So positional arguments are bound to `audit`'s real signature rather than
+    # to hard-coded indices, because an index would be a second copy of the parameter order.
+    audit_parameters = list(inspect.signature(audit).parameters)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                collect(key.value if isinstance(key, ast.Constant) else None, value)
+        elif isinstance(node, ast.Call):
+            for argument in node.keywords:
+                collect(argument.arg, argument.value)
+            called = node.func
+            if isinstance(called, ast.Name) and called.id == "audit":
+                for index, value in enumerate(node.args):
+                    if index < len(audit_parameters):
+                        collect(audit_parameters[index], value)
+    for field, values in emitted.items():
+        assert values, f"no literal {field!r} values found in app.py, so this check is vacuous"
+        rule = AUDIT_STRING_VALUES[field]
+        for emitted_value in values:
+            assert not rule.rejects(emitted_value), (
+                f"the application emits {field}={emitted_value!r} and the pin refuses it, so a "
+                f"real record would fail the shape check: {rule.description}"
+            )
+        # And the pin must permit NOTHING beyond them, which is the direction `confidence` failed.
+        assert isinstance(rule, _OneOf), f"{field!r} is no longer a closed-set rule: {rule!r}"
+        assert rule.permitted == values, (
+            f"the {field!r} pin and the application disagree: pin has "
+            f"{sorted(rule.permitted - values)} that nothing emits, and is missing "
+            f"{sorted(values - rule.permitted)} that it does"
+        )
+
+
 def test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit() -> None:
     """The meta-assertion that makes a literal pin safe to keep as a literal.
 
@@ -3199,16 +3373,19 @@ def test_every_audit_value_rule_can_actually_reject_something() -> None:
         assert rule.rejects(bad), (
             f"the rule for {field!r} accepts {bad!r}, so it pins nothing: {rule.description}"
         )
-    # Every PATTERN rule must reject a trailing newline. `re.match` with `$` accepts one.
+    # Every PATTERN rule must reject a trailing newline. `re.match` with `$` accepts one, and a
+    # pattern reached THROUGH a marker wrapper is still a pattern: asking `isinstance` of the
+    # wrapper let `path` out of this sweep, and out of the completeness check below it, at the
+    # moment it was wrapped.
     for field, bad in AUDIT_PATTERN_NEWLINE_CANARIES.items():
         rule = AUDIT_STRING_VALUES[field]
-        assert isinstance(rule, _Pattern), f"{field!r} is no longer a pattern rule: {rule!r}"
+        assert _pattern_within(rule) is not None, f"{field!r} is no longer a pattern rule: {rule!r}"
         assert rule.rejects(bad), (
             f"the rule for {field!r} accepts a trailing newline, so `$` is anchoring rather than "
             f"`fullmatch`: {rule.description}"
         )
     assert set(AUDIT_PATTERN_NEWLINE_CANARIES) == {
-        field for field, rule in AUDIT_STRING_VALUES.items() if isinstance(rule, _Pattern)
+        field for field, rule in AUDIT_STRING_VALUES.items() if _pattern_within(rule) is not None
     }, "every pattern rule needs a trailing-newline canary"
     # And EVERY fail-closed arm, because four of the five could be deleted with the suite green, in
     # the commit whose whole thesis is that a claim without a canary is a fact nobody asserts.
