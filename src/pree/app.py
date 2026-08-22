@@ -64,6 +64,12 @@ MAX_BODY_BYTES = 32 * 1024
 # controlled. A 20,000-character key produced a 20,104-byte log record, so a rejected request
 # was a cheaper way to fill the log volume than an accepted one.
 MAX_VALIDATION_ERRORS_LOGGED = 10
+# The request PATH is caller controlled too, and bounding only the body missed the cheaper
+# attack: a rejected body needs an upload, while a long path needs neither a body nor a valid
+# token. h11 admits roughly 16 KiB of request line, and JSON escaping doubled that on the way
+# into the log, so one unauthenticated 401 wrote about 30 KB. Every handler that logs a path
+# truncates it, and 96 bytes is well past the longest route this app serves.
+MAX_LOGGED_PATH = 96
 # The interactive documentation paths. FastAPI serves all three by default, which made the
 # whole route table, every field range and the token header name readable by an unauthenticated
 # caller, and made /docs load a floating-tag CDN script onto the app origin: the same origin
@@ -219,7 +225,11 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         """Client sees a generic 401. The reason stays server-side."""
         audit_log.warning(
             json.dumps(
-                {"kind": "auth_reject", "path": request.url.path, "reason": str(exc)},
+                {
+                    "kind": "auth_reject",
+                    "path": request.url.path[:MAX_LOGGED_PATH],
+                    "reason": str(exc)[:MAX_ACTOR_LENGTH],
+                },
                 separators=(",", ":"),
                 sort_keys=True,
             )
@@ -242,7 +252,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "validation_reject",
-                    "path": request.url.path,
+                    "path": request.url.path[:MAX_LOGGED_PATH],
                     "errors": [
                         {
                             "loc": [str(part)[:MAX_ACTOR_LENGTH] for part in item.get("loc", ())],
@@ -266,7 +276,11 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         """Storage refused. The client gets a generic 503; the cause is logged server-side."""
         audit_log.error(
             json.dumps(
-                {"kind": "store_error", "path": request.url.path, "reason": str(exc)},
+                {
+                    "kind": "store_error",
+                    "path": request.url.path[:MAX_LOGGED_PATH],
+                    "reason": str(exc)[:MAX_ACTOR_LENGTH],
+                },
                 separators=(",", ":"),
                 sort_keys=True,
             )

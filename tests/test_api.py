@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from pree.app import (
     LIVENESS_PATHS,
     MAX_BODY_BYTES,
+    MAX_LOGGED_PATH,
     MAX_VALIDATION_ERRORS_LOGGED,
     STORAGE_PROBE_PATH,
     create_app,
@@ -273,9 +274,13 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
     config = make_config(tmp_path)
     with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
         payload: dict[str, Any] = {"protected_asset_id": 1, "candidate_id": 2}
-        # Sized to sit UNDER the 32 KiB body cap, so the cap is not what stops this: five
-        # 5,000-character keys is roughly 25 KiB of body and was roughly 25 KiB of audit line.
+        # Two shapes at once, because each defeats a different bound. Five 5,000-character
+        # keys sit under the 32 KiB body cap, so truncation and not the cap is what stops
+        # them; and MANY tiny keys exceed MAX_VALIDATION_ERRORS_LOGGED, so the cap is what
+        # stops those. The first version of this test sent only the five, which left the cap
+        # unasserted: deleting it wrote a 142,290-byte record with the suite green.
         payload.update({f"k{index}{'x' * 5_000}": 1 for index in range(5)})
+        payload.update({f"t{index}": 1 for index in range(MAX_VALIDATION_ERRORS_LOGGED * 20)})
         assert bounded.post("/v1/assess", json=payload, headers=AUTH).status_code == 422
 
     lines = [line for line in stream.getvalue().splitlines() if "validation_reject" in line]
@@ -283,11 +288,37 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
     for line in lines:
         assert len(line) < 4096, f"audit line is {len(line)} bytes, unbounded by caller input"
         record = json.loads(line)
-        assert len(record["errors"]) <= MAX_VALIDATION_ERRORS_LOGGED
-        assert record["error_count"] >= len(record["errors"])
+        assert len(record["errors"]) == MAX_VALIDATION_ERRORS_LOGGED, (
+            f"{len(record['errors'])} errors were logged; the cap is not load-bearing"
+        )
+        assert record["error_count"] > MAX_VALIDATION_ERRORS_LOGGED, (
+            "the request did not produce more errors than the cap, so the cap is untested"
+        )
         for item in record["errors"]:
             for part in item["loc"]:
                 assert len(part) <= MAX_ACTOR_LENGTH
+
+
+def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path) -> None:
+    """The cheaper version of the same attack, and the one the first fix missed.
+
+    Bounding the body left the path unbounded, and a path needs no body and no valid token: a
+    15,000-character request line wrote a 30,074-byte 401 audit record, because JSON escaping
+    of control characters doubles the bytes on the way in. The route is metered, but 240
+    requests a window per worker is still megabytes of log a minute from a single address.
+    """
+    stream = io.StringIO()
+    logger = build_logger(stream)
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
+        long_path = "/v1/assessments/" + "%01" * 4_000
+        assert bounded.get(long_path, headers={"x-pree-token": "wrong"}).status_code == 401
+
+    lines = [line for line in stream.getvalue().splitlines() if "auth_reject" in line]
+    assert lines, "the rejection was not audited at all"
+    for line in lines:
+        assert len(line) < 1024, f"audit line is {len(line)} bytes, unbounded by the caller"
+        assert len(json.loads(line)["path"]) <= MAX_LOGGED_PATH
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:

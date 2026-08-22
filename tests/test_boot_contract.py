@@ -48,6 +48,42 @@ _DOCKERFILE_KEYWORDS = frozenset(
 )
 
 
+# What counts as a sentence about the team token, and the retired rules that must not return.
+# "credential" is here because a fabricated sentence naming only "the shared operator
+# credential" stated a 16-character floor and was not checked at all.
+_TOKEN_TERMS = ("token", "pree_team_token", "credential")
+_RETIRED_TOKEN_RULES = (
+    "distinct character",
+    "character variety",
+    "character-variety rule",
+    "mix upper case",
+    "mixed case",
+    "upper case, lower case",
+)
+# A floor is always stated with a comparator or the word "floor" itself. Requiring one keeps
+# the guard from reading an unrelated character count as a rule.
+_FLOOR_PHRASES = (
+    "floor",
+    "shorter than",
+    "fewer than",
+    "longer than",
+    "at least",
+    "no less than",
+    "minimum",
+    "raised to",
+    "must be",
+)
+_WORD_NUMBERS = {
+    "eight": 8,
+    "twelve": 12,
+    "sixteen": 16,
+    "twenty": 20,
+    "twenty-four": 24,
+    "thirty-two": 32,
+    "sixty-four": 64,
+}
+
+
 @dataclass(frozen=True)
 class _Instruction:
     """One resolved Dockerfile instruction, with comments and continuations removed."""
@@ -80,6 +116,20 @@ def _instructions() -> list[_Instruction]:
     # project's Dockerfile has no need of heredocs, so their presence is refused rather than
     # interpreted.
     assert "<<" not in text, "heredocs are refused: a line-based parser cannot read them safely"
+    # Parser directives are comments to every line-based reader and instructions to docker. An
+    # `# escape=` directive stops `\` continuing a line, so docker split a HEALTHCHECK that this
+    # parser had swallowed whole and read the `USER root` hidden inside it as its own
+    # instruction. Only the syntax directive is permitted; anything else is refused.
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped.startswith("#"):
+            break
+        directive = stripped.lstrip("#").strip()
+        if "=" in directive and " " not in directive.split("=")[0]:
+            assert directive.split("=")[0].strip() == "syntax", (
+                f"unrecognised parser directive {directive!r}; a directive changes how docker "
+                "reads this file and is invisible to a line-based parser"
+            )
     joined: list[str] = []
     buffer = ""
     for raw in text.splitlines():
@@ -118,6 +168,29 @@ def _final_stage() -> list[_Instruction]:
     instructions = _instructions()
     last = max(i.stage for i in instructions)
     return [i for i in instructions if i.stage == last]
+
+
+def _shipped_source_stage() -> str:
+    """The name of the stage the shipped layer is actually copied FROM.
+
+    Without this the hardening assertions floated free of the image. The sweep was asserted to
+    exist in some stage and the shipped COPY to come from some stage, with nothing joining the
+    two, so moving the sweep into the `build` stage shipped every setuid binary the base image
+    carries with the whole suite green, and repointing the COPY at `build` shipped pip as well.
+    """
+    copies = [i for i in _final_stage() if i.keyword in {"COPY", "ADD"}]
+    assert len(copies) == 1, f"the shipped stage copies {len(copies)} times"
+    argument = copies[0].argument
+    source = next(
+        (part.split("=", 1)[1] for part in argument.split() if part.startswith("--from=")),
+        None,
+    )
+    assert source is not None, f"the shipped layer is not copied from a stage: {argument!r}"
+    assert not source.isdigit(), (
+        f"the shipped layer is copied from stage index {source!r}; a positional reference "
+        "silently follows any stage inserted above it, so name the stage"
+    )
+    return source.lower()
 
 
 def test_the_dockerfile_sits_at_the_repository_root() -> None:
@@ -200,6 +273,35 @@ def test_the_suid_sweep_is_the_last_mutating_instruction_of_its_stage() -> None:
     assert not later, f"instructions follow the suid sweep in its own stage: {later}"
 
 
+def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
+    """Position within a stage is worthless if the stage is not the one that ships.
+
+    Both halves of this were asserted and neither was joined to the other. Moving the sweep
+    from `prep` into `build` left all 238 tests green while the shipped filesystem kept every
+    setuid binary python:3.12-slim carries, among them su, mount, passwd and newgrp; and
+    repointing the shipped COPY at `build` shipped the unswept stage with pip in it. Each
+    hardening step is now required to be in the stage the shipped layer is copied from.
+    """
+    shipped_from = _shipped_source_stage()
+    instructions = _instructions()
+    required = {
+        "the suid and sgid sweep": "-perm /6000",
+        "the pip removal": "site-packages/pip",
+        "the numeric user creation": "--uid 10001",
+    }
+    misplaced: list[str] = []
+    for label, needle in required.items():
+        matches = [i for i in instructions if needle in i.argument and i.keyword == "RUN"]
+        assert matches, f"{label} is absent from the Dockerfile entirely"
+        for found in matches:
+            if found.stage_name != shipped_from:
+                misplaced.append(
+                    f"{label} runs in stage {found.stage_name or '<unnamed>'!r}, "
+                    f"but the shipped layer is copied from {shipped_from!r}"
+                )
+    assert not misplaced, misplaced
+
+
 def test_the_shipped_stage_is_exactly_one_copied_layer() -> None:
     """The image-policy scan reads layer history, so one clean layer is the point.
 
@@ -258,17 +360,62 @@ def test_every_documented_token_floor_matches_the_number_the_code_enforces() -> 
     wrong: list[str] = []
     retired: list[str] = []
     checked = 0
-    for name in ("DEPLOYMENT.md", "SECURITY.md"):
-        flat = re.sub(r"\s+", " ", (REPO_ROOT / "docs" / name).read_text(encoding="utf-8"))
-        for sentence in re.split(r"(?<=[.!?])\s+", flat):
-            if "token" not in sentence.lower():
+    for name in ("DEPLOYMENT.md", "SECURITY.md", "CHANGELOG.md"):
+        # Fragments are built PER LINE, then split into sentences within the line. Flattening
+        # the whole document first and splitting on the pipe put a table row's cells into
+        # separate fragments, so `| Token floor | at least 24 characters |` had the subject in
+        # one fragment and the number in another and neither fragment had both. A line keeps a
+        # row, a bullet and an undotted heading whole.
+        fragments: list[str] = []
+        for line in (REPO_ROOT / "docs" / name).read_text(encoding="utf-8").splitlines():
+            collapsed = re.sub(r"\s+", " ", line).strip(" ●■")
+            if collapsed:
+                fragments.extend(re.split(r"(?<=[.!?])\s+", collapsed))
+        for fragment in fragments:
+            lowered = fragment.lower()
+            # Named by the environment variable as well as by the word, because a sentence
+            # about "the shared operator credential" is about the token and said 16.
+            if not any(term in lowered for term in _TOKEN_TERMS):
                 continue
-            if "distinct character" in sentence.lower():
-                retired.append(f"{name}: {sentence.strip()}")
-            for stated in re.findall(r"\b(\d+)\s+characters?\b", sentence):
+            # The retired-rule check runs BEFORE the floor gate. Putting it after meant a
+            # reworded variety rule ("must mix upper case, lower case and digits") states no
+            # number, failed the floor gate, and was never examined for the rule at all.
+            #
+            # It is scoped to the operator sheet on purpose. There, a sentence naming a rule is
+            # an instruction the operator will follow, so a rule the code no longer has is a
+            # defect. Elsewhere the same words appear in the record of the rule's REMOVAL, and
+            # no text test can reliably separate "we enforce this" from "we deleted this"
+            # without an exemption phrase that then becomes the escape hatch.
+            if name == "DEPLOYMENT.md" and any(
+                phrase in lowered for phrase in _RETIRED_TOKEN_RULES
+            ):
+                retired.append(f"{name}: {fragment.strip()}")
+            # A number of characters is only a FLOOR claim when a comparator says so. Matching
+            # every "N characters" in a token sentence flagged "five 5,000-character field
+            # names", which is a fact about a log line, and a guard that cries wolf gets
+            # relaxed rather than obeyed.
+            if not any(phrase in lowered for phrase in _FLOOR_PHRASES):
+                continue
+            stated_numbers = [
+                int(digits) for digits in re.findall(r"\b(\d+)[\s-]*characters?\b", fragment)
+            ]
+            stated_numbers += [
+                _WORD_NUMBERS[word]
+                for word in re.findall(r"\b([a-z]+(?:-[a-z]+)?)[\s-]*characters?\b", lowered)
+                if word in _WORD_NUMBERS
+            ]
+            for stated in stated_numbers:
                 checked += 1
-                if int(stated) != floor:
-                    wrong.append(f"{name}: {sentence.strip()}")
+                if stated != floor:
+                    wrong.append(f"{name}: {fragment.strip()}")
+    # A fenced block carries no prose the split above would recognise as a claim, so the
+    # constant's own name is checked wherever it appears with a value attached.
+    for name in ("DEPLOYMENT.md", "SECURITY.md", "CHANGELOG.md"):
+        body = (REPO_ROOT / "docs" / name).read_text(encoding="utf-8")
+        for value in re.findall(r"MIN_PRODUCTION_TOKEN_LENGTH\s*[=:]\s*(\d+)", body):
+            checked += 1
+            if int(value) != floor:
+                wrong.append(f"{name}: MIN_PRODUCTION_TOKEN_LENGTH stated as {value}")
 
     assert checked, (
         "no document states a character floor for the team token; the operator has no way to "

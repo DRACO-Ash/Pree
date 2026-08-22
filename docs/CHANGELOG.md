@@ -241,3 +241,25 @@ Tenth security review, three guards rebuilt and one document defect of my own:
   message claimed all three places had. `docs/DEPLOYMENT.md` still described a rule the code no
   longer has. Both now state the enforced number, and a guard reads the constant from the
   source so the prose cannot drift from it again.
+
+Eleventh security review, three majors and four overstated claims of mine:
+
+● Round ten bounded the audit line for a rejected body and left the request PATH unbounded, one
+  function higher in the same file. A path needs no upload and no valid token: a
+  15,000-character request line wrote a 30,074-byte 401 record. All three handlers now truncate
+  the path and the reason.
+● The suid and sgid sweep was asserted to exist in some build stage, and the shipped layer to
+  come from some build stage, with nothing joining the two. Moving the sweep into `build`
+  shipped every setuid binary the base image carries with the suite green. The guard now reads
+  the shipped COPY's `--from=` and requires every hardening step to run in that stage.
+● The ten-error cap on the logged error list was tested nowhere, because the test sent five
+  field names. Deleting it wrote a 142,290-byte record. The test now exceeds the cap.
+● A `# escape=` parser directive was invisible to the Dockerfile parser and honoured by docker,
+  leaving the resolved user as root. Unknown parser directives are refused like heredocs.
+● The packaging scan named no certificate extension, followed symlinks so a link could ship a
+  private key's contents under a harmless name, and missed `.netrc`, `authorized_keys` and
+  `creds.txt`. It now stores links as links, refuses them, and states that it reads names only.
+● The token-floor guard caught one number form of five. Fragments are built per line so a table
+  row stays whole, and the retired-rule check runs before the floor gate.
+● The shipped `MAX_ASSESSMENTS` value was unpinned, because every cap test monkeypatched it.
+  It is now asserted against the sheet and the volume footprint.

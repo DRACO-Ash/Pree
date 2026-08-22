@@ -28,7 +28,10 @@ done
 
 # Banned from the archive: virtual environments, caches, built output, version-control
 # metadata, local data and any environment file.
-zip -qr "$OUT" $INCLUDE \
+# -y stores a symlink as a link. Without it zip follows the link and writes the TARGET's bytes
+# into the archive under the link's name, so `notes-appendix.md -> ~/.ssh/id_rsa` shipped a
+# private key past a scan that only ever saw a markdown filename.
+zip -qry "$OUT" $INCLUDE \
   -x '*/__pycache__/*' '*.pyc' '*/.venv/*' '*/.mypy_cache/*' '*/.ruff_cache/*' \
      '*/.pytest_cache/*' '*/data/*' '*.env' '*.zip'
 
@@ -43,13 +46,24 @@ for banned in .env .git .venv node_modules coverage; do
   fi
 done
 
-# A second pass over what actually landed, by shape rather than by name. The name denylist
-# above only refuses five known directory names; it says nothing about a key, a certificate or
-# a file whose name merely reads like a credential, and the archive is what leaves the building.
+# A second pass over what actually landed, by PATH SHAPE ONLY. This scan is content-blind: it
+# reads names, never bytes, so it cannot see a credential inside an archive, a document or a
+# source file. It is the last net, not the first: the pre-write hook and the secret rules are.
+#
+# The name denylist above refuses five known directory names and nothing else, which let a
+# certificate, a .netrc, an authorized_keys, a creds.txt, a nested tarball and a symlink
+# pointing at a private key all ship. Extensions are matched case-insensitively because
+# backup.ENV is the same file as backup.env, and the whole-name list covers the credential
+# files that carry no extension at all.
+#
 # .env.example is the one deliberate exception: it carries placeholders, and a test asserts so.
 SUSPECT=$(unzip -Z1 "$OUT" \
   | grep -vE '(^|/)\.env\.example$' \
-  | grep -iE '\.(env|pem|key|p12|pfx|jks|keystore)$|(^|/)id_(rsa|dsa|ecdsa|ed25519)|token|secret|credential' \
+  | grep -iE \
+      '\.(env|pem|key|p12|pfx|jks|keystore|crt|cer|der|p8|pk8|asc|gpg|ppk|kdbx|ovpn)$'\
+'|(^|/)id_(rsa|dsa|ecdsa|ed25519)'\
+'|(^|/)(\.netrc|\.pgpass|\.npmrc|\.htpasswd|authorized_keys|known_hosts|shadow)$'\
+'|token|secret|cred|passwd|private.?key' \
   || true)
 if [ -n "$SUSPECT" ]; then
   echo "package: the archive carries paths shaped like credentials:" >&2
@@ -57,4 +71,15 @@ if [ -n "$SUSPECT" ]; then
   exit 1
 fi
 
-echo "package: archive clean: no banned directory, no credential-shaped path"
+# And no symlinks at all. -y stops the content leak, but a stored link still points somewhere
+# outside the archive, and what it resolves to on the platform runner is not ours to reason
+# about. This project ships no symlink, so any is a defect.
+LINKS=$(unzip -Z "$OUT" | grep '^l' || true)
+if [ -n "$LINKS" ]; then
+  echo "package: the archive carries symbolic links:" >&2
+  echo "$LINKS" >&2
+  exit 1
+fi
+
+echo "package: archive clean: no banned directory, no credential-shaped path, no symlink"
+echo "package: note: the path scan reads names only; it cannot see inside an archived file"

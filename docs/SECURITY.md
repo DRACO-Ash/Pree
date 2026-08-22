@@ -68,6 +68,9 @@ the assessment store.
 | Every documented token floor matches the enforced constant | `docs/` | `test_every_documented_token_floor_matches_the_number_the_code_enforces` |
 | Sonar scans `src` only, read as a resolved property | `sonar-project.properties` | `test_the_sonar_configuration_scopes_sources_to_src` |
 | The upload archive carries no credential-shaped path | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
+| No handler writes an audit line an unauthenticated caller can size | `src/pree/app.py` | `test_a_long_request_path_cannot_write_an_unbounded_audit_line` |
+| Every hardening step runs in the stage that actually ships | `Dockerfile` | `test_every_hardening_step_runs_in_the_stage_that_actually_ships` |
+| The shipped collection cap matches the sheet and the volume | `src/pree/store.py` | `test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget` |
 
 ## Deliberately accepted risks
 
@@ -259,6 +262,46 @@ has, alongside the superseded floor. Both documents now state the enforced numbe
 `MIN_PRODUCTION_TOKEN_LENGTH` from the source and fails on any sentence about the token that
 states a different figure or names the retired rule, so the prose cannot drift from the
 constant again.
+
+Eleventh review: three majors, and the first of them is the same defect as round ten's own
+headline, one function higher up the file. Bounding the audit line for a rejected body left the
+request PATH unbounded, and a path is the cheaper attack: no upload, no valid token. A
+15,000-character request line wrote a 30,074-byte 401 record, because JSON escaping of control
+characters doubles the bytes on the way in, and h11 admits roughly 16 KiB of request line. All
+three handlers now truncate the path, and the reason string with it.
+
+The second was a hard rule with no guard behind it. The suid and sgid sweep was asserted to
+exist in some stage, and the shipped layer was asserted to be copied from some stage, and
+nothing joined the two. Moving the sweep into the `build` stage shipped every setuid binary the
+base image carries, `su`, `mount`, `passwd` and `newgrp` among them, with the whole suite green;
+repointing the shipped COPY at `build` shipped the unswept stage with pip in it. The guard now
+reads the `--from=` of the single shipped COPY and requires the sweep, the pip removal and the
+numeric user creation all to run in that stage, and refuses a positional stage reference.
+
+The third was this round's own headline left unasserted. The ten-error cap on the logged error
+list was correct in code and tested nowhere: the test sent five field names, so the cap was
+never reached. Deleting it wrote a 142,290-byte record from a 31,944-byte body, 5.6 times worse
+than the defect round ten fixed. The test now exceeds the cap and asserts the exact count.
+
+Four minors came with them, each an overstated claim of mine rather than a defect in the app.
+The token-floor guard caught one number form of five: a hyphenated figure, a spelled-out one, a
+sentence naming the credential but not the token, and a figure inside a table cell all passed,
+and a reworded variety rule was never examined because the floor gate ran first. Fragments are
+now built per line so a table row stays whole, the retired-rule check runs before the floor
+gate, and all eight fabrications are caught. The packaging scan named no certificate extension
+despite a comment claiming it did, followed symlinks so a link named `notes-appendix.md`
+shipped a private key's contents, and missed `.netrc`, `authorized_keys` and `creds.txt`; it
+now stores links as links, refuses them outright, and says plainly that it reads names and
+never bytes. A `# escape=` parser directive was invisible to the Dockerfile parser and honoured
+by docker, which split a continuation the parser had swallowed and left the resolved user as
+root: unknown parser directives are now refused the way heredocs are. And the shipped
+`MAX_ASSESSMENTS` value was unpinned, because every cap test monkeypatched it: raising it to
+10^9 left the suite green.
+
+Nine of nine mutations in the reviewer's own list now turn the suite red, verified one at a
+time. The pattern across the last four rounds is worth stating plainly, because it is not
+flattering: the application code has held every attack these rounds have run, and every defect
+found has been in a guard, in a document, or in a claim I made about one of them.
 
 Each of these now has a named regression test in the control table above.
 

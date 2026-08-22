@@ -6,6 +6,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -529,3 +530,33 @@ def test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing(tmp_path: Pa
     (data_dir / "assessments.json").write_text("[" * depth + "]" * depth, encoding="utf-8")
     with pytest.raises(StoreError, match="unreadable"):
         JsonStore(data_dir).read()
+
+
+def test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget() -> None:
+    """Every other cap test monkeypatches the constant, so the SHIPPED value was unpinned.
+
+    Setting MAX_ASSESSMENTS to 10**9 left the whole suite green. The mechanism was thoroughly
+    tested at 3 and at 5 records and the number that actually ships was tested nowhere, which
+    is the same class of gap as a guard asserting its own constant.
+    """
+    sheet = (Path(__file__).resolve().parent.parent / "docs" / "DEPLOYMENT.md").read_text(
+        encoding="utf-8"
+    )
+    stated = re.search(r"capped at (\d+)\s*\n?records", sheet) or re.search(
+        r"capped at (\d+)", sheet
+    )
+    assert stated is not None, "the deployment sheet states no record cap for the operator"
+    assert int(stated.group(1)) == store_module.MAX_ASSESSMENTS, (
+        f"the sheet documents a cap of {stated.group(1)} records but the code ships "
+        f"{store_module.MAX_ASSESSMENTS}"
+    )
+
+    # And the cap has to fit the volume. The sheet publishes 1258 bytes per record measured on
+    # this build; the snapshot is rewritten whole on every upsert, and a backup copy sits
+    # beside it, so the steady-state floor is twice the collection plus the temporary file.
+    measured_bytes_per_record = 1258
+    peak_bytes = store_module.MAX_ASSESSMENTS * measured_bytes_per_record * 3
+    assert peak_bytes <= 64 * 1024 * 1024, (
+        f"at the shipped cap the volume holds up to {peak_bytes / 1024 / 1024:.0f} MiB across "
+        "the snapshot, its backup and the temporary file, which is not a bounded footprint"
+    )
