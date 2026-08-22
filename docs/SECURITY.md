@@ -131,7 +131,8 @@ the assessment store.
 | The guarded interpreter version is the base image's | `Dockerfile` | `test_the_guarded_python_version_is_the_one_the_base_image_ships` |
 | A vetted RUN or COPY names an instruction the file actually has | `Dockerfile` | `test_every_vetted_instruction_is_one_the_dockerfile_actually_has` |
 | The middleware stack is the pinned one, per environment | `src/pree/app.py` | `test_the_middleware_stack_is_exactly_the_pinned_one` |
-| Middleware, handlers, route class and router dependencies are pinned on the LISTENER | `src/pree/main.py` | `test_every_request_handling_surface_of_the_built_app_is_pinned` |
+| Middleware, handler types, route class, router dependencies and overrides are pinned on the LISTENER | `src/pree/main.py` | `test_every_request_handling_surface_of_the_built_app_is_pinned` |
+| Every route's type is APIRoute EXACTLY, so a subclass cannot wrap the handler | `src/pree/app.py` | `test_the_route_table_holds_nothing_but_api_routes_and_the_documentation` |
 
 ## Deliberately accepted risks
 
@@ -1263,6 +1264,36 @@ That is four consecutive rounds with the boundary holding under a full live prob
 path matrix, prototype pollution, oversized and lying bodies, both framings on one connection,
 traversal in four encodings, the limiter under a rotating forwarding header, the actor label, the
 access log, and the token absent from every body, log line and store file.
+
+### Twenty-fifth review: one blocker, one minor, both the same mistake
+
+`isinstance` accepts a subclass. That single fact carried the blocker, and the fix for the round-24
+blocker had used it three times.
+
+An `APIRoute` SUBCLASS overriding `get_route_handler` IS the request handler. Registered through
+`app.router.add_api_route(..., route_class_override=SupportRoute)`, one returned the team token to
+any caller sending a chosen header, with 307 of 307 green and 100% statement coverage. Reproduced
+here: `GET /v1/support` without the header is a generic 401 with an `auth_reject` audit line, and
+with the header it is `200 {"support_token": "..."}`. It defeated three controls at once, and each
+for a different reason. The listener pin asserted `app.router.route_class is APIRoute`, which reads
+the router's DEFAULT factory, and the override is per route. Both route walks filtered on
+`isinstance(route, APIRoute)`, which a subclass satisfies. And `require_token` stayed in the route's
+dependant tree, so the gate walk read a correctly gated route while the handler wrapped around it
+ignored the gate entirely.
+
+Every route's type is now checked exactly, on both surfaces, because one subclassed route is
+enough. The same mistake in miniature produced the minor: the exception-handler pin compared bare
+`__name__` strings, and two different types can share a name, so a decoy handler on a second class
+called `StoreError` left the pinned set exactly equal. Handlers are pinned by type identity now,
+and reported module-qualified.
+
+Worth recording as a pattern rather than as two entries. Three consecutive rounds have found the
+same class of defect in the fix for the previous round: an enumerating filter, then a pin on the
+factory instead of the listener, now an `isinstance` where the type is the control. Each time the
+fix was correct about the mechanism it had just been shown and loose about the boundary of the
+category. `isinstance` is the sharpest instance of it, because the loose check and the strict one
+are one word apart and the loose one reads as more idiomatic Python. Where a type IS the control,
+identity is the test.
 
 ## Not accepted, and why it is not a risk here
 

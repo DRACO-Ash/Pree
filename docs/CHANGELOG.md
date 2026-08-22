@@ -625,3 +625,15 @@ Twenty-fourth security review, one blocker, two majors and one minor:
   replaced authentication module. Both are guarded, all four COPYs are vetted by exact text as a
   consequence, and a new test asserts every vetted entry names an instruction that exists.
 ● Three control rows in `docs/SECURITY.md` overstated their coverage and are restated.
+
+Twenty-fifth security review, one blocker and one minor, both the same mistake:
+
+● BLOCKER: an `APIRoute` SUBCLASS overriding `get_route_handler` is the request handler.
+  Registered with `route_class_override`, one returned the team token to any caller sending a
+  chosen header, with 307 of 307 green: the router-level pin reads the DEFAULT route class and the
+  override is per route, both route walks used `isinstance` which a subclass satisfies, and
+  `require_token` stayed visible in the dependant tree while the wrapping handler ignored it.
+  Every route's type is now checked exactly, on both surfaces.
+● The exception-handler pin compared bare `__name__` strings, and two types can share a name, so a
+  decoy handler on a second class called `StoreError` left the pinned set unchanged. Handlers are
+  pinned by type identity now and reported module-qualified.

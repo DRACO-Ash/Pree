@@ -15,9 +15,12 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException, Request
+from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.routing import Route
 
 from pree.app import (
     DOC_PATHS,
@@ -34,7 +37,7 @@ from pree.audit import build_logger
 from pree.health import StorageProber
 from pree.main import build
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
-from pree.security import MAX_ACTOR_LENGTH, sanitise_actor
+from pree.security import MAX_ACTOR_LENGTH, AuthError, sanitise_actor
 from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, PRODUCTION_TOKEN, TEST_TOKEN, build_client, make_config
 
@@ -1024,7 +1027,7 @@ def test_every_method_not_allowed_names_the_methods_that_are(client: TestClient)
     # added later was invisible to it. The table is the fact; the assertion reads the fact.
     checked = 0
     for route in _all_routes(client.app):
-        if not isinstance(route, APIRoute):
+        if type(route) is not APIRoute:
             continue
         target = route.path.replace("{key}", "probe:key")
         expected = (route.methods or set()) - {"OPTIONS"}
@@ -1482,14 +1485,24 @@ def test_the_route_table_holds_nothing_but_api_routes_and_the_documentation() ->
 
     The documentation routes are the one exemption, by PATH rather than by type: FastAPI
     registers them as plain Starlette routes and they exist only when PREE_ENV is development.
+
+    EXACT TYPE, not `isinstance`. A SUBCLASS of APIRoute satisfies isinstance while overriding
+    `get_route_handler`, which is the request handler itself: registered through
+    `add_api_route(..., route_class_override=SupportRoute)`, a subclass returned the team token to
+    any caller sending a chosen header, with 307 of 307 green and 100% coverage. It defeated three
+    controls at once. `app.router.route_class` stayed `APIRoute`, because the override is
+    per-route. `isinstance` passed, because a subclass is an instance. And `require_token` stayed
+    visible in the route's dependant tree, so the gate walk read a correctly gated route while the
+    handler wrapped around it ignored the gate. A subclass is a different handler wearing the
+    type's name, so the type must match exactly.
     """
     for env, expected_docs in (("development", EXPECTED_DOC_PATHS), ("production", frozenset())):
         with _app_in(env) as app:
             foreign = [
                 f"{type(route).__name__} {getattr(route, 'path', route)!r}"
                 for route in _all_routes(app)
-                if not isinstance(route, APIRoute)
-                and getattr(route, "path", None) not in expected_docs
+                if type(route) is not APIRoute
+                and not (type(route) is Route and getattr(route, "path", None) in expected_docs)
             ]
             assert not foreign, (
                 f"the {env} route table carries entries this suite cannot read the gate from, "
@@ -1554,19 +1567,29 @@ def _middleware_stack(app: Any) -> tuple[tuple[str, str | None], ...]:
 #
 # WebSocketRequestValidationError is Starlette's own default, present because FastAPI registers
 # it on every app; HTTPException is the base the StarletteHTTPException handler binds to.
+# BY IDENTITY, not by name. The first version pinned bare `__name__` strings, and two different
+# exception types can share a name: registering a second, differently-typed `StoreError` left the
+# name set exactly equal to the five pinned entries. The type objects themselves cannot collide.
 EXPECTED_EXCEPTION_HANDLERS = frozenset(
     {
-        "HTTPException",
-        "RequestValidationError",
-        "WebSocketRequestValidationError",
-        "AuthError",
-        "StoreError",
+        StarletteHTTPException,
+        RequestValidationError,
+        WebSocketRequestValidationError,
+        AuthError,
+        StoreError,
     }
 )
 
 
-def _handler_names(app: Any) -> frozenset[str]:
-    return frozenset(getattr(key, "__name__", str(key)) for key in app.exception_handlers)
+def _handler_keys(app: Any) -> frozenset[Any]:
+    return frozenset(app.exception_handlers)
+
+
+def _handler_labels(keys: frozenset[Any]) -> list[str]:
+    """Module-qualified, so a report names the type rather than a name two types can share."""
+    return sorted(
+        f"{getattr(key, '__module__', '?')}.{getattr(key, '__qualname__', key)}" for key in keys
+    )
 
 
 def test_the_middleware_stack_is_exactly_the_pinned_one() -> None:
@@ -1623,15 +1646,30 @@ def test_every_request_handling_surface_of_the_built_app_is_pinned(
                 assert _middleware_stack(app) == expected, (
                     f"{name} in {env} has middleware {_middleware_stack(app)}, not {expected}"
                 )
-                assert _handler_names(app) == EXPECTED_EXCEPTION_HANDLERS, (
+                assert _handler_keys(app) == EXPECTED_EXCEPTION_HANDLERS, (
                     f"{name} registers exception handlers "
-                    f"{sorted(_handler_names(app))}, not {sorted(EXPECTED_EXCEPTION_HANDLERS)}. A "
-                    "handler runs instead of the route and appears in no route table"
+                    f"{_handler_labels(_handler_keys(app))}, not "
+                    f"{_handler_labels(EXPECTED_EXCEPTION_HANDLERS)}. A handler runs instead of "
+                    "the route and appears in no route table"
                 )
                 assert app.router.route_class is APIRoute, (
                     f"{name} uses route class {app.router.route_class.__name__}; a custom route "
                     "class rewrites every request before the gate reads it, and leaves the gate "
                     "visible in the dependant tree while it does"
+                )
+                # And PER ROUTE, by exact type. The router-level assertion above reads the
+                # DEFAULT factory only, so `add_api_route(..., route_class_override=SupportRoute)`
+                # left it saying APIRoute while one route's handler forged the token header. Every
+                # route's type is checked, because one is enough.
+                subclassed = [
+                    f"{type(route).__name__} {getattr(route, 'path', route)!r}"
+                    for route in app.routes
+                    if type(route) is not APIRoute and type(route) is not Route
+                ]
+                assert not subclassed, (
+                    f"{name} carries routes whose type is neither APIRoute nor Route: "
+                    f"{subclassed}. An APIRoute SUBCLASS overrides get_route_handler, which is "
+                    "the request handler, and satisfies every isinstance check while doing it"
                 )
                 assert app.router.dependencies == [], (
                     f"{name} carries router-level dependencies {app.router.dependencies}, which "
@@ -1653,7 +1691,7 @@ def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestCl
     """
     checked = 0
     for route in _all_routes(client.app):
-        if not isinstance(route, APIRoute):
+        if type(route) is not APIRoute:
             continue
         gated = "require_token" in _dependency_names(route)
         if route.path in UNAUTHENTICATED_PATHS:
