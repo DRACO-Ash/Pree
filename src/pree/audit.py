@@ -23,10 +23,23 @@ MAX_ACCESS_PATH = 160
 
 
 def _clip(value: object) -> object:
-    """Clip one field of an access record, leaving non-strings alone."""
-    if isinstance(value, str) and len(value) > MAX_ACCESS_PATH:
-        return value[:MAX_ACCESS_PATH] + "[truncated]"
-    return value
+    """Clip one field of an access record, and redact any query string in it.
+
+    The redaction is not tidiness. `GET /diagnostics?x-pree-token=<the real token>` is refused
+    for authentication, correctly, and then the access log wrote the token verbatim into the pod
+    log store: the one channel in this application that ever held it in cleartext. No route
+    here takes a query parameter, so nothing is lost by dropping every query string, and the
+    filter that already rewrites this field is the cheapest place to do it.
+    """
+    if not isinstance(value, str):
+        return value
+    marked = value
+    if "?" in marked:
+        head, _, _ = marked.partition("?")
+        marked = f"{head}?[redacted]"
+    if len(marked) > MAX_ACCESS_PATH:
+        marked = marked[:MAX_ACCESS_PATH] + "[truncated]"
+    return marked
 
 
 class _TruncateRequestPath(logging.Filter):

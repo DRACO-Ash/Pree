@@ -98,6 +98,15 @@ the assessment store.
 | The storage probe publishes the data directory only on failure | `src/pree/health.py` | `test_the_storage_probe_publishes_the_data_directory_only_on_failure` |
 | Every read of the assessment store is audited | `src/pree/app.py` | `test_every_read_of_the_store_is_audited` |
 | A refused CORS preflight uses one contract and is audited | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
+| The framing guard is the outermost middleware | `src/pree/app.py` | `test_the_frame_guard_is_the_outermost_middleware` |
+| A guessing run cannot read the answer off the status code | `src/pree/app.py` | `test_a_guessing_run_cannot_read_the_answer_off_the_status_code` |
+| A refused preflight is metered | `src/pree/app.py` | `test_a_refused_preflight_is_metered` |
+| Production refuses a cleartext allowed origin | `src/pree/config.py` | `test_production_refuses_a_cleartext_allowed_origin` |
+| The access log redacts a query string | `src/pree/audit.py` | `test_the_access_log_filter_redacts_a_query_string` |
+| A malformed store key is refused at the boundary | `src/pree/app.py` | `test_a_malformed_store_key_is_refused_at_the_boundary` |
+| Nothing writes over a binary a hardening step names, at any WORKDIR | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
+| No instruction fetches from the network or rewrites the shipped PATH | `Dockerfile` | `test_no_instruction_fetches_from_the_network_or_rewrites_the_shipped_path` |
+| Exactly one environment file ships, the root example | `scripts/package-appstore.sh` | `test_the_example_environment_file_carries_no_real_value` |
 
 ## Deliberately accepted risks
 
@@ -633,6 +642,77 @@ a `_FLOOR_PHRASES` constant sat in the test module with a comment describing a r
 not implement, which is exactly the evidence inflation this document apologises for elsewhere,
 and it is deleted; and the per-record volume figure, wrong three times before, is now searched
 across all 64 indicator combinations rather than measured at one set of values.
+
+Sixteenth review: seven majors. Two of them defeated this round's own headline control with one
+attacker-chosen header, and two more were guards that reported a pass without running.
+
+The framing refusal moved from the innermost middleware to above the bodyless-method return
+last round, and still missed every CORS preflight, because Starlette answers a preflight inside
+the CORS middleware without calling down and CORS sits above the body-size layer. Measured: 200
+OK and two responses on one connection, with a pipelined GET served. A second shape got through
+even where the refusal did fire: the layer that normalises a refused preflight rewrote the 400
+into a fresh response and dropped the `Connection: close` that the refusal sets precisely so the
+trailing bytes cannot be replayed. Position is the whole control, and it took three attempts to
+find the one position nothing can answer above. `FrameGuard` now holds it, a test asserts it
+holds it, and the unreachable close-check that would have been the second line is deleted rather
+than left reading as a control.
+
+Choosing the rate-limit bucket by the token's validity fixed one defect and created a worse one:
+refusal itself became a free oracle. Once a peer saturated its unauthenticated bucket with wrong
+guesses, a wrong guess landed in the saturated bucket and returned 429 while the RIGHT token
+landed in a fresh bucket and returned 200, so the caller kept guessing at full speed and read the
+answer off the status code. Measured: 2,666 distinguishable guesses in three seconds, about
+53,000 a minute, against the 240 a minute this project's own token-length floor is calculated
+from. A peer now gets twenty wrong tokens per window, counted separately, and once that budget is
+spent every token-bearing request from it is refused whether the token is right or wrong.
+
+Refused preflights were never counted, because CORS answers them above the coarse limiter.
+Measured: 902,000 bytes of log in 1.6 seconds, about 32.9 MB a minute per worker, from an
+unauthenticated caller. That is the exact amplification class the bounded audit lines exist to
+close, on the one path nothing metered, and this round had just added a new audit line to it.
+
+The suid sweep guard was defeated for the FIFTH consecutive round, and both new ways were
+one line. `WORKDIR /usr/bin` with `COPY --from=build /bin/true find` writes `/usr/bin/find`
+while the destination token is just `find`, and the JSON form `COPY --from=build ["/bin/true",
+"/usr/bin/find"]` yields a token with a bracket on the end. The destination is now resolved
+against the WORKDIR in force and stripped of quoting. And `ADD https://…` replacing the
+application source, plus an `ENV PATH=` in the shipped stage hijacking the `sh` and `gunicorn`
+the pinned CMD resolves, both passed and are both refused now.
+
+The worst of the seven was the behavioural image check this project added last round precisely
+because text guards keep failing. Every assertion was `VALUE=$(docker run … || true)` followed by
+a test for emptiness, so a failed run read as a pass; and both used `--entrypoint /usr/bin/find`,
+so the mutation they exist to catch, a no-op binary copied over that path, made them print "no
+setuid or setgid bits" and pass. The one behavioural verification of the container hard rules was
+defeated by the very mutation that motivated it. It now exports the filesystem to the host with
+`docker export` and reads the modes from the tar listing, trusts nothing inside the image, checks
+the exit status of every command rather than the emptiness of its output, and asserts a positive
+control first so silence cannot be a pass.
+
+Eight minors. `GET /diagnostics?x-pree-token=<the token>` wrote the team token verbatim into the
+access log, the one channel in this application that ever held it in cleartext; query strings are
+now redacted and no route here takes a parameter. The read path's comment claimed a path
+validator that did not exist, in a round whose own commit message called that pattern out; the
+validator exists now and is asserted. The packaging script's `.env.example` exemption matched the
+basename anywhere, so `docs/.env.example` carrying a live-looking token shipped while the test
+that checks placeholders read only the root path; the exemption is anchored, the test reads the
+whole tree, and the script refuses a second environment file. Three more packaging nets read a
+tool failure as a pass, one of them using `grep -P`, which is absent from BusyBox: all three now
+check exit status, and the pattern is POSIX. The base digest lived in an `ARG`, so `--build-arg`
+swapped it while the guard resolved the default only; it is inline in both `FROM` lines and an
+`ARG` referenced by a `FROM` is refused. Production could run with credentials against an
+`http://` origin, putting the token on the wire; a non-https origin is refused in production.
+And the `cors_reject` audit recorded `origin_allowed: false` for every 400 on a preflight,
+including one raised for the allowed origin by a different control, so the only record of the
+event misstated its cause.
+
+Two things in this round were mine to notice rather than the reviewer's. The guessing budget's
+first implementation charged every token-bearing request, which would have locked out an operator
+who simply made more than twenty ordinary requests in a window: a denial of service dressed as a
+control. Separating the question from the charge needed a new `spent` method on the limiter, and
+that is what the code does now. And the container restarted mid-mutation-test leaving one
+mutation applied in the working tree; the snapshot discipline caught it on the next diff, which
+is the only reason it is not in this commit.
 
 Each of these now has a named regression test in the control table above.
 

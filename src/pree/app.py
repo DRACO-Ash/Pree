@@ -24,9 +24,10 @@ import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -91,7 +92,20 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 # arrives percent-decoded, and json.dumps renders one astral code point as a 12-byte surrogate
 # escape. The worst case is therefore about 12x this number, roughly 2 KB per record, which the
 # test asserts against that exact input rather than against an ASCII one.
+# The store key's shape, enforced at the boundary rather than assumed. Two identifiers of at
+# most 64 characters and the colon between them.
+STORE_KEY_MAX_LENGTH = 129
+STORE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 MAX_LOGGED_PATH = 160
+# Wrong tokens a single peer may present per window before every token-bearing request from it
+# is refused, right or wrong. Twenty is generous for a human pasting a value and mistyping it,
+# and it caps a guessing run at twenty attempts a minute per address rather than the tens of
+# thousands the validity-keyed buckets allowed. AUTH_FAILURE_COST spends the budget in one
+# step per failure; it exists as a named constant so the arithmetic is visible rather than
+# implied by a limit of one. Only FAILURES are charged: an operator with the right token can
+# make as many requests as the ordinary limiters allow.
+AUTH_FAILURE_LIMIT = 20
+AUTH_FAILURE_WINDOW_SECONDS = 60.0
 # The reason string is composed server-side in both handlers that log one: AuthError carries a
 # fixed literal, and StoreError embeds a configured path, never caller input. Truncating it to
 # the actor length cut "could not acquire the store lock at /proc/.../.assessments.json" off
@@ -119,22 +133,24 @@ _TOKEN_HEADER = "x-pree-token"  # noqa: S105 - a header NAME, not a credential
 _ACTOR_HEADER = "x-pree-actor"
 
 
-class BodySizeLimit:
-    """Reject an oversize request body before the application ever reads it.
+class FrameGuard:
+    """Refuse an ambiguously framed request, from the OUTERMOST layer.
 
-    The body is drained here, counted as it arrives, and replayed to the application from a
-    bounded buffer. Draining rather than wrapping the receive channel matters: raising from
-    inside a wrapped channel is caught by the framework's own body-parsing guard and reported
-    as a generic 400, so the cap could not state its own reason. Buffering answers both
-    shapes honestly, a declared Content-Length above the cap and a chunked body with no
-    declared length at all, and the buffer is bounded by the cap, which is the whole point.
+    Position is the whole control here, and two rounds got it wrong. The check first lived
+    inside the body-size middleware, after its bodyless-method early return, so it never ran
+    for GET, HEAD, OPTIONS, DELETE or TRACE: precisely the method class smuggling uses, because
+    a front end permits a GET with no body. Moving it above that return fixed those methods and
+    left a preflight open, because Starlette answers a CORS preflight inside the CORS
+    middleware without calling down, and CORS sits above the body-size layer. Measured: 200 OK
+    and two responses on one connection, with a pipelined GET served.
+
+    There is one position from which no other middleware can answer first, and this is it.
+    Nothing may be registered outside this except the hardening headers, which only decorate a
+    response on the way out.
     """
 
-    _BODYLESS_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE", "TRACE"})
-
-    def __init__(self, app: Any, max_bytes: int = MAX_BODY_BYTES) -> None:
+    def __init__(self, app: Any) -> None:
         self._app = app
-        self._max_bytes = max_bytes
 
     @staticmethod
     def _ambiguously_framed(scope: Any) -> bool:
@@ -153,17 +169,49 @@ class BodySizeLimit:
         return b"transfer-encoding" in names and b"content-length" in names
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http" and self._ambiguously_framed(scope):
+            body = json.dumps({"error": GENERIC_CLIENT_ERROR}).encode("utf-8")
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": status.HTTP_400_BAD_REQUEST,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                        # RFC 9112 section 6.1 says reject OR close. Both: the bytes after a
+                        # frame two parsers would read differently must not be reusable as a
+                        # pipelined request on this connection, whatever the front end made of
+                        # them. A layer below this one dropped this header while rewriting the
+                        # response, which is how the smuggled request got served.
+                        (b"connection", b"close"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self._app(scope, receive, send)
+
+
+class BodySizeLimit:
+    """Reject an oversize request body before the application ever reads it.
+
+    The body is drained here, counted as it arrives, and replayed to the application from a
+    bounded buffer. Draining rather than wrapping the receive channel matters: raising from
+    inside a wrapped channel is caught by the framework's own body-parsing guard and reported
+    as a generic 400, so the cap could not state its own reason. Buffering answers both
+    shapes honestly, a declared Content-Length above the cap and a chunked body with no
+    declared length at all, and the buffer is bounded by the cap, which is the whole point.
+    """
+
+    _BODYLESS_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "DELETE", "TRACE"})
+
+    def __init__(self, app: Any, max_bytes: int = MAX_BODY_BYTES) -> None:
+        self._app = app
+        self._max_bytes = max_bytes
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
             await self._app(scope, receive, send)
-            return
-
-        # BEFORE the bodyless-method return, not after. Placing it after meant the check never
-        # ran for GET, HEAD, OPTIONS, DELETE or TRACE, which is precisely the method class
-        # smuggling uses: a front end permits a GET with no body, so GET is the canonical
-        # CL.TE carrier. One socket write of `GET /healthz` with both framings produced two
-        # 200s. The refusal was written to close that exact primitive and did not.
-        if self._ambiguously_framed(scope):
-            await self._reject(send, status.HTTP_400_BAD_REQUEST, close=True)
             return
 
         if scope.get("method") in self._BODYLESS_METHODS:
@@ -214,21 +262,24 @@ class BodySizeLimit:
                     return False
         return False
 
-    async def _reject(
-        self, send: Any, code: int = status.HTTP_413_CONTENT_TOO_LARGE, close: bool = False
-    ) -> None:
-        """Answer from the middleware, without the application ever seeing the request."""
+    async def _reject(self, send: Any) -> None:
+        """Answer from the middleware, without the application ever seeing the request.
+
+        No `close` parameter any more. It existed for the ambiguous-frame refusal, which now
+        lives in FrameGuard above every other layer, so keeping it here left an unreachable
+        branch reading as a control.
+        """
         body = json.dumps({"error": GENERIC_CLIENT_ERROR}).encode("utf-8")
-        headers = [
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(body)).encode("ascii")),
-        ]
-        if close:
-            # RFC 9112 section 6.1 says reject OR close on an ambiguous frame. Doing both means
-            # the bytes after a frame two parsers would read differently cannot be reused as a
-            # pipelined request on this connection, whatever the front end made of them.
-            headers.append((b"connection", b"close"))
-        await send({"type": "http.response.start", "status": code, "headers": headers})
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status.HTTP_413_CONTENT_TOO_LARGE,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
         await send({"type": "http.response.body", "body": body})
 
 
@@ -274,6 +325,20 @@ def _first_refused(limiter: RateLimiter, keys: tuple[str, ...]) -> str | None:
     return refused
 
 
+def _peer_key(request: Request) -> str:
+    """The socket peer, folded to one literal when any forwarding header is present."""
+    if _FORWARD_HEADERS & {name.lower() for name in request.headers}:
+        return "forwarded"
+    client = request.client
+    return client.host if client else "unknown"
+
+
+def _is_authenticated(request: Request, config: Config) -> bool:
+    """Constant-time check of the presented token, for bucket selection only."""
+    presented = request.headers.get(_TOKEN_HEADER)
+    return bool(config.team_token and presented and token_matches(presented, config.team_token))
+
+
 def _limit_keys(request: Request, config: Config) -> tuple[str, ...]:
     """Every bucket this request must fit inside. Refused if ANY of them is over.
 
@@ -283,24 +348,59 @@ def _limit_keys(request: Request, config: Config) -> tuple[str, ...]:
     already at its limit escaped simply by adding X-Forwarded-For. Measured: a throttled
     caller went back to 404 by adding any of three headers. Charging both keys means a header
     can only ever reduce a caller's allowance, never increase it.
+
+    The space is chosen by the token's VALIDITY, not its presence, so an unauthenticated caller
+    cannot reach the operators' budget with `X-Pree-Token: anything`. That choice creates a
+    guessing oracle on its own, which is why `_guessing_budget_spent` exists below and must be
+    consulted BEFORE these keys are used.
     """
-    headers = request.headers
+    space = "auth" if _is_authenticated(request, config) else "unauth"
+    peer = _peer_key(request)
+    keys = [f"{space}:{peer}"]
+    if peer != "forwarded":
+        return tuple(keys)
+    # A forwarded request is charged to the fold AND to the socket peer, so a header can only
+    # ever reduce an allowance. Both live in the same space, so switching space cannot escape
+    # either: the guessing budget below is what stops that.
+    client = request.client
+    keys.append(f"{space}:socket:{client.host if client else 'unknown'}")
+    return tuple(keys)
+
+
+def _guessing_budget_spent(request: Request, config: Config, failures: RateLimiter) -> bool:
+    """Has this peer spent its budget of wrong tokens? Charged before validity is used.
+
+    Deciding the rate-limit bucket by the token's validity fixed one defect and created a
+    worse one: refusal itself became a free oracle. Once a peer saturated its `unauth:` bucket
+    with wrong guesses, every wrong guess landed in the saturated bucket and returned 429 while
+    the RIGHT token landed in a fresh `auth:` bucket and returned 200, so the caller could keep
+    guessing at full speed and read the answer off the status code. Measured: 2,666
+    distinguishable guesses in three seconds, about 53,000 a minute, against the 240 a minute
+    that config.py asserts and uses to justify the token length floor.
+
+    So a peer gets a bounded number of WRONG tokens, counted separately, and once that budget
+    is spent every token-bearing request from that peer is refused whether the token is right
+    or wrong. Wrong and right become indistinguishable again, which is the property the floor
+    calculation depends on.
+
+    Charged on the socket peer, never on the fold: a caller must not be able to spend someone
+    else's guessing budget by naming a forwarding header, and must not be able to escape its
+    own by adding one.
+    """
+    if request.headers.get(_TOKEN_HEADER) is None:
+        return False
     client = request.client
     peer = client.host if client else "unknown"
-    # VALIDITY, not presence. `space = "auth" if headers.get(...)` let an unauthenticated
-    # caller into the operators' space with `X-Pree-Token: anything`, which is the same defect
-    # as keying on the actor header: the caller picks its own bucket. Measured: flooding with a
-    # garbage token header then presenting the real one from the same peer returned 429. The
-    # compare is the constant-time one, so this is not a new timing surface.
-    presented = headers.get(_TOKEN_HEADER)
-    authenticated = bool(
-        config.team_token and presented and token_matches(presented, config.team_token)
-    )
-    space = "auth" if authenticated else "unauth"
-    keys = [f"{space}:{peer}"]
-    if _FORWARD_HEADERS & {name.lower() for name in headers}:
-        keys.append(f"{space}:forwarded")
-    return tuple(keys)
+    key = f"guess:{peer}"
+    # ASK first, without charging. Charging every token-bearing request to the failure budget
+    # would lock out a legitimate operator who simply made more than AUTH_FAILURE_LIMIT ordinary
+    # requests in a window, which is a denial of service dressed as a control. The question and
+    # the charge have to be separable, which is why RateLimiter.spent exists.
+    if failures.spent(key):
+        return True
+    if not _is_authenticated(request, config):
+        failures.allow(key)
+    return False
 
 
 def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
@@ -555,7 +655,7 @@ def register_api_routes(
 
     @app.get("/v1/assessments/{key}", dependencies=[Depends(require_token)])
     def read_assessment(
-        key: str,
+        key: Annotated[str, PathParam(max_length=STORE_KEY_MAX_LENGTH, pattern=STORE_KEY_PATTERN)],
         response: Response,
         x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
         if_none_match: str | None = Header(default=None, alias="if-none-match"),
@@ -573,9 +673,10 @@ def register_api_routes(
         actor = sanitise_actor(x_pree_actor)
         record = store.read()["assessments"].get(key)
         elapsed = int((time.monotonic() - started) * 1000)
-        # The key is caller-supplied, but it reached here through the path validator, so it is
-        # already shape-checked. Truncated anyway: a bound that depends on another layer's
-        # correctness is a bound that moves when that layer does.
+        # The path validator on the parameter above is what shape-checks this, and it exists
+        # because this comment previously CLAIMED a validator that was not there. Truncated
+        # anyway: a bound that depends on another layer's correctness is a bound that moves
+        # when that layer does, and an astral-plane key still costs twelve JSON bytes each.
         audited_key = key[:MAX_LOGGED_PATH]
         if record is None:
             audit(audit_log, "read_assessment", actor, elapsed, "not_found", key=audited_key)
@@ -591,6 +692,80 @@ def register_api_routes(
         return record
 
 
+def register_cors(
+    app: FastAPI,
+    config: Config,
+    audit_log: logging.Logger,
+    refuse_over_limit: Callable[[Request], Response | None],
+) -> None:
+    """Register CORS and the layer that normalises and meters what CORS answers itself.
+
+    Extracted because create_app grew past its statement budget, and because the ordering here
+    is a security property that deserves to be read in one place: the normaliser must sit
+    OUTSIDE CORSMiddleware, since Starlette answers a preflight inside it without calling down,
+    and that makes this the only layer that can meter a preflight or see its response.
+    """
+    if config.allowed_origin:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[config.allowed_origin],
+            allow_credentials=True,
+            allow_methods=["GET", "POST"],
+            allow_headers=[_TOKEN_HEADER, _ACTOR_HEADER, "content-type"],
+        )
+
+        @app.middleware("http")
+        async def normalise_cors_rejection(
+            request: Request, call_next: Callable[[Request], Awaitable[Response]]
+        ) -> Response:
+            """Bring a refused preflight inside the one error contract, and audit it.
+
+            Starlette answers a disallowed preflight itself, with a 400 whose body is the plain
+            text "Disallowed CORS origin" and no audit line. The body carries no caller input,
+            so this was contract drift rather than a reflection, but the control table claimed
+            every rejection used one contract and was audited, and this one did neither. Sitting
+            ABOVE the CORS middleware is the only place that can see its answer, and it is
+            also the only place that can METER a preflight: CORS answers one itself without
+            calling down, so the coarse limiter below never saw one. Unmetered, refused
+            preflights wrote 902,000 bytes of log in 1.6 seconds, about 32.9 MB a minute per
+            worker, from an unauthenticated caller: the exact class of amplification the
+            bounded audit lines exist to close, on the one path nothing counted.
+            """
+            if request.method == "OPTIONS":
+                over = refuse_over_limit(request)
+                if over is not None:
+                    return over
+            response = await call_next(request)
+            if response.status_code != status.HTTP_400_BAD_REQUEST:
+                return response
+            if request.method != "OPTIONS" or "origin" not in request.headers:
+                return response
+            # There is no "leave a Connection: close response alone" branch here, and there
+            # was one for a while. It was unreachable, because FrameGuard sits outside this
+            # layer and answers an ambiguously framed request before it arrives, and an
+            # unreachable branch that reads as a control is the thing this project keeps
+            # deleting. What replaces it is an assertion that FrameGuard IS outermost, which
+            # is the property that makes the branch unnecessary.
+            audit_log.warning(
+                json.dumps(
+                    {
+                        "kind": "cors_reject",
+                        "path": request.url.path[:MAX_LOGGED_PATH],
+                        # The ACTUAL reason. This field said origin_allowed=false for every 400
+                        # on a preflight, including one raised for the allowed origin by a
+                        # different control, so the only record of the event misstated it.
+                        "origin_allowed": request.headers.get("origin") == config.allowed_origin,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            return JSONResponse(
+                {"error": GENERIC_CLIENT_ERROR},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+
 def create_app(
     config: Config,
     store: JsonStore,
@@ -599,6 +774,7 @@ def create_app(
     prober: StorageProber | None = None,
     global_limiter: RateLimiter | None = None,
     actor_limiter: RateLimiter | None = None,
+    failure_limiter: RateLimiter | None = None,
 ) -> FastAPI:
     """Build the app from injected dependencies. Does not listen."""
     audit_log = logger or build_logger()
@@ -607,6 +783,9 @@ def create_app(
     bound_access_log()
     coarse = global_limiter or RateLimiter(GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
     fine = actor_limiter or RateLimiter(ACTOR_LIMIT, ACTOR_WINDOW_SECONDS)
+    # Wrong tokens per peer, counted separately from traffic so a legitimate operator's normal
+    # request rate can never exhaust it and a guessing run cannot hide inside it.
+    auth_failures = failure_limiter or RateLimiter(AUTH_FAILURE_LIMIT, AUTH_FAILURE_WINDOW_SECONDS)
     # Holds the last observed storage state so a change of state can be logged once, rather
     # than every probe restating it. A pod the platform later kills still leaves a narrative.
     last_ready: dict[str, bool | None] = {"writable": None}
@@ -643,9 +822,32 @@ def create_app(
             last_ready["writable"] = probe.writable
         return probe
 
-    # --- innermost of the middleware stack, above the routes (four layers with CORS
-    # configured, three without, since that registration is conditional) ---
+    # --- innermost of the middleware stack, above the routes. Later registrations are
+    # OUTERMOST, so the order below reads inside-out. Which layer sits where is a security
+    # property, not a style choice, and getting it wrong is what the last round's framing
+    # defect was: the check lived in the innermost layer and CORS answered above it. ---
     app.add_middleware(BodySizeLimit)
+
+    def _refuse_over_limit(request: Request) -> Response | None:
+        """Charge the coarse limiter, and refuse if any of the request's buckets is over."""
+        if request.url.path in UNMETERED_PATHS:
+            return None
+        if _guessing_budget_spent(request, config, auth_failures):
+            # Deliberately the same 429 a rate limit gives, with no hint that the reason was a
+            # wrong token. Answering differently here would rebuild the oracle this closes.
+            return JSONResponse(
+                {"error": RATE_LIMITED_ERROR},
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(int(AUTH_FAILURE_WINDOW_SECONDS))},
+            )
+        refused = _first_refused(coarse, _limit_keys(request, config))
+        if refused is None:
+            return None
+        return JSONResponse(
+            {"error": RATE_LIMITED_ERROR},
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(coarse.retry_after_seconds(refused))},
+        )
 
     @app.middleware("http")
     async def coarse_rate_limit(
@@ -657,63 +859,26 @@ def create_app(
         The liveness paths and the storage probe are exempt; rate-limiting the platform's own
         probes would present an infrastructure fault as an application failure, and would let
         rejected traffic restart the pod.
+
+        A CORS preflight never reaches this layer, because Starlette answers it inside the CORS
+        middleware above. Preflights are metered separately, outside CORS: unmetered they wrote
+        32.9 MB of log a minute per worker from an unauthenticated caller.
         """
-        if request.url.path in UNMETERED_PATHS:
-            return await call_next(request)
-        refused = _first_refused(coarse, _limit_keys(request, config))
-        if refused is not None:
-            return JSONResponse(
-                {"error": RATE_LIMITED_ERROR},
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                headers={"Retry-After": str(coarse.retry_after_seconds(refused))},
-            )
-        return await call_next(request)
+        over = _refuse_over_limit(request)
+        return over if over is not None else await call_next(request)
 
     # --- second-outermost: CORS, so it wraps every rejection the layers below emit. The
     # hardening headers are registered after this and are therefore outermost. ---
     # Fail-closed by construction: only the configured origin, and load_config refuses to
     # start on a wildcard origin with a token, so by here the origin is absent or safe.
-    if config.allowed_origin:
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=[config.allowed_origin],
-            allow_credentials=True,
-            allow_methods=["GET", "POST"],
-            allow_headers=[_TOKEN_HEADER, _ACTOR_HEADER, "content-type"],
-        )
+    register_cors(app, config, audit_log, _refuse_over_limit)
 
-        @app.middleware("http")
-        async def normalise_cors_rejection(
-            request: Request, call_next: Callable[[Request], Awaitable[Response]]
-        ) -> Response:
-            """Bring a refused preflight inside the one error contract, and audit it.
-
-            Starlette answers a disallowed preflight itself, with a 400 whose body is the plain
-            text "Disallowed CORS origin" and no audit line. The body carries no caller input,
-            so this was contract drift rather than a reflection, but the control table claimed
-            every rejection used one contract and was audited, and this one did neither. Sitting
-            ABOVE the CORS middleware is the only place that can see its answer.
-            """
-            response = await call_next(request)
-            if response.status_code != status.HTTP_400_BAD_REQUEST:
-                return response
-            if request.method != "OPTIONS" or "origin" not in request.headers:
-                return response
-            audit_log.warning(
-                json.dumps(
-                    {
-                        "kind": "cors_reject",
-                        "path": request.url.path[:MAX_LOGGED_PATH],
-                        "origin_allowed": False,
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-            )
-            return JSONResponse(
-                {"error": GENERIC_CLIENT_ERROR},
-                status_code=status.HTTP_400_BAD_REQUEST,
-            )
+    # --- second-outermost: the framing guard. It has to be above CORS, because Starlette
+    # answers a preflight inside the CORS middleware without calling down, so a preflight
+    # carrying both framings never reached the check while it lived in BodySizeLimit: measured,
+    # 200 OK and two responses on one connection with a smuggled GET served. Registered before
+    # security_headers only so the hardening headers still wrap it. ---
+    app.add_middleware(FrameGuard)
 
     @app.middleware("http")
     async def security_headers(

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from pree.app import MAX_BODY_BYTES, BodySizeLimit
+from pree.app import MAX_BODY_BYTES, BodySizeLimit, FrameGuard
 
 
 async def _echo(scope: Any, receive: Any, send: Any) -> None:
@@ -24,7 +24,9 @@ async def _echo(scope: Any, receive: Any, send: Any) -> None:
 
 
 async def _run(
-    middleware: BodySizeLimit, scope: dict[str, Any], messages: list[dict[str, Any]]
+    middleware: BodySizeLimit | FrameGuard,
+    scope: dict[str, Any],
+    messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     queue = list(messages)
     sent: list[dict[str, Any]] = []
@@ -130,7 +132,7 @@ async def test_a_request_declaring_both_framings_is_refused() -> None:
     choice rather than an oversight.
     """
     scope = _post_scope([(b"transfer-encoding", b"chunked"), (b"content-length", b"6")])
-    sent = await _run(BodySizeLimit(_echo), scope, [{"type": "http.request", "body": b"0"}])
+    sent = await _run(FrameGuard(_echo), scope, [{"type": "http.request", "body": b"0"}])
     assert sent[0]["status"] == 400, (
         f"a request declaring both framings reached the application with {sent[0]['status']}"
     )
@@ -157,7 +159,7 @@ async def test_a_request_declaring_both_framings_is_refused_on_a_bodyless_method
             "method": method,
             "headers": [(b"transfer-encoding", b"chunked"), (b"content-length", b"6")],
         }
-        sent = await _run(BodySizeLimit(_echo), scope, [])
+        sent = await _run(FrameGuard(_echo), scope, [])
         assert sent[0]["status"] == 400, (
             f"{method} with both framings reached the application with {sent[0]['status']}"
         )
@@ -171,6 +173,8 @@ async def test_either_framing_header_alone_is_still_accepted() -> None:
     """The refusal is about the PAIR. Refusing either alone would break every normal request."""
     for header in ((b"content-length", b"1"), (b"transfer-encoding", b"chunked")):
         sent = await _run(
-            BodySizeLimit(_echo), _post_scope([header]), [{"type": "http.request", "body": b"x"}]
+            FrameGuard(BodySizeLimit(_echo)),
+            _post_scope([header]),
+            [{"type": "http.request", "body": b"x"}],
         )
         assert sent[0]["status"] == 200, f"{header!r} alone was refused"

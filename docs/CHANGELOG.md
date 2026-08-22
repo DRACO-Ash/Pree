@@ -380,3 +380,35 @@ that did not do what their commit messages said:
 ● A refused CORS preflight was answered in plain text with no audit line, outside the contract.
 ● `HEALTHCHECK NONE`, `VOLUME` and `STOPSIGNAL` in the shipped stage all passed silently.
 ● A `_FLOOR_PHRASES` constant described a rule the guard did not implement; deleted.
+
+Sixteenth security review, seven majors:
+
+● The framing refusal still missed every CORS preflight: Starlette answers one inside the CORS
+  middleware without calling down, and CORS sits above the body-size layer where the check
+  lived. Measured 200 OK and two responses on one connection with a pipelined GET served. The
+  check now lives in `FrameGuard`, registered outermost, with a test asserting the position.
+● The layer that normalises a refused preflight rewrote the 400 and dropped its
+  `Connection: close`, so the trailing bytes of an ambiguous frame could still be replayed.
+● Choosing the rate bucket by the token's validity made refusal an oracle: after saturating the
+  unauthenticated bucket, a wrong guess returned 429 and the right token 200. Measured 2,666
+  distinguishable guesses in three seconds, about 53,000 a minute, against the 240 a minute the
+  token-length floor is calculated from. A peer now gets twenty wrong tokens per window, and once
+  spent every token-bearing request is refused whether right or wrong.
+● Refused preflights were never metered, because CORS answers them above the coarse limiter:
+  902,000 bytes of log in 1.6 seconds, about 32.9 MB a minute per worker, unauthenticated.
+● The suid sweep guard was defeated for the fifth round: `WORKDIR /usr/bin` with a relative COPY
+  destination, and the JSON-form COPY. Destinations are now resolved against the WORKDIR.
+● `ADD https://…` replacing the application source, and `ENV PATH=` in the shipped stage
+  hijacking the binaries the pinned CMD resolves, both passed. Both are refused.
+● The behavioural image check added last round reported a pass without running: every assertion
+  read a failed `docker run` as empty output, and both used `--entrypoint /usr/bin/find`, the
+  very binary the mutation replaces. It now exports the filesystem with `docker export`, reads
+  modes from the host, checks exit status, and asserts a positive control first.
+● `GET /diagnostics?x-pree-token=<token>` wrote the token into the access log in cleartext.
+● The read path's comment claimed a path validator that did not exist. It exists and is asserted.
+● `docs/.env.example` with a live-looking token shipped: the packaging exemption matched the
+  basename anywhere while the placeholder test read only the root path.
+● Three packaging nets read a tool failure as a pass, one using `grep -P`, absent from BusyBox.
+● The base digest lived in an `ARG`, so `--build-arg` could swap it past the pinning guard.
+● Production could run with credentials against an `http://` origin. Non-https is refused.
+● The `cors_reject` audit misstated its cause for every 400 on a preflight.

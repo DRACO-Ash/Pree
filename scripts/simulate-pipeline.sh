@@ -73,41 +73,65 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   docker build -t pree:simulated .
   echo "container build: green"
 
-  # The container hard rules are asserted against the BUILT IMAGE here, not against the
-  # Dockerfile's text. Four consecutive security reviews defeated the text guards, each in a
-  # new place: the sweep moved to another stage, its predicate was narrowed, PATH was changed
-  # so `find` resolved elsewhere, and a no-op binary was copied over /usr/bin/find. Every one
-  # of those left the whole suite green, because text cannot verify what an image contains.
-  # These three checks can. They run only when a daemon exists, which is why the no-daemon
-  # branch below exits 2 rather than reporting a pass.
+  # The container hard rules are asserted against the BUILT IMAGE, and asserted from OUTSIDE
+  # it. The first version of these checks ran `docker run --entrypoint /usr/bin/find` and
+  # treated empty output as a pass, which was wrong twice over: a failed run produces empty
+  # output, and the mutation these checks exist to catch is a no-op binary copied over
+  # /usr/bin/find, so the attack made the check print "no setuid or setgid bits" and pass.
+  #
+  # `docker export` streams the flattened filesystem to the host, so nothing inside the image
+  # is trusted to report on it. Every check names the tool that must produce output, so silence
+  # is a failure rather than a pass.
+  CONTAINER=$(docker create pree:simulated) || { echo "image: docker create failed" >&2; exit 1; }
+  LISTING=$(mktemp)
+  if ! docker export "$CONTAINER" | tar -tv > "$LISTING"; then
+    echo "image: could not export the built filesystem for inspection" >&2
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+  # Positive control FIRST: if the listing is short, the export failed quietly and every
+  # assertion below would pass by saying nothing.
+  ENTRIES=$(wc -l < "$LISTING")
+  if [ "$ENTRIES" -lt 1000 ]; then
+    echo "image: the exported listing has only $ENTRIES entries, so it did not export" >&2
+    exit 1
+  fi
+  echo "image: exported $ENTRIES filesystem entries for inspection"
+
   echo "--- image: no setuid or setgid bits ---"
-  BITS=$(docker run --rm --entrypoint /usr/bin/find pree:simulated \
-    / -xdev -perm /6000 \( -type f -o -type d \) -print 2>/dev/null || true)
-  if [ -n "$BITS" ]; then
-    echo "image: setuid or setgid bits present in the shipped filesystem:" >&2
-    echo "$BITS" >&2
+  # tar -tv renders the mode as e.g. -rwsr-xr-x. s or S in the user or group execute position
+  # is the /6000 mask. Read from the host listing, not from a binary inside the image.
+  if awk '{ m = substr($1, 1, 10) } substr(m,4,1) ~ /[sS]/ || substr(m,7,1) ~ /[sS]/ { print }' \
+       "$LISTING" | grep . >&2; then
+    echo "image: setuid or setgid bits present in the shipped filesystem (listed above)" >&2
     exit 1
   fi
   echo "image: no setuid or setgid bits"
 
-  echo "--- image: runs as the non-root numeric user ---"
-  IDENTITY=$(docker run --rm --entrypoint /opt/venv/bin/python pree:simulated \
-    -c 'import os;print(f"{os.getuid()}:{os.getgid()}")')
-  if [ "$IDENTITY" != "10001:10001" ]; then
-    echo "image: runtime identity is $IDENTITY, not 10001:10001" >&2
-    exit 1
-  fi
-  echo "image: runs as $IDENTITY"
-
   echo "--- image: the package manager does not ship ---"
-  PIPS=$(docker run --rm --entrypoint /usr/bin/find pree:simulated \
-    /opt/venv/bin /usr/local/bin -maxdepth 1 -name 'pip*' -print 2>/dev/null || true)
-  if [ -n "$PIPS" ]; then
-    echo "image: pip is present in the shipped filesystem:" >&2
-    echo "$PIPS" >&2
+  if grep -E '(^|/)(opt/venv/bin|usr/local/bin)/pip' "$LISTING" >&2; then
+    echo "image: pip is present in the shipped filesystem (listed above)" >&2
     exit 1
   fi
   echo "image: no pip in the shipped filesystem"
+
+  echo "--- image: runs as the non-root numeric user ---"
+  # The one check that must run INSIDE the image, because an identity is a runtime property.
+  # It fails closed: an unset or unexpected value is a failure, and the command is the venv
+  # python the CMD itself uses, so a broken interpreter fails here rather than at deploy.
+  if ! IDENTITY=$(docker run --rm --entrypoint /opt/venv/bin/python pree:simulated \
+       -c 'import os;print(f"{os.getuid()}:{os.getgid()}")'); then
+    echo "image: could not read the runtime identity" >&2
+    exit 1
+  fi
+  if [ "$IDENTITY" != "10001:10001" ]; then
+    echo "image: runtime identity is '$IDENTITY', not 10001:10001" >&2
+    exit 1
+  fi
+  echo "image: runs as $IDENTITY"
+  rm -f "$LISTING"
 else
   # An honest non-zero skip, never a green pass. Continuous integration is the binding source
   # of truth for this leg, and it is the ONLY place the three image assertions above can run,

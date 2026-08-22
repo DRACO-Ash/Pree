@@ -190,7 +190,7 @@ def test_the_access_log_filter_bounds_the_request_line() -> None:
     access.handlers = [handler]
     access.setLevel(logging.INFO)
     access.propagate = False
-    long_path = "/healthz?" + "x" * 15_000
+    long_path = "/healthz/" + "x" * 15_000
     access.info('%s - "%s %s HTTP/%s" %d', "10.0.0.1", "GET", long_path, "1.1", 200)
 
     written = buffer.getvalue()
@@ -232,7 +232,7 @@ def test_the_access_log_filter_also_bounds_a_pre_formatted_line() -> None:
     access.handlers = [handler]
     access.setLevel(logging.INFO)
     access.propagate = False
-    access.info('10.0.0.1 - "GET /healthz?%s HTTP/1.1" 200' % ("x" * 15_000))
+    access.info('10.0.0.1 - "GET /healthz/%s HTTP/1.1" 200' % ("x" * 15_000))
     written = buffer.getvalue()
     assert "[truncated]" in written, "the pre-formatted path was not truncated"
     assert len(written) < MAX_ACCESS_PATH * 4 + 200, f"the line is {len(written)} bytes"
@@ -255,7 +255,7 @@ def test_the_access_log_filter_bounds_the_mapping_shape_gunicorn_emits() -> None
     access.handlers = [handler]
     access.setLevel(logging.INFO)
     access.propagate = False
-    atoms = {"h": "10.0.0.1", "r": "GET /healthz?" + "x" * 15_000 + " HTTP/1.1", "s": "200"}
+    atoms = {"h": "10.0.0.1", "r": "GET /healthz/" + "x" * 15_000 + " HTTP/1.1", "s": "200"}
     access.info('%(h)s "%(r)s" %(s)s', atoms)
 
     written = buffer.getvalue()
@@ -296,3 +296,33 @@ def test_the_retry_after_read_happens_under_the_same_lock_as_the_count() -> None
         "retry_after_seconds read the shared key table without taking the lock that allow() "
         "takes, so a concurrent prune can empty the deque between its two reads"
     )
+
+
+def test_the_access_log_filter_redacts_a_query_string() -> None:
+    """A token in a query string was the one channel that ever held it in cleartext.
+
+    `GET /diagnostics?x-pree-token=<the real token>` is refused for authentication, correctly,
+    and then the access log wrote the token verbatim into the pod log store. No route in this
+    application takes a query parameter, so dropping every query string costs nothing.
+    """
+    bound_access_log()
+    access = logging.getLogger("uvicorn.access")
+    buffer = io.StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    access.handlers = [handler]
+    access.setLevel(logging.INFO)
+    access.propagate = False
+    secret = "Ab3-Cd6_Ef9.Gh2~Ij5Kl8Mn1Op4Qr7St"
+    access.info(
+        '%s - "%s %s HTTP/%s" %d',
+        "10.0.0.1",
+        "GET",
+        f"/diagnostics?x-pree-token={secret}&next=/",
+        "1.1",
+        401,
+    )
+    written = buffer.getvalue()
+    assert secret not in written, f"the access log carries the token: {written}"
+    assert "[redacted]" in written
+    assert "/diagnostics" in written, "the redaction destroyed the path the operator needs"

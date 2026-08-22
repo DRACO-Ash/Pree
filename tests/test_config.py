@@ -339,3 +339,46 @@ def test_a_generated_token_clears_both_production_floors(
         }
     )
     assert config.auth_enabled is True
+
+
+def test_production_refuses_a_cleartext_allowed_origin(tmp_path: Path) -> None:
+    """CORS is configured with credentials, so an http origin puts the token on the wire.
+
+    The origin pattern admitted `http://` in every environment, and nothing checked the scheme,
+    so production could run with `allow_credentials=True` against a cleartext origin: the browser
+    attaches the team token to a cross-origin request and it crosses the network unencrypted.
+    Development still allows http, because localhost has no certificate.
+    """
+    for origin in ("http://pree.apps.bluestaq.com", "http://localhost:3000"):
+        with pytest.raises(ConfigError, match="not https"):
+            load_config(
+                {
+                    "PREE_ENV": "production",
+                    "PREE_TEAM_TOKEN": "Ab3-Cd6_Ef9.Gh2~Ij5Kl8Mn1Op4Qr7St",
+                    "PREE_ALLOWED_ORIGIN": origin,
+                    "PREE_DATA_DIR": str(tmp_path),
+                }
+            )
+
+    # https is accepted, and development is unaffected.
+    assert (
+        load_config(
+            {
+                "PREE_ENV": "production",
+                "PREE_TEAM_TOKEN": "Ab3-Cd6_Ef9.Gh2~Ij5Kl8Mn1Op4Qr7St",
+                "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
+                "PREE_DATA_DIR": str(tmp_path),
+            }
+        ).allowed_origin
+        == "https://pree.apps.bluestaq.com"
+    )
+    assert (
+        load_config(
+            {
+                "PREE_ENV": "development",
+                "PREE_ALLOWED_ORIGIN": "http://localhost:3000",
+                "PREE_DATA_DIR": str(tmp_path),
+            }
+        ).allowed_origin
+        == "http://localhost:3000"
+    )

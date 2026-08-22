@@ -36,6 +36,15 @@ zip -qry "$OUT" $INCLUDE \
      '*/.pytest_cache/*' '*/data/*' '*.env' '*.zip'
 
 echo "package: wrote $OUT"
+
+# Both listings, captured ONCE with their exit status checked. Every check below reads these
+# variables rather than re-running unzip, because `$(cmd || true)` reads a tool failure as an
+# empty result and an empty result is what every one of these nets treats as a pass.
+if ! LISTING=$(unzip -Z "$OUT") || ! LISTING_NAMES=$(unzip -Z1 "$OUT"); then
+  echo "package: could not read the archive listing, so no check below has run" >&2
+  exit 1
+fi
+
 echo "--- archive root ---"
 unzip -l "$OUT" | awk 'NR>3 && $4 !~ /\// {print $4}' | head -20
 
@@ -90,7 +99,7 @@ fi
 # name space is bounded too, and "key" is matched as a DELIMITED WORD anywhere in a component
 # rather than only at its end, which is what let deploy_key.txt through when deploy_key did not.
 NAMED=$(unzip -Z1 "$OUT" \
-  | grep -vE '(^|/)\.env\.example$' \
+  | grep -vE '^\.env\.example$' \
   | grep -iE 'keys?([_.-]|$)'\
 '|token|secret|cred|passwd|password|bearer|keytab|kubeconfig|pypirc|dotenv'\
 '|service.?account|authorized|private.?key|vault|jwt|pat[_.-]|id[_.-]?(rsa|dsa|ecdsa|ed25519)' \
@@ -101,10 +110,25 @@ if [ -n "$NAMED" ]; then
   exit 1
 fi
 
+# Exactly one environment file, at the root, and it is the example. `docs/.env.example` shipped
+# past both nets above: the extension allowlist admits `.example`, and no credential word
+# appears in the name. The content check that catches it lives in the test suite, which is the
+# right place for content, but a second environment file anywhere is a name-shape fact this
+# script can see and should refuse.
+ENVFILES=$(printf '%s\n' "$LISTING_NAMES" | grep -E '(^|/)\.env' || true)
+if [ "$ENVFILES" != ".env.example" ]; then
+  echo "package: the archive carries environment files other than the root .env.example:" >&2
+  printf '%s\n' "$ENVFILES" >&2
+  exit 1
+fi
+
 # And no symlinks at all. -y stops the content leak, but a stored link still points somewhere
 # outside the archive, and what it resolves to on the platform runner is not ours to reason
 # about. This project ships no symlink, so any is a defect.
-LINKS=$(unzip -Z "$OUT" | grep '^l' || true)
+# Exit status, not emptiness. `$(... || true)` reads a tool failure as a pass, and grep -P is
+# absent from BusyBox and from some minimal runner images, so a net could report clean having
+# never run. Each check below distinguishes "found nothing" from "could not look".
+LINKS=$(printf '%s\n' "$LISTING" | grep '^l' || true)
 if [ -n "$LINKS" ]; then
   echo "package: the archive carries symbolic links:" >&2
   echo "$LINKS" >&2
@@ -115,7 +139,10 @@ fi
 # the archive, but a hard link is an ordinary directory entry: zip reads it and writes the
 # content, so `notes-appendix.md` hard-linked to a private key shipped the key under a
 # harmless name with every name-based check clean. find is the only thing that can see it.
-HARDLINKS=$(find $INCLUDE -type f -links +1 -print 2>/dev/null || true)
+if ! HARDLINKS=$(find $INCLUDE -type f -links +1 -print); then
+  echo "package: could not scan for hard links" >&2
+  exit 1
+fi
 if [ -n "$HARDLINKS" ]; then
   echo "package: these files have more than one hard link, so their name is not their only" >&2
   echo "         name and the scan above cannot speak for their content:" >&2
@@ -126,7 +153,9 @@ fi
 # Names that are not what they look like. A Cyrillic small letter es renders as a Latin s, so
 # `\u0455ecret.md` reads as "secret.md" to a human and matches nothing as bytes. Anything
 # outside ASCII in a path is refused: this project ships no such name.
-NONASCII=$(unzip -Z1 "$OUT" | LC_ALL=C grep -nP '[^\x20-\x7e]' || true)
+# A POSIX bracket range, not grep -P: the -P flag is a GNU extension and its absence made this
+# net report a pass without running.
+NONASCII=$(unzip -Z1 "$OUT" | LC_ALL=C grep -n '[^ -~]' || true)
 if [ -n "$NONASCII" ]; then
   echo "package: the archive carries non-ASCII paths, which can render as a name they are" >&2
   echo "         not; refuse rather than guess:" >&2

@@ -10,12 +10,12 @@
 #   ship  : FROM scratch with a single COPY of the prepared filesystem. The scan reads layer
 #           history, so one clean layer is the only construction with no history to flag.
 #
-# The base digest is pinned to the resolved python:3.12-slim multi-architecture index.
-
-ARG BASE_DIGEST=sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+# The base digest is INLINE in both FROM lines, not held in an ARG. An ARG default can be
+# replaced at build time with --build-arg, which swapped the base of both stages while the guard
+# that checks the pinning resolved the default only and could not see it.
 
 # ---- build: install from the hash-locked requirements into an isolated venv ----
-FROM python:3.12-slim@${BASE_DIGEST} AS build
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a AS build
 ENV PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
 RUN python -m venv /opt/venv
@@ -24,7 +24,7 @@ COPY requirements.txt ./
 RUN pip install --require-hashes --no-deps -r requirements.txt
 
 # ---- prep: assemble the runtime filesystem, then sweep suid and sgid bits last ----
-FROM python:3.12-slim@${BASE_DIGEST} AS prep
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a AS prep
 # Tolerated step, on its own RUN. Base-package upgrades are best-effort against a mirror that
 # may lag; chaining a mandatory step behind them would let a tolerated miss swallow it.
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*

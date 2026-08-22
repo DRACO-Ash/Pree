@@ -45,7 +45,7 @@ Integration because no Docker daemon is reachable. Exit 2 is not a pass.
 | `GET /`, `/healthz`, `/readyz`, `/livez`, `/ping` | no | liveness; 200, touches nothing |
 | `GET /healthz/storage` | no | proves storage with a real write, races a hard timeout |
 | `GET /diagnostics` | when a token exists | secret-free read-out: booleans and lengths, never values |
-| `POST /v1/assess` | yes | score one candidate against one protected asset |
+| `POST /v1/assess` | yes | score a candidate against a protected asset |
 | `GET /v1/assessments/{key}` | yes | read a stored assessment, with ETag support |
 
 `/openapi.json`, `/docs` and `/redoc` are served in development only, never in production.
