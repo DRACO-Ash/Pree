@@ -5,8 +5,9 @@ verification of it in this project's history has been a manual measurement typed
 That is the pattern this suite exists to break: a control nothing exercises automatically is a
 control that regresses between rounds without anybody noticing.
 
-The script is invoked as the operator invokes it. These tests are slow by the standards of the
-rest of the suite (each one zips the tree), so there are three of them and no more.
+The script is invoked as the operator invokes it. Each test zips the tree, measured at 0.08s
+against a 31s suite, so the cost is not the reason there are three of them: three is what covers
+the happy path, the refusal path and the archive shape.
 """
 
 from __future__ import annotations
@@ -41,23 +42,43 @@ def _package(out: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+PROBE_PREFIX = "pree_packaging_probe_"
+
+
+def _sweep_stale_probes() -> list[str]:
+    """Remove any probe file a killed run left behind, and name what was removed.
+
+    Every directory this script scans is a tracked one, so the probe has to live in the working
+    tree. `finally` covers a failing test and not a killed process, and a surviving probe makes
+    every later `package-appstore.sh` run refuse for a file the suite itself created. Sweeping
+    at fixture entry makes that self-healing instead of a puzzle.
+    """
+    stale = sorted((REPO_ROOT / "docs").glob(f"{PROBE_PREFIX}*"))
+    for path in stale:
+        path.unlink()
+    return [path.name for path in stale]
+
+
 @pytest.fixture
 def planted(request: pytest.FixtureRequest) -> Iterator[Path]:
     """A file in the tree whose NAME reads like a credential, removed however the test ends.
 
     The content is a placeholder: the script's scan reads names, never bytes, and says so.
     """
-    target = REPO_ROOT / "docs" / f"pree_packaging_probe_{request.node.name[:24]}_key.txt"
+    _sweep_stale_probes()
+    target = REPO_ROOT / "docs" / f"{PROBE_PREFIX}{request.node.name[:24]}_key.txt"
     target.write_text("placeholder for a packaging test, not a credential\n", encoding="utf-8")
     try:
         yield target
     finally:
         target.unlink(missing_ok=True)
+        assert not _sweep_stale_probes(), "a probe file survived the test that created it"
 
 
 @needs_zip
 def test_a_clean_tree_packages_and_the_archive_lands_at_the_named_path(tmp_path: Path) -> None:
     """The happy path, so the refusal tests below cannot pass by the script being broken."""
+    assert not _sweep_stale_probes(), "a probe file from an earlier run was still in the tree"
     out = tmp_path / "upload.zip"
     result = _package(out)
     assert result.returncode == 0, result.stdout + result.stderr

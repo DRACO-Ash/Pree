@@ -7,6 +7,9 @@ import io
 import json
 import logging
 import re
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -31,24 +34,79 @@ from pree.health import StorageProber
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
 from pree.security import MAX_ACTOR_LENGTH, sanitise_actor
 from pree.store import JsonStore, StoreError
-from tests.conftest import AUTH, TEST_TOKEN, build_client, make_config
+from tests.conftest import AUTH, PRODUCTION_TOKEN, TEST_TOKEN, build_client, make_config
 
 # Pinned literals, deliberately NOT derived from LIVENESS_PATHS. These five paths are the
 # contract in CLAUDE.md and in the deployment sheet; a test that reads them from the constant
 # it is checking cannot notice the constant shrinking.
 EXPECTED_LIVENESS_PATHS = frozenset({"/", "/healthz", "/readyz", "/livez", "/ping"})
-# The paths that may answer without a token, by design: the platform's probes, and the
-# development documentation. Everything else on the route table is gated, and the two tests
-# below walk the table rather than listing the routes, because a hand-written list cannot see a
-# route somebody adds. `@app.post("/v1/debug")` returning the team token, unauthenticated,
-# passed 292 of 292 tests and did not trip the coverage floor: one line, and the shared
-# credential goes to any client on the internet with a green gate.
-UNAUTHENTICATED_PATHS = frozenset(UNMETERED_PATHS) | frozenset(DOC_PATHS)
+# PINNED literals, like EXPECTED_LIVENESS_PATHS above and for the identical reason. The first
+# version of this was `frozenset(UNMETERED_PATHS) | frozenset(DOC_PATHS)`, which derives the
+# exemption set from the constants it is policing: appending "/v1/dump" to UNMETERED_PATHS and
+# adding an ungated route on it passed 300 of 300, and the same edit took the new path out of the
+# coarse rate limiter too, so an unauthenticated dump of the store was unmetered as well. A test
+# that reads the exemption from the constant cannot see the exemption widening.
+#
+# Everything else on the route table is gated, and the tests below walk the table rather than
+# listing the routes, because a hand-written list cannot see a route somebody adds.
+# `@app.post("/v1/debug")` returning the team token, unauthenticated, passed 292 of 292 tests and
+# did not trip the coverage floor: one line, and the shared credential goes to any client on the
+# internet with a green gate.
+EXPECTED_UNMETERED_PATHS = frozenset(EXPECTED_LIVENESS_PATHS | {"/healthz/storage"})
+# The development documentation, served only when PREE_ENV is development. FastAPI registers
+# these as plain Starlette routes rather than APIRoutes, and `/docs/oauth2-redirect` is not in
+# DOC_PATHS because the CSP exemption does not need it; the route table still carries it.
+EXPECTED_DOC_PATHS = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"})
+UNAUTHENTICATED_PATHS = EXPECTED_UNMETERED_PATHS | EXPECTED_DOC_PATHS
 
 
-def _api_routes(app: Any) -> list[Any]:
-    """The routes this application declares, excluding the framework's own error handlers."""
-    return [route for route in app.routes if isinstance(route, APIRoute)]
+def test_the_unauthenticated_path_set_is_the_one_the_tests_below_police() -> None:
+    """The pinned literals against the shipped constants, so neither can drift unnoticed.
+
+    This is the assertion that makes the walk below meaningful: without it, widening
+    UNMETERED_PATHS widens the exemption and every gate test still passes.
+    """
+    assert frozenset(UNMETERED_PATHS) == EXPECTED_UNMETERED_PATHS, (
+        f"UNMETERED_PATHS is {sorted(UNMETERED_PATHS)}; every path there answers without a token "
+        "and is exempt from the coarse rate limiter, so a new entry is a deliberate decision"
+    )
+    assert frozenset(DOC_PATHS) <= EXPECTED_DOC_PATHS, (
+        f"DOC_PATHS is {sorted(DOC_PATHS)}, which is not a subset of the documentation paths "
+        "this suite expects to answer unauthenticated"
+    )
+
+
+def _all_routes(app: Any) -> list[Any]:
+    """EVERY entry in the route table, whatever its type.
+
+    Not `[r for r in app.routes if isinstance(r, APIRoute)]`, which is what this was. That
+    filter made the control written to make routes visible blind to every other registration
+    mechanism, and each of these is one line: `app.add_route("/v1/debug", handler)` served the
+    team token unauthenticated with 300 of 300 green, and so did `app.mount("/admin", admin)`
+    with a gated-looking sub-application. A WebSocketRoute has a path and no methods at all and
+    was invisible the same way. FastAPI's own /docs and /openapi.json are plain Starlette
+    routes, which is the proof the class is reachable in a single call.
+    """
+    return list(app.routes)
+
+
+@contextmanager
+def _app_in(env: str) -> Iterator[Any]:
+    """A built app for one environment, with throwaway storage, for reading its route table.
+
+    Both environments matter: the documentation routes exist only in development, and asserting
+    the table in one environment would leave the other unexamined.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        overrides: dict[str, object] = {"PREE_ENV": env, "PREE_TEAM_TOKEN": PRODUCTION_TOKEN}
+        if env == "production":
+            overrides["PREE_ALLOWED_ORIGIN"] = "https://pree.apps.bluestaq.com"
+        config = make_config(Path(directory), **overrides)
+        prober = StorageProber(cache_seconds=0.0)
+        try:
+            yield create_app(config, JsonStore(config.data_dir), prober=prober)
+        finally:
+            prober.shutdown()
 
 
 def _dependency_names(route: APIRoute) -> set[str]:
@@ -963,10 +1021,18 @@ def test_every_method_not_allowed_names_the_methods_that_are(client: TestClient)
     # paths to their expected sets, so four registered paths were never checked and a route
     # added later was invisible to it. The table is the fact; the assertion reads the fact.
     checked = 0
-    for route in _api_routes(client.app):
+    for route in _all_routes(client.app):
+        if not isinstance(route, APIRoute):
+            continue
         target = route.path.replace("{key}", "probe:key")
-        expected = route.methods - {"OPTIONS"}
-        refused = next(iter({"DELETE", "PUT", "PATCH"} - expected))
+        expected = (route.methods or set()) - {"OPTIONS"}
+        # SORTED, so the chosen method is the same on every run. `next(iter(set))` picked a
+        # different one each time under string hash randomisation, which makes a failure
+        # irreproducible from the seed, and it raised a bare StopIteration rather than a readable
+        # assertion if a route ever declared all three.
+        candidates = sorted({"DELETE", "PUT", "PATCH"} - expected)
+        assert candidates, f"{target} serves every method this test could refuse with"
+        refused = candidates[0]
         response = client.request(refused, target, headers=AUTH)
         assert response.status_code == 405, f"{refused} {target} gave {response.status_code}"
         allowed = response.headers.get("allow")
@@ -1402,14 +1468,49 @@ def test_every_documented_liveness_path_is_exempt_from_rate_limiting(
             assert limited.get(path).status_code == 200, f"{path} was metered"
 
 
-def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestClient) -> None:
-    """Walked from the route table, so a route added later cannot be invisible to it.
+def test_the_route_table_holds_nothing_but_api_routes_and_the_documentation() -> None:
+    """A registration mechanism this suite cannot read is refused, not tolerated.
 
-    Gating used to be asserted route by route, by hand, and nothing looked at the table. The
+    The gate assertions below read an APIRoute's dependant tree, so a route registered any other
+    way is invisible to them however carefully they walk the table. Rather than teach them every
+    mechanism, the mechanisms are refused: the same reasoning that refuses a heredoc and a SHELL
+    instruction in the boot contract instead of parsing them. `app.add_route(...)` and
+    `app.mount(...)` each served the team token unauthenticated with 300 of 300 green, and a
+    WebSocketRoute carries a path and no methods at all.
+
+    The documentation routes are the one exemption, by PATH rather than by type: FastAPI
+    registers them as plain Starlette routes and they exist only when PREE_ENV is development.
+    """
+    for env, expected_docs in (("development", EXPECTED_DOC_PATHS), ("production", frozenset())):
+        with _app_in(env) as app:
+            foreign = [
+                f"{type(route).__name__} {getattr(route, 'path', route)!r}"
+                for route in _all_routes(app)
+                if not isinstance(route, APIRoute)
+                and getattr(route, "path", None) not in expected_docs
+            ]
+            assert not foreign, (
+                f"the {env} route table carries entries this suite cannot read the gate from, "
+                f"and an unreadable route is an ungated route: {foreign}"
+            )
+            if env == "production":
+                served = {str(getattr(route, "path", "")) for route in _all_routes(app)}
+                overlap = served & EXPECTED_DOC_PATHS
+                assert not overlap, f"production serves a documentation path: {sorted(overlap)}"
+
+
+def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestClient) -> None:
+    """Walked from the route table, and paired with the refusal above so the walk is complete.
+
+    Gating used to be asserted route by route, by hand, and nothing looked at the table. This
+    reads every APIRoute; the test above guarantees there is nothing else to read. The
     complement matters as much as the rule: a probe path that GAINS the gate would fail the
     platform's liveness check and restart the pod, so both directions are asserted here.
     """
-    for route in _api_routes(client.app):
+    checked = 0
+    for route in _all_routes(client.app):
+        if not isinstance(route, APIRoute):
+            continue
         gated = "require_token" in _dependency_names(route)
         if route.path in UNAUTHENTICATED_PATHS:
             assert not gated, (
@@ -1422,6 +1523,8 @@ def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestCl
             f"{sorted(UNAUTHENTICATED_PATHS)} is gated; its dependencies are "
             f"{sorted(_dependency_names(route))}"
         )
+        checked += 1
+    assert checked == 3, f"expected three gated routes, walked {checked}"
 
 
 def test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set(
@@ -1430,13 +1533,16 @@ def test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set(
     """The behavioural half: the gate is asserted by asking, not by reading the wiring.
 
     A dependency that is present but does not enforce would satisfy the introspection above.
+    Every entry in the table is asked, whatever its type, because asking needs no knowledge of
+    how the route was registered.
     """
     answered: list[str] = []
-    for route in _api_routes(client.app):
-        if route.path in UNAUTHENTICATED_PATHS:
+    for route in _all_routes(client.app):
+        path = getattr(route, "path", None)
+        if path is None or path in UNAUTHENTICATED_PATHS:
             continue
-        target = route.path.replace("{key}", "probe:key")
-        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+        target = path.replace("{key}", "probe:key")
+        for method in sorted((getattr(route, "methods", None) or set()) - {"HEAD", "OPTIONS"}):
             response = client.request(method, target, json={})
             if response.status_code != 401:
                 answered.append(f"{method} {target} -> {response.status_code}")
@@ -1467,9 +1573,10 @@ def test_the_team_token_reaches_no_response_body_and_no_log_record(
     logger = build_logger(stream)
     with build_client(config, logger, prober) as probe:
         bodies: list[str] = []
-        for route in _api_routes(probe.app):
-            target = route.path.replace("{key}", "probe:key")
-            for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+        for route in _all_routes(probe.app):
+            target = getattr(route, "path", "").replace("{key}", "probe:key")
+            methods = (getattr(route, "methods", None) or set()) - {"HEAD", "OPTIONS"}
+            for method in sorted(methods):
                 for headers in (AUTH, {"x-pree-token": "wrong-token-value"}, {}):
                     bodies.append(probe.request(method, target, headers=headers, json={}).text)
         # And the shapes that reflect caller input back: a validation failure whose detail

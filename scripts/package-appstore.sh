@@ -22,7 +22,12 @@ rm -f "$OUT"
 # uploadable artefact, and the trap covers the interrupted run as well as the refused one.
 WORK="$OUT.partial"
 rm -f "$WORK"
-trap 'rm -f "$WORK"' EXIT INT TERM
+trap 'rm -f "$WORK"' EXIT
+# INT and TERM EXIT rather than falling through. Without the exit, an interrupted run continued
+# past the interruption and was safe only by ordering: the next command happened to be a guard
+# that fails, or the later `mv` failed on a file the handler had just removed. 130 is the
+# conventional status for an interrupted shell command.
+trap 'rm -f "$WORK"; exit 130' INT TERM
 
 INCLUDE="Dockerfile .dockerignore .gitignore requirements.txt requirements.in \
 requirements-dev.txt requirements-dev.in pyproject.toml sonar-project.properties \
@@ -186,7 +191,7 @@ fi
 
 # LAST. Every check above has passed, so the archive becomes the upload now and not before.
 mv "$WORK" "$OUT"
-trap - EXIT INT TERM
+trap - EXIT INT TERM  # the archive is the upload now; do not remove it on exit
 echo "package: wrote $OUT"
 
 echo "package: archive checks passed: every extension on the allowlist, no name that"

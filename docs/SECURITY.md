@@ -124,6 +124,9 @@ the assessment store.
 | A colon sentence pairs with the bullet, fence or row that follows it | `tests/test_boot_contract.py` | `test_the_claim_unit_splitter_pairs_a_colon_sentence_with_what_follows` |
 | A refused package run leaves no uploadable artefact | `scripts/package-appstore.sh` | `test_a_refused_tree_leaves_no_archive_at_the_upload_path` |
 | The upload archive is flat, with the source and the suite at its root | `scripts/package-appstore.sh` | `test_the_archive_is_flat_and_carries_the_files_the_platform_builds_from` |
+| The route table holds nothing the gate tests cannot read | `src/pree/app.py` | `test_the_route_table_holds_nothing_but_api_routes_and_the_documentation` |
+| The unauthenticated path set is pinned, not derived from the constant it polices | `src/pree/app.py` | `test_the_unauthenticated_path_set_is_the_one_the_tests_below_police` |
+| Every directory on the shipped PATH is guarded against a planted shim | `Dockerfile` | `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` |
 
 ## Deliberately accepted risks
 
@@ -1068,7 +1071,10 @@ automated test at all; it has three now, and the refusal path is one of them.
 
 Two comments in `src/pree/app.py` asserted controls that are not in the code: an explicit
 operation id that is never passed, left behind when the fix moved from pinning an id to leaving the
-schema, and two different middleware layers each labelled "second-outermost". Both corrected. A
+schema, and two different middleware layers each labelled "second-outermost". The operation-id
+claims are deleted and the CORS label corrected to third-outermost; the framing guard's label was
+already right, so ONE label changed, not two. My own summary of that fix said two, which is the
+same overstatement in miniature that this section exists to record. A
 comment describing a control that does not exist is the same defect class as a policy paragraph
 recording a fix that did not land, and this file has already had two of those.
 
@@ -1082,6 +1088,62 @@ move and it was not enough on its own: a test can be added to a testable parser 
 nothing. What each of this round's fixes has in common is that the control is now invoked on
 synthetic input whose expected outcome is known, rather than described and then measured against
 the one document that happens to be correct.
+
+### Twenty-second review: three majors, four minors
+
+Every finding was in a control added the round before, which is now the fourth consecutive round
+where that is true.
+
+The route walk filtered `isinstance(route, APIRoute)`. That single line made the control written
+to make routes visible blind to every registration mechanism except the decorator:
+`app.add_route("/v1/debug", handler)` served the team token to an unauthenticated caller with 300
+of 300 tests green, `app.mount("/admin", sub_app)` did the same, and a websocket route carries a
+path with no methods at all. FastAPI's own `/docs` and `/openapi.json` are plain Starlette routes,
+which is the proof the class was reachable in one call and was sitting in the table the whole time.
+The fix is not to teach the walk every mechanism, because that list will always be one entry
+short. Anything the suite cannot read a gate from is refused outright, the same reasoning that
+refuses a heredoc and a `SHELL` instruction in the boot contract instead of parsing them, with the
+documentation routes exempt by path rather than by type and asserted absent from production.
+
+`UNAUTHENTICATED_PATHS` was `frozenset(UNMETERED_PATHS) | frozenset(DOC_PATHS)`, deriving the
+exemption set from the constants it polices. The pinned liveness literal sits eight lines above it
+with a comment explaining exactly why it is pinned, and the new constant was written the other way
+in the same commit. Appending `/v1/dump` to `UNMETERED_PATHS` with an ungated route on it passed
+300 of 300, and because that tuple also drives the coarse rate limiter, the same two lines made an
+unauthenticated read of the store both open and unmetered. The expected set is a literal now,
+asserted against the shipped constants, so widening the exemption is a test failure rather than a
+silent widening.
+
+The write guard's directory list omitted `/opt/venv/bin/`, which is the FIRST entry on the shipped
+`PATH` and holds the gunicorn the pinned command execs and the python the health check runs.
+`COPY --from=build /bin/true /opt/venv/bin/gunicorn` above the sweep passed 300 of 300. The RUN
+spelling of the identical attack was caught, and only by accident, because `/opt/venv/bin/gunicorn`
+contains the substring `/bin/` that the RUN branch tests loosely and the COPY branch does not: two
+branches of one guard disagreeing about the same file, with the disagreement invisible because one
+of them happened to fire. The list now covers every directory on the shipped `PATH` plus the
+site-packages tree, and a test derives the required set from the Dockerfile's own `ENV PATH`, so
+adding a directory to the image's search path without guarding it is a failure.
+
+Four minors. The colon pairing's three-unit bound is a real residual: a wrong floor stated in the
+fourth bullet after its colon sentence passes, measured. The docstring said three residuals remain
+and there were four, so the bound is named. The directive test omitted the two shapes BuildKit's
+`DetectSyntax` honours beyond a leading `#name=` comment, a byte-order mark before the comment and
+the C-style `// syntax=` form; both are refused today, but by the unrecognised-keyword assert
+rather than by the directive guard, so nothing pinned them and a change to keyword handling could
+reopen them quietly. The packaging probe file was removed in a `finally`, which covers a failing
+test and not a killed process, and a survivor would make every later packaging run refuse for a
+file the suite itself created. And the refused method in the `Allow` test was chosen with
+`next(iter(set))`, so it varied per run under hash randomisation and a failure could not be
+reproduced from its seed.
+
+What this round says about the previous one is worth stating rather than smoothing over. Round 21
+was told that a hand-written list cannot see a route somebody adds, and the control written in
+answer had a filter that could not see a route somebody adds a different way, plus an exemption set
+read from the constant it was policing. Both defects were of the class the finding named, written
+into the fix for that finding, in the same file, minutes apart. The lesson is not "walk more
+carefully": it is that a control which enumerates what it accepts must refuse everything else by
+construction, and that a test must never read its expected value from the thing under test. Both
+are now true of this control, and both are assertions rather than intentions.
 
 ## Not accepted, and why it is not a risk here
 

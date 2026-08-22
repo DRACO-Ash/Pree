@@ -547,4 +547,39 @@ layer written to prove the application's boundaries hold rather than in a bounda
   partial path and moves into place only after the last check. The script had no automated test
   at all after six rounds of findings; it has three now.
 ● Two comments in `src/pree/app.py` claimed an explicit operation id the code does not pass, and
-  two labelled different middleware layers "second-outermost".
+  two labelled different middleware layers "second-outermost". Only one of those labels was
+  wrong, the CORS one; the framing guard is second-outermost and its label was correct.
+
+Twenty-second review, three majors and four minors, all in the round-21 controls themselves:
+
+● The route walk added last round filtered `isinstance(route, APIRoute)`, so the control written
+  to make routes visible was blind to every other registration mechanism.
+  `app.add_route("/v1/debug", …)` served the team token to an unauthenticated caller with 300 of
+  300 green, and so did `app.mount("/admin", …)`; a websocket route carries a path and no methods
+  at all. Any route the suite cannot read the gate from is now refused outright, the way the boot
+  contract refuses a heredoc rather than parsing it, with the documentation paths exempt by path
+  rather than by type and asserted absent in production.
+● `UNAUTHENTICATED_PATHS` was derived from the constants it polices, which is the defect the
+  pinned liveness literal next to it exists to avoid. Appending `/v1/dump` to `UNMETERED_PATHS`
+  with an ungated route on it passed 300 of 300, and the same edit took that path out of the
+  coarse rate limiter, so the unauthenticated read was unmetered too. The expected set is a
+  literal now, asserted against the shipped constants.
+● The write guard omitted `/opt/venv/bin/`, the FIRST entry on the shipped `PATH`: it holds the
+  gunicorn the pinned command execs and the python the health check runs.
+  `COPY --from=build /bin/true /opt/venv/bin/gunicorn` passed 300 of 300. The RUN spelling was
+  caught only by accident, because that path contains the substring `/bin/`, so two branches of
+  one guard disagreed about the same file. Every directory on the shipped `PATH` is guarded now,
+  and a test derives the list from the Dockerfile's own `ENV` so it cannot drift from the image.
+● The colon pairing's three-unit bound is a fourth residual on the token-floor guard, recorded
+  now rather than left implied by a comment that said three residuals remain.
+● The directive test omitted the two shapes BuildKit honours beyond a leading `#name=` comment, a
+  byte-order mark before the comment and the C-style `// syntax=` form. Both are refused, but by
+  the unrecognised-keyword assert rather than by the directive guard, so nothing pinned them.
+● The packaging probe file was removed in a `finally`, which does not cover a killed process, and
+  a survivor would make every later packaging run refuse for a file the suite created. Stale
+  probes are swept at fixture entry and their absence asserted after.
+● The refused method in the `Allow` test was chosen by `next(iter(set))`, so it differed on every
+  run under hash randomisation and a failure could not be reproduced from the seed. Also the
+  decay rule in the claim-unit splitter was implemented twice, the `INT` and `TERM` traps in the
+  packaging script did not exit, and the same rationale was written out three times across the
+  Dockerfile and two docstrings.
