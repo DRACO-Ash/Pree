@@ -147,6 +147,11 @@ the assessment store.
 | The suid sweep narrows by nothing and clears both bits, as a property | `Dockerfile` | `test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits` |
 | Two request targets whose PATHS differ cannot share one audit record, below the escaped-form cap | `src/pree/security.py` | `test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_record`, `test_the_path_scrub_is_injective_over_every_single_byte` |
 | The query string is excluded from the audit record, and a bit says one was present | `src/pree/app.py` | `test_the_query_string_aliases_and_the_record_says_a_query_was_present` |
+| A server that leaves the query in `raw_path` still cannot reach the audit field | `src/pree/app.py` | `test_a_server_that_puts_the_query_in_raw_path_still_cannot_reach_the_audit_field` |
+| The audited path EQUALS the recomputed scrub of the target, so nothing can be appended to it | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
+| Every boolean audit field is value-pinned on every kind that emits it, across the token axis | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it`, `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
+| Every closed-set value pin equals what the application can emit, in both directions | `tests/test_api.py` | `test_every_closed_set_pin_is_exactly_what_the_application_can_emit`, `test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit` |
+| No truncated audit path can read as a route this app serves | `src/pree/security.py` | `test_no_truncated_path_record_can_read_as_a_route_this_app_serves` |
 | The audited path keeps its separator and carries no control character | `src/pree/app.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
 | A stage before the shipped one cannot mount over or de-privilege what the suid sweep visits | `Dockerfile` | `test_no_stage_declares_an_instruction_that_undoes_the_hardening` |
 | A refused preflight records whether the ORIGIN was allowed, by value | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
@@ -2044,7 +2049,7 @@ is exploitable by an internet client against the tree as it stands today. All of
 of the next regression to roughly one line. Those are different statements from a pass, and the
 second is the one that should govern how much a reader trusts a green loop here.
 
-### Third security review of the audit layer: one field, defeated three ways
+### The audited path: one field, defeated three ways
 
 Three rounds built the audited `path` field on the DECODED request path, and each round's fix was
 defeated by the next review. The rounds are worth reading together, because the lesson is not in any
@@ -2135,7 +2140,7 @@ Four minors closed alongside:
   names a route, which is what made the path's aliasing a finding and leaves these two a documented
   limit.
 
-### Fourth security review of the audit layer: the fix that reintroduced the defect it cited
+### The query bit: the fix that reintroduced the defect it cited
 
 The previous round added `had_query` to five record kinds, pinned its value on ONE, and wrote a
 comment claiming it was "asserted in both directions on every kind that emits it" across "the
@@ -2199,6 +2204,61 @@ narrative in this same document, the changelog rows, and code comments are all u
 round's false claim lived in a code comment, where no guard of that kind can reach. The countermeasure
 there is not another guard; it is the rule this register already carries, that a comment asserting a
 security property names the test that asserts it or is deleted.
+
+### The whole credential, through a charset
+
+Two majors, and the first is the most serious finding in this range.
+
+**The `path` field was pinned by CHARSET, and hex is inside that charset.** Appending
+`config.team_token.encode().hex()` at the CORS site put the WHOLE credential into a record any
+unauthenticated caller can trigger, 240 a minute on the coarse allowance, with all 331 tests green
+and the "token not in log" assertion still true because the value was hex. This is the third form of
+one defect this register already records twice: `key = key + "#" + base64(token)` and
+`duration_ms = int.from_bytes(token.encode())`. The lesson each time is the same and it is now
+stated as a rule: **a value that can be recomputed must be recomputed, not shape-checked.** The
+exercise knows every target it drove, so each logged `path` is now asserted equal to
+`sanitise_log_path` of that target, and the token is asserted absent both verbatim and hex-encoded.
+
+**The second major is a claim of mine that measurement contradicted at three places.** "The
+two-token axis catches the class rather than the member" is false. Both fixture tokens contain a
+hyphen, so `... and "-" in (config.team_token or "")` on `had_query` was green, and the same
+conjunct on `origin_allowed` was green too - two real bits of the deployed credential per refused
+preflight, nothing red. A two-sample axis catches only a predicate that DISAGREES between those two
+samples. And the accompanying claim, that a single-token version of the test would pass against the
+`ord(token[0]) & 1` expression, was also false: that expression is request-independent, so the
+both-directions axis alone kills it, single token or not.
+
+The axis is now five fixed tokens chosen so the obvious character classes each split them, plus one
+drawn per run from `secrets.token_urlsafe`, and both boolean matrices use it. **The honest limit is
+stated where the set is defined:** a constant predicate can still survive by luck, so this raises the
+cost of the channel rather than closing it. That is what the axis is worth, and no more.
+
+Three minors closed with them:
+
+● The pin-drift guard covered `confidence` alone. It now covers the class: `action` and `outcome` are
+  cross-checked against the string literals `app.py` actually passes, read from the SOURCE rather
+  than imported, so the check stays independent of the code it constrains. Two earlier versions of
+  that walk found a subset and drew a confident wrong conclusion from it - a dict-literal-only walk
+  found nothing at all, and a dict-plus-keyword walk reported `read_assessment` as
+  permitted-but-unemitted when it is emitted positionally at three sites. Positional arguments are
+  bound to `audit`'s real signature rather than to hard-coded indices.
+● The `path` pin refused `UNPRINTABLE_MARKER`, which `sanitise_log_path` emits for an empty target,
+  so it is wrapped in `_MarkerOr` as `loc` already was. Wrapping it then revealed a second defect
+  in one edit: the trailing-newline sweep AND the check that every pattern is swept both asked
+  `isinstance(rule, _Pattern)` of the wrapper, so wrapping removed `path` from both at once with
+  nothing red. Both now reach through the wrapper.
+● The changelog carried "Fourth security review of the audit layer" twice, for two different
+  reviews. Renumbered - and the ordinals are gone from THIS document's headings, which is the
+  actual fix. Two documents numbering the same sequence independently drift, and they had: the
+  register's headings and the changelog's rows no longer mapped one to one, so any renumbering
+  here would have been a guess presented as a fact. The headings now say what each review found,
+  which is what a reader is looking for anyway; the changelog keeps its ordinals, where they are
+  sequential within one list.
+
+**And the register table rows for the previous round's controls were absent**, which the gate noted
+as an observation rather than a finding. Six rows are added here, including this round's. The row
+guard checks that a cited test EXISTS, not that it asserts what the row claims, so a row is only as
+good as the reader who writes it.
 
 ## Not accepted, and why it is not a risk here
 

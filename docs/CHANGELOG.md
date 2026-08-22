@@ -993,7 +993,7 @@ Fourth security review of the audit layer, one major and three minors:
   to `raw is not None` left the whole suite green while a `str` would make every audited rejection a
   500. Three cases now: absent, `str`, `bytearray`.
 
-Fourth security review of the audit layer, one major and five minors:
+Fifth security review of the audit layer, one major and five minors:
 
 ● The previous round's fix reintroduced the defect it cited. `had_query` was added to five record
   kinds, its value pinned on ONE, and a comment written claiming it was asserted on every kind
@@ -1020,3 +1020,34 @@ Fourth security review of the audit layer, one major and five minors:
 ● The `confidence` pin permitted `medium`, which the enum has never had, and omitted `moderate` and
   `insufficient`, which the application emits. A meta-assertion now checks the literal pin and the
   enum agree, so the literal can stay a literal.
+
+Sixth security review of the audit layer, two majors and three minors:
+
+● The `path` field was pinned by CHARSET, and hex is inside that charset, so appending
+  `config.team_token.encode().hex()` at the CORS site put the WHOLE credential into a record any
+  unauthenticated caller can trigger, 240 a minute, with the suite green and the "token not in log"
+  assertion still true because the value was hex. Third form of one defect: `key + base64(token)`
+  and `duration_ms = int.from_bytes(token)` were the first two. The rule that comes out of it: a
+  value that can be RECOMPUTED must be recomputed, not shape-checked. Each logged path is now
+  asserted equal to the scrub of the target that produced it, and the token is asserted absent both
+  verbatim and hex-encoded.
+● "The two-token axis catches the class rather than the member" was false, at three places. Both
+  fixture tokens contain a hyphen, so `... and "-" in token` on `had_query` was green, and the same
+  conjunct on `origin_allowed` was green too: two real bits of the credential per refused preflight.
+  A two-sample axis catches only a predicate that disagrees between those two samples. The
+  accompanying claim that a single-token version would pass against the `ord(token[0]) & 1`
+  expression was also false, since that expression is request-independent. The axis is now five
+  fixed tokens that the obvious character classes each split, plus one per run from
+  `secrets.token_urlsafe`, and the limit is stated where the set is defined: a constant predicate can
+  survive by luck, so this raises the channel's cost rather than closing it.
+● The pin-drift guard covered `confidence` alone and now covers the class. `action` and `outcome` are
+  checked against the literals `app.py` actually passes, read from the source so the check stays
+  independent of the code it constrains. Two earlier versions of that walk found a subset and drew a
+  wrong conclusion: dict-only found nothing, dict-plus-keyword called `read_assessment` unemitted
+  when it is passed positionally. Positional arguments bind to `audit`'s real signature.
+● The `path` pin refused `UNPRINTABLE_MARKER`, which the scrub emits for an empty target, so it is
+  wrapped in `_MarkerOr` as `loc` was. Wrapping it revealed a second defect in one edit: the
+  newline sweep and the check that every pattern is swept both asked `isinstance` of the wrapper, so
+  wrapping removed `path` from both at once. Both now reach through it.
+● The changelog carried "Fourth security review of the audit layer" twice, for two different
+  reviews, and six control-register rows for recent controls were missing. Both corrected.
