@@ -458,3 +458,31 @@ Eighteenth security review, three majors, all in controls already repaired once:
 ● `_TOKEN_TERMS` omitted "key", after "secret" and "passphrase" had been added for the same
   reason. Both that table and the size-word table are now named as residuals.
 ● An orphan comment described the guessing budget this project deleted.
+
+Nineteenth security review, two majors:
+
+● The RUN-write guard added one round earlier was gated on a six-verb denylist, and three
+  one-line mutations walked through it: shell redirection needs no verb, `tar -C` uses one that
+  was not listed, and `python -c open(...)` names the target literally. The denylist is gone: any
+  RUN mentioning an executable directory is an offence and the five legitimate ones are pinned by
+  exact text. Nine fabrications now turn it red.
+● **A claim in `docs/SECURITY.md` was false.** It named `src/pree/keyring/x.py` among paths the
+  packaging fix had closed; the rule still required a delimiter after "key", so `keyring` was
+  open along with `keystore.json`, `keyfile.txt`, `keychain.py`, `keypair.txt` and
+  `sshkeygen.sh`. My verification had reported that path refused because a leftover directory
+  from the previous test iteration made a different net fire. The rule is the plain substring
+  now, and the paragraph is corrected in place rather than reworded.
+● Reported and NOT reproduced: the suppressed 405 dropping `Allow`. Measured with and without
+  the argument, on three methods and three paths, every response carried `allow: GET`,
+  because Starlette's router sets it on the response rather than only on the exception. The
+  argument is forwarded anyway, since it is right in general, and recorded as a
+  non-reproduction rather than a fix.
+● HEAD was exempt on `/healthz/storage`, which serves only GET, so an unmetered 405 that can
+  never be a platform probe: 600 of 600 admitted. The exemption is per path and per method now.
+● GET and HEAD on one route gave both the same OpenAPI operation id, so the development document
+  was invalid and the loop carried a warning every run. HEAD is its own route.
+● The base digest was asserted to exist rather than to be a value: one character shipped a
+  different filesystem with the suite green. It is pinned as a literal in both stages.
+● The token guard's unit builder used adjacent-line pairs and lost to a three-line split. It
+  builds sentences now, and the remaining pronoun-split residual is documented rather than
+  chased, because pairing sentences flagged three true statements.

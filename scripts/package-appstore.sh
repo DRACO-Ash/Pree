@@ -98,12 +98,20 @@ fi
 # default. It says nothing about a credential wearing an allowed extension, and five of the ten
 # paths that beat the old denylist do exactly that: deploy_key.txt, deploy_key.sh, sa-key.json,
 # bearer.txt and fixture_key.json all end in an extension this project genuinely ships. So the
-# name space is bounded too, and "key" is matched as a DELIMITED WORD anywhere in a component
-# rather than only at its end, which is what let deploy_key.txt through when deploy_key did not.
+# name space is bounded too, and "key" is now matched as a plain SUBSTRING.
+#
+# Six rounds of narrowing that rule and six rounds of one more name outside it. "Ending in key"
+# needed a delimiter after it, so `keyring/` failed; adding "/" to that class fixed the directory
+# case and still missed `keyring`, `keystore.json`, `keyfile.txt`, `keychain.py`, `keypair.txt`
+# and `sshkeygen.sh`, each of which shipped a real private key. Worse, docs/SECURITY.md asserted
+# the keyring case was closed when it was not, which is the one failure mode worse than the hole:
+# nobody looks again. There is no reading of "a delimited word" that covers those names, so the
+# rule is the substring and a file with "monkey" in its name is a false positive somebody has to
+# rename. That is the correct trade for a last net.
 NAMED=$(printf '%s
 ' "$LISTING_NAMES" \
   | grep -vE '^\.env\.example$' \
-  | grep -iE 'keys?([_./-]|$)'\
+  | grep -iE 'keys?'\
 '|token|secret|cred|passwd|password|bearer|keytab|kubeconfig|pypirc|dotenv'\
 '|service.?account|authorized|private.?key|vault|jwt|pat[_.-]|id[_.-]?(rsa|dsa|ecdsa|ed25519)' \
   || true)

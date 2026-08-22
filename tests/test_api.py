@@ -912,6 +912,58 @@ def test_every_liveness_path_answers_head_as_well_as_get(client: TestClient) -> 
         assert response.content == b"", "a HEAD response carried a body"
 
 
+def test_every_method_not_allowed_names_the_methods_that_are(client: TestClient) -> None:
+    """RFC 9110 makes Allow a MUST on a 405, and this asserts it across every shape.
+
+    A review reported that the audit-suppressed 405 on a probe path dropped the Allow header. I
+    could not reproduce that: Starlette's router sets Allow on the outgoing response, not only on
+    the exception it raises, so the header survives whether or not the handler forwards
+    `exc.headers`. This test therefore asserts a property the framework provides rather than one
+    this code provides, and it is recorded as such: it will not fail if that argument is removed.
+    It is worth keeping anyway, because the property is part of the app's HTTP contract and a
+    future handler that builds its own 405 would break it.
+    """
+    for path in ("/healthz", "/", STORAGE_PROBE_PATH, "/diagnostics", "/v1/assess"):
+        response = client.request("DELETE", path, headers=AUTH)
+        assert response.status_code == 405, f"{path} gave {response.status_code}"
+        allowed = response.headers.get("allow")
+        assert allowed, f"405 on {path} carries no Allow header"
+        # The method the route actually serves, which is POST for the scoring path.
+        expected = "POST" if path == "/v1/assess" else "GET"
+        assert expected in allowed, f"405 on {path} allows {allowed!r}, not {expected}"
+
+
+def test_the_probe_exemption_is_per_path_and_per_method(tmp_path: Path) -> None:
+    """The exemption is for the probe, which means the method the path actually serves.
+
+    HEAD was exempt on every probe path including `/healthz/storage`, which serves only GET, so
+    a 405 that can never be a platform probe was unmetered: 600 of 600 admitted, 33,000 bytes of
+    access log in 0.62 seconds from an unauthenticated caller. That is the same reasoning used to
+    meter preflights on those same six paths one commit earlier, applied inconsistently.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    # HEAD on a LIVENESS path is a real probe: exempt, and 200 however many times it is called.
+    live = build_client(
+        config,
+        build_logger(io.StringIO()),
+        StorageProber(cache_seconds=0.0),
+        global_limiter=RateLimiter(3, 60.0),
+    )
+    assert [live.head("/healthz").status_code for _ in range(8)] == [200] * 8
+
+    # HEAD on the STORAGE path is not a probe, because that route serves only GET. It is a 405,
+    # and it is metered like any other traffic.
+    metered = build_client(
+        config,
+        build_logger(io.StringIO()),
+        StorageProber(cache_seconds=0.0),
+        global_limiter=RateLimiter(3, 60.0),
+    )
+    codes = [metered.head(STORAGE_PROBE_PATH).status_code for _ in range(8)]
+    assert 429 in codes, f"HEAD on the storage path is unmetered: {codes}"
+    assert 405 in codes, f"expected method-not-allowed before the limit bites: {codes}"
+
+
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:
     """The cap is only a defence if concurrent worst-case bodies fit inside the request.
 

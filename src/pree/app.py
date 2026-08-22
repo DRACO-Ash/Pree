@@ -59,7 +59,15 @@ STORAGE_PROBE_PATH = "/healthz/storage"
 UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
 # The methods a platform probe actually uses. The exemption is for the probe, not for the path:
 # any other verb on one of these paths is ordinary traffic and is metered like any other.
-_PROBE_METHODS = frozenset({"GET", "HEAD"})
+# Per PATH, because the exemption is for the probe and a path that does not serve a method is
+# not being probed with it. HEAD was exempt on /healthz/storage, which serves only GET, so a
+# 405 that can never be a platform probe was both unmetered and unaudited: 600 of 600 admitted,
+# 33,000 bytes of access log in 0.62 seconds. It grants no capability beyond flooding
+# GET /healthz, but it contradicts the reasoning used to meter preflights on these same paths.
+_PROBE_METHODS: dict[str, frozenset[str]] = {
+    **{path: frozenset({"GET", "HEAD"}) for path in LIVENESS_PATHS},
+    STORAGE_PROBE_PATH: frozenset({"GET"}),
+}
 # Any header by which a proxy claims to speak for someone else. Their PRESENCE collapses the
 # rate-limit key rather than being trusted for its content.
 _FORWARD_HEADERS = frozenset({"x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"})
@@ -459,7 +467,16 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         # request is metered now so the flood is bounded either way. Every other rejection,
         # including a 405 on a real route, is still audited.
         if _unaudited_rejection(request, exc.status_code):
-            return JSONResponse({"error": detail}, status_code=exc.status_code)
+            # exc.headers is passed through, and this is correctness by construction rather
+            # than a repair. A review reported that suppressing the audit line here also
+            # dropped the Allow header, which RFC 9110 makes a MUST on a 405. I could not
+            # reproduce it: measured with and without this argument, on HEAD, DELETE and PUT
+            # against /healthz/storage, /healthz and /diagnostics, every response carried
+            # `allow: GET`, because Starlette's router sets it on the outgoing response and not
+            # only on the exception. The argument stays because it is right in general: if this
+            # branch ever handles a 429, dropping Retry-After would tell a compliant client to
+            # retry in a tight loop. It is not, however, the fix for a defect I could observe.
+            return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
         audit_log.warning(
             json.dumps(
                 {
@@ -525,12 +542,22 @@ def register_health_routes(
         app.add_api_route(
             path,
             liveness,
-            # HEAD as well as GET. FastAPI does not add HEAD for a GET route, so `HEAD /healthz`
-            # was a 405, which is both wrong for a liveness path a probe may be configured to
-            # HEAD and the cheapest way into the unmetered-405 amplification below.
-            methods=["GET", "HEAD"],
+            methods=["GET"],
             status_code=status.HTTP_200_OK,
             include_in_schema=path == "/healthz",
+        )
+        # HEAD as its OWN route. FastAPI does not add HEAD for a GET route, so `HEAD /healthz`
+        # was a 405: wrong for a liveness path a probe may be configured to HEAD, and the
+        # cheapest way into the unmetered-405 amplification. Registering both methods on one
+        # route instead made FastAPI derive a single operation id from an arbitrary member of the
+        # method set, so the development OpenAPI document gave GET and HEAD the same id and
+        # emitted a duplicate-operation-id warning on every verify run. Two routes, one id each.
+        app.add_api_route(
+            path,
+            liveness,
+            methods=["HEAD"],
+            status_code=status.HTTP_200_OK,
+            include_in_schema=False,
         )
 
     @app.get(STORAGE_PROBE_PATH)
@@ -860,7 +887,7 @@ def create_app(
         project closed for preflights one commit earlier while claiming to have closed the last
         uncounted unauthenticated path.
         """
-        if request.url.path in UNMETERED_PATHS and request.method in _PROBE_METHODS:
+        if request.method in _PROBE_METHODS.get(request.url.path, frozenset()):
             return None
         return _charge_coarse(request)
 

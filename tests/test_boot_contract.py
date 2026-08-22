@@ -329,6 +329,13 @@ def test_the_effective_launch_command_binds_every_interface_and_execs() -> None:
     assert exposed == ["8080"], f"the final stage exposes {exposed}, not the platform port"
 
 
+# The digest that decides what actually ships, pinned as a literal the way SUID_SWEEP and the
+# forwarded trust list are. Requiring only that A digest exists let one character change swap the
+# base filesystem, including for one carrying a pre-neutered /usr/bin/find, with the whole suite
+# green. With the containerize leg exiting 2 for want of a daemon, this text is all there is.
+BASE_DIGEST = "sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a"
+
+
 def test_every_base_image_is_pinned_by_digest() -> None:
     """ "The base digest is pinned" was a comment, asserted nowhere.
 
@@ -371,6 +378,25 @@ def test_every_base_image_is_pinned_by_digest() -> None:
         if not re.search(r"@sha256:[0-9a-f]{64}$", resolved):
             unpinned.append(f"{reference} resolves to {resolved!r}")
     assert not unpinned, f"a base image is not pinned to a digest: {unpinned}"
+
+    # And pinned to THE vetted digest, the same one in both stages. A digest that merely exists
+    # is not a pin: changing one character ships a different filesystem.
+    digests = [
+        match.group(1)
+        for instruction in instructions
+        if instruction.keyword == "FROM"
+        for match in [re.search(r"@(sha256:[0-9a-f]{64})", instruction.argument)]
+        if match
+    ]
+    assert digests, "no FROM carries a digest at all"
+    assert set(digests) == {BASE_DIGEST}, (
+        f"a base image is pinned to a digest other than the vetted one. Changing the base is a "
+        f"deliberate act: update BASE_DIGEST in this file too.\n  found: {sorted(set(digests))}"
+        f"\n  vetted: {BASE_DIGEST}"
+    )
+    assert len(digests) == 2, (
+        f"expected both build stages to carry the digest, found {len(digests)}"
+    )
 
 
 def test_the_suid_sweep_is_the_last_mutating_instruction_of_its_stage() -> None:
@@ -420,6 +446,24 @@ def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
     assert not misplaced, misplaced
 
 
+# The RUN commands that are allowed to mention an executable directory, pinned by exact text
+# the way the sweep is. Anything else naming one of those directories is an offence, so there is
+# no verb list to be one entry short. Changing any of these means changing this literal, which
+# is the point: a reviewer sees the diff.
+_VETTED_RUNS = (
+    "python -m venv /opt/venv",
+    "pip install --require-hashes --no-deps -r requirements.txt",
+    "apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*",
+    "rm -rf /opt/venv/lib/python3.12/site-packages/pip* /opt/venv/bin/pip* "
+    "/usr/local/lib/python3.12/site-packages/pip* "
+    "/usr/local/lib/python3.12/site-packages/setuptools* "
+    "/usr/local/lib/python3.12/ensurepip /usr/local/bin/pip /usr/local/bin/pip3 "
+    "/usr/local/bin/pip3.12 && rm -rf /var/lib/apt /var/cache/apt /etc/apt /usr/bin/apt "
+    "/usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/sbin/dpkg-* /var/lib/dpkg/info "
+    "&& useradd --uid 10001 --user-group --system --no-create-home "
+    "--shell /usr/sbin/nologin appuser && chown -R 10001:10001 /app",
+    "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +",
+)
 SUID_SWEEP = (
     "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +"
 )
@@ -534,18 +578,31 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
     # And a RUN that writes into one of those directories. The guard only ever considered COPY
     # and ADD, so `RUN cp /bin/true /usr/bin/find` before the sweep was invisible: the simplest
     # form of the attack, and the one nobody had tried.
-    # Word-bounded verbs. A substring list matched "useradd" through "dd " and flagged the
-    # legitimate pip-removal RUN, and a guard that cries wolf gets relaxed rather than obeyed.
-    writer = re.compile(r"(?:^|[;&|]\s*|\s)(cp|mv|install|ln|tee|dd)\s")
+    # NO verb denylist. There was one, of six verbs, and three one-line mutations walked through
+    # it: `RUN /bin/cat /bin/true > /usr/bin/find` needs no verb at all, `RUN tar -xf … -C
+    # /usr/bin/` uses a verb that was not listed, and `RUN python -c "open('/usr/bin/find','w')…"`
+    # names the target literally. Enumerating the ways a shell can write a file is the same
+    # losing game as enumerating the ways a name can look like a credential.
+    #
+    # So ANY mention of an executable directory in a RUN is an offence, and the legitimate ones
+    # are pinned by exact text rather than excused by a pattern. That inverts the burden: adding
+    # a RUN that touches /usr/bin means adding it to _VETTED_RUNS deliberately, which is a
+    # decision someone has to make and a reviewer can see.
+    vetted = {" ".join(text.split()) for text in _VETTED_RUNS}
     for instruction in _instructions():
         if instruction.keyword != "RUN":
             continue
         collapsed = " ".join(instruction.argument.split())
-        if not writer.search(collapsed):
+        if collapsed in vetted:
             continue
+        # Both spellings of each directory, and the WORKDIR in force, because `-C /usr/bin`
+        # without the trailing slash and a `cd`-relative destination both matched nothing.
+        haystack = f"{collapsed} {instruction.workdir}"
         for directory in _EXECUTABLE_DIRECTORIES:
-            if directory in collapsed:
-                offenders.append(f"RUN writes into {directory}: {collapsed[:80]}")
+            bare = directory.rstrip("/")
+            if directory in haystack or f" {bare}" in f" {haystack}" or haystack.endswith(bare):
+                offenders.append(f"RUN touches {bare}: {collapsed[:80]}")
+                break
 
     assert not offenders, (
         f"an instruction writes into a system executable directory, so the binaries the "
@@ -690,29 +747,54 @@ def test_the_sonar_configuration_scopes_sources_to_src() -> None:
 
 
 def _claim_units(path: Path) -> list[str]:
-    """One unit per line, plus each ADJACENT PAIR of table rows.
+    """SENTENCES, not line windows, plus each table row whole.
 
-    Three shapes had to be handled and the first two attempts each broke on the third. Treating
-    every line separately missed a floor split over two rows of a table. Joining every
-    contiguous run of rows into one unit swallowed the whole 70-row control table, so any
-    integer anywhere in it read as a claim about the token and the guard became unusable noise.
-    Pairs of adjacent rows cover the split-row case and can never grow past two rows.
+    Line windows lost twice. One line at a time missed a floor stated across two wrapped lines.
+    Pairs of adjacent lines fixed that and missed a floor stated across THREE: the first pair
+    carried the subject and the size word with no number, the second carried the size word and
+    the number with no subject, and neither pair had all three. Widening to three lines would
+    lose to four. A sentence is the unit a claim is actually written in, so the prose is joined
+    and split on terminators instead, and the window disappears.
+
+    Table rows are kept whole and separate, because a markdown row has no sentence terminator
+    and joining rows into flowing prose would run the whole table together.
     """
     lines = [
         re.sub(r"\s+", " ", raw).strip() for raw in path.read_text(encoding="utf-8").splitlines()
     ]
-    # A leading ordered-list marker is stripped: "8." at the start of a line is the item's
-    # index, not a claim about anything, and the inverted rule below would read it as one.
-    units = [re.sub(r"^\d+\.\s+", "", line.strip(" ●■")) for line in lines if line]
-    # EVERY adjacent pair, not only table rows. Both these documents wrap at about 100 columns,
-    # so a sentence stating the floor can split into a line with the subject and no number and a
-    # line with the number and no subject, and neither half trips the rule. That is why
-    # DEPLOYMENT.md kept its floor sentence as one long unwrapped line, which no guard enforced:
-    # a rewrap would have silently disabled the check.
+    units: list[str] = []
+    prose: list[str] = []
+    for line in lines:
+        if line.startswith("|"):
+            if prose:
+                units.extend(re.split(r"(?<=[.!?])\s+", " ".join(prose)))
+                prose = []
+            units.append(line)
+            continue
+        if not line:
+            if prose:
+                units.extend(re.split(r"(?<=[.!?])\s+", " ".join(prose)))
+                prose = []
+            continue
+        prose.append(re.sub(r"^\d+\.\s+", "", line.strip(" ●■")))
+    if prose:
+        units.extend(re.split(r"(?<=[.!?])\s+", " ".join(prose)))
+    # Adjacent table rows too, for a floor split across a header row and its value row.
     units += [
-        f"{first} {second}" for first, second in itertools.pairwise(lines) if first and second
+        f"{first} {second}"
+        for first, second in itertools.pairwise(lines)
+        if first.startswith("|") and second.startswith("|")
     ]
-    return units
+    # NO sentence lookback, and it was tried. A floor can be split so the sentence naming the
+    # token carries no number and the next sentence carries the number without naming the token
+    # ("…how long the shared team token must be. The rule is that it must be at least 16 in
+    # size."), and sentence units localise a claim correctly enough that neither half trips the
+    # rule. Pairing adjacent sentences catches that and joined unrelated ones: three true
+    # statements in this repository flagged immediately, among them "a verdict is cached for two
+    # seconds". A guard that cries wolf gets relaxed rather than obeyed, so the residual is
+    # recorded in the test's docstring instead. That is the third documented boundary on this
+    # guard, and widening it a seventh time has now cost more than it bought twice running.
+    return [unit for unit in units if unit.strip()]
 
 
 _NUMBER_WORD_PATTERN = re.compile(
@@ -765,7 +847,13 @@ def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
     word in it and passes. What the inversion actually buys is that the NUMBER side needs no
     table, which is where five consecutive rounds of defeats came from.
 
-    TWO tables remain, and both have been one entry short. The size-word set: "16 random units"
+    THREE residuals remain, all recorded rather than implied away.
+
+    First, the pronoun split: a floor stated across two sentences, where the one naming the token
+    carries no number and the one carrying the number names no token, passes. Pairing adjacent
+    sentences catches it and flags unrelated prose, so it is not done.
+
+    And two tables, both of which have been one entry short. The size-word set: "16 random units"
     states a floor with no size word in it. And the token-synonym set: "the shared access key as
     16 random characters" has a full size word and passed because "key" was missing, after
     "secret" and "passphrase" had already been added for the same reason. The consequence of

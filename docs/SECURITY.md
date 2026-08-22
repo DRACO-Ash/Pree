@@ -103,6 +103,9 @@ the assessment store.
 | A preflight to a probe path is refused without an audit line | `src/pree/app.py` | `test_a_preflight_to_a_probe_path_is_refused_without_an_audit_line` |
 | A wrong method on a probe path is metered and not audited | `src/pree/app.py` | `test_a_wrong_method_on_a_probe_path_is_metered_and_not_audited` |
 | Every liveness path answers HEAD as well as GET | `src/pree/app.py` | `test_every_liveness_path_answers_head_as_well_as_get` |
+| Only vetted RUN commands may touch an executable directory | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
+| The base image is pinned to the vetted digest in both stages | `Dockerfile` | `test_every_base_image_is_pinned_by_digest` |
+| The probe exemption is per path and per method | `src/pree/app.py` | `test_the_probe_exemption_is_per_path_and_per_method` |
 | Production refuses a cleartext allowed origin | `src/pree/config.py` | `test_production_refuses_a_cleartext_allowed_origin` |
 | The access log redacts a query string | `src/pree/audit.py` | `test_the_access_log_filter_redacts_a_query_string` |
 | A malformed store key is refused at the boundary | `src/pree/app.py` | `test_a_malformed_store_key_is_refused_at_the_boundary` |
@@ -175,6 +178,16 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    limit doubles, so the pair could not discriminate and contradicted this entry's own first
    sentence about worker count. The reviewer caught that, not I, and the figures above replace
    it at the shipped configuration.
+
+   One residual is not in the limiter at all and belongs here. The six probe paths are exempt
+   from the coarse limit for GET and HEAD, so an unauthenticated caller can drive the ACCESS log
+   without bound on those methods: measured at about 3.2 MB a minute per worker. The audit
+   channel is bounded (those paths write no record) and the request line is truncated to 160
+   characters, so what is unbounded is the volume of short lines rather than their size. It is
+   accepted because the alternative is metering the platform's own probes, which turns an
+   infrastructure fault into a pod restart, and because a log volume filling is a degradation
+   rather than a disclosure. If the platform's log store has a hard quota, set a retention policy
+   on it rather than a limit here.
 
    If operations later needs real client addresses, set the flag to the ingress address
    specifically, never to `*`, and remove the in-app fold deliberately at the same time.
@@ -836,9 +849,18 @@ directories are checked, and ADD is refused outright rather than inspected, beca
 uses COPY everywhere and an extension list will always be one short.
 
 Five minors. The packaging key rule omitted `/` from its delimiter class, so "key" as a whole
-path COMPONENT was not a delimited word and `docs/keys/prod.txt`, `docs/key/prod.txt` and
-`src/pree/keyring/x.py` all shipped a real private key past a scan whose own comment claimed a
-component-wide match. The image listing's name scan read the last field of a `tar -tv` line,
+path COMPONENT was not a delimited word and `docs/keys/prod.txt` and `docs/key/prod.txt` shipped
+a real private key past a scan whose own comment claimed a component-wide match.
+
+That paragraph originally named `src/pree/keyring/x.py` in the same list, as fixed. It was not:
+adding "/" to the delimiter class closed the directory case and left `keyring` open, because the
+rule still required a delimiter AFTER "key". The next review ran the script's own pipeline and
+found it, along with `keystore.json`, `keyfile.txt`, `keychain.py`, `keypair.txt` and
+`sshkeygen.sh`. My own verification had shown that path refused, and it was wrong: a leftover
+directory from the previous iteration of the same test loop was still present, so a different
+net fired and I read it as this one. Asserting a fix that does not exist is the one failure mode
+worse than the hole, because nobody looks again. The rule is now the plain substring "key",
+false positives and all. The image listing's name scan read the last field of a `tar -tv` line,
 which is the link TARGET for a symlink or a hard link, so every link member was invisible: a
 listing containing `opt/venv/bin/pip3 -> python3.12` matched nothing, and the positive control
 added one commit earlier was blind in exactly the same way. The mode-column count excluded `h`,
@@ -856,6 +878,61 @@ a different method, the same guard through a different path form. The applicatio
 boundaries, the constant-time compare, the boundary validation, the CSP and CORS lock, the
 generic-error contract, the secret trace, have held throughout. What keeps failing is the layer
 written to prove they hold, and it keeps failing in the direction of reporting a pass.
+
+Nineteenth review: two majors, and one of them was a claim in this document rather than a defect
+in the code.
+
+The RUN-write guard added one round earlier was gated on a six-verb denylist, and three one-line
+mutations walked straight through it: `RUN /bin/cat /bin/true > /usr/bin/find` needs no verb at
+all, `RUN tar -xf … -C /usr/bin/` uses one that was not listed, and
+`RUN python -c "open('/usr/bin/find','w')…"` names the target literally. Two mutations that were
+caught were caught by accident, matching `/bin/` inside the SOURCE path rather than the
+destination. Enumerating the ways a shell can write a file is the same losing game as
+enumerating the ways a name can look like a credential, so the denylist is gone: any RUN
+mentioning an executable directory is an offence, and the five legitimate ones are pinned by
+exact text in `_VETTED_RUNS` the way the sweep itself is. Adding a RUN that touches `/usr/bin`
+now means editing that literal, which is a decision a reviewer sees in the diff. Nine
+fabrications turn it red, including shell redirection, `tar -C`, `sed -i`, `busybox cp`, a
+`cd`-relative write and a `chmod u+s`.
+
+The second major is worse than a hole. The paragraph above about the packaging key rule named
+`src/pree/keyring/x.py` as one of three paths the fix had closed. It had not: adding "/" to the
+delimiter class fixed the directory case and left `keyring` open, because the rule still required
+a delimiter after "key". Five more names were open with it. My own verification had reported that
+path refused, and the reason it did was a leftover directory from the previous iteration of the
+same test loop, so a different net fired and I recorded it as this one. That is the second time
+in this project a measurement of mine was wrong because the harness was contaminated, and the
+first time the wrong result was written into this document as a completed fix. The rule is now
+the plain substring, with the false positives that implies, and the paragraph is corrected in
+place rather than quietly reworded.
+
+Five minors, and one of them I could not reproduce. The review reported that the suppressed 405
+on a probe path dropped `exc.headers`, leaving those six paths without an `Allow` header, which
+RFC 9110 makes a MUST. Measured with and without that argument, on HEAD, DELETE and PUT against
+`/healthz/storage`, `/healthz` and `/diagnostics`, every response carried `allow: GET`, because
+Starlette's router sets the header on the outgoing response rather than only on the exception it
+raises. The argument is passed through anyway, because it is right in general and free: if that
+branch ever handles a 429, dropping `Retry-After` would tell a compliant client to retry in a
+tight loop. It is recorded here as a non-reproduction rather than as a fix, and the test that
+asserts the header says in its own docstring that it will not fail if the argument is removed.
+`HEAD` was exempted on `/healthz/storage`, which serves only GET, so a 405 that can never be a
+platform probe was unmetered: 600 of 600 admitted, 33,000 bytes of access log in 0.62 seconds.
+The exemption is now per path and per method, which is what "the exemption is for the probe, not
+the path" actually means. Registering GET and HEAD on one route made FastAPI derive one operation
+id for both, so the development OpenAPI document was invalid and the verify loop carried a
+duplicate-operation-id warning on every run; HEAD is its own route now. The base digest was
+asserted to EXIST rather than to be a particular value, so changing one character shipped a
+different filesystem with the suite green: it is pinned as a literal and both stages must carry
+it. And the token guard's unit builder used adjacent-line pairs, which lost to a floor split
+across three lines; it builds sentences now.
+
+That last one has a residual, and it is the third on this guard. A floor split so that the
+sentence naming the token carries no number and the next carries the number without naming the
+token still passes. Pairing adjacent sentences catches it and flagged three true statements in
+this repository immediately, "a verdict is cached for two seconds" among them. A guard that cries
+wolf gets relaxed rather than obeyed, so the pairing is not done and the boundary is written into
+the test's own docstring. Widening this guard has now cost more than it bought twice running,
+which is the point at which the right answer is to stop widening it and say where it ends.
 
 Each of these now has a named regression test in the control table above.
 
