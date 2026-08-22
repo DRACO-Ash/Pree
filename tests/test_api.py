@@ -16,7 +16,8 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Protocol
+from types import ModuleType
+from typing import Any, NamedTuple, Protocol
 from unittest import mock
 
 import pytest
@@ -31,6 +32,7 @@ from starlette.routing import Route
 
 from pree import __version__
 from pree import app as app_module
+from pree import audit as audit_module
 from pree.app import (
     DOC_PATHS,
     LIVENESS_PATHS,
@@ -3249,6 +3251,260 @@ AUDIT_RULE_CANARIES: dict[str, str] = {
 }
 
 
+# Every audit field pinned as a CLOSED SET of literals. `kind` was outside this sweep and the gate
+# proved the consequence: `"phantom_kind_nothing_emits"` added to its `_OneOf` left 332 tests green,
+# because `kind` had only the emit-to-pin direction, through EXPECTED_AUDIT_KEYS, and nothing
+# checked the other way. The register row claimed "in both directions" for all of them, which was
+# false for exactly this field.
+# The logger names an audit record is written through. Both, because the two modules name the same
+# object differently and a one-name walk silently missed the module that builds the `audit` record.
+_AUDIT_LOGGER_NAMES = frozenset({"audit_log", "logger"})
+_LOG_EMIT_METHODS = frozenset(
+    {"debug", "info", "warning", "warn", "error", "exception", "critical", "fatal", "log"}
+)
+CLOSED_SET_AUDIT_FIELDS = ("kind", "action", "outcome")
+
+
+class _Emission(NamedTuple):
+    """One expression whose value can reach an audit record, with enough context to judge it.
+
+    `where` names the module and line, because an error message that hardcodes one module lies as
+    soon as the walk covers two: mine said "app.py:135" for a line in `audit.py`. `parameters` are
+    the enclosing function's parameter names, which is what distinguishes a PASS-THROUGH from a
+    computation - `audit()` forwards `"action": action` from its own signature, which carries no
+    value of its own, while `outcome="harvest" if ord(token[0]) & 1 else "ok"` computes one.
+    """
+
+    where: str
+    field: str
+    expression: ast.expr
+    parameters: frozenset[str]
+
+
+def _enclosing_parameters(tree: ast.Module) -> dict[int, frozenset[str]]:
+    """Which function's parameters are in scope at each line.
+
+    Needed to tell a PASS-THROUGH from a computation: `audit()` forwarding `"action": action` from
+    its own signature originates no value, while an expression that computes one does.
+    """
+    scopes: dict[int, frozenset[str]] = {}
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        names = frozenset(
+            argument.arg
+            for group in (
+                function.args.posonlyargs,
+                function.args.args,
+                function.args.kwonlyargs,
+            )
+            for argument in group
+        )
+        for inner in ast.walk(function):
+            line = getattr(inner, "lineno", None)
+            if line is not None:
+                scopes[line] = scopes.get(line, frozenset()) | names
+    return scopes
+
+
+def _bound_record_dicts(tree: ast.Module) -> dict[str, ast.Dict]:
+    """Dict literals bound to a name, so a record BUILT then logged is reachable.
+
+    `audit.py` does exactly that: `record = {...}` then `logger.info(json.dumps(record, ...))`. A
+    call-argument-only walk therefore reported the `kind` pin's `audit` entry as unemitted, which
+    was the third time a partial walk here produced a confident wrong answer.
+    """
+    bound: dict[str, ast.Dict] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign | ast.AnnAssign) or not isinstance(node.value, ast.Dict):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                bound[target.id] = node.value
+    return bound
+
+
+def _emissions_in(module: ModuleType) -> tuple[list[_Emission], int]:
+    """Every audit emission expression in one module, and how many payloads went unresolved.
+
+    ONE function per module rather than a loop with a closure over per-module state: the closure
+    version bound the scope map from the enclosing loop, which is the late-binding bug that reads
+    correctly only because every call happens in the same iteration.
+    """
+    path = Path(module.__file__ or "").resolve()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    scopes = _enclosing_parameters(tree)
+    bound = _bound_record_dicts(tree)
+    audit_parameters = list(inspect.signature(audit).parameters)
+    found: list[_Emission] = []
+    unresolved = 0
+
+    def emit(value: ast.expr, field: str) -> None:
+        found.append(
+            _Emission(
+                f"{path.name}:{value.lineno}",
+                field,
+                value,
+                scopes.get(value.lineno, frozenset()),
+            )
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = node.func
+        if isinstance(called, ast.Name) and called.id == "audit":
+            for index, value in enumerate(node.args):
+                if index < len(audit_parameters):
+                    emit(value, audit_parameters[index])
+            for argument in node.keywords:
+                if argument.arg:
+                    emit(argument.value, argument.arg)
+            continue
+        if not isinstance(called, ast.Attribute) or not isinstance(called.value, ast.Name):
+            continue
+        # EMITTING methods only. `addHandler`, `setLevel` and `addFilter` are calls on the same
+        # object that write no record, and counting them as unresolvable payloads made this walk
+        # refuse the tree it was measuring.
+        if called.value.id not in _AUDIT_LOGGER_NAMES or called.attr not in _LOG_EMIT_METHODS:
+            continue
+        payloads = [
+            inner
+            for argument in node.args
+            for inner in ast.walk(argument)
+            if isinstance(inner, ast.Dict) or (isinstance(inner, ast.Name) and inner.id in bound)
+        ]
+        if not payloads:
+            unresolved += 1
+        for payload in payloads:
+            record = payload if isinstance(payload, ast.Dict) else bound[payload.id]
+            for key, value in zip(record.keys, record.values, strict=True):
+                emit(value, str(key.value if isinstance(key, ast.Constant) else "?"))
+    return found, unresolved
+
+
+def _audit_emission_expressions() -> list[_Emission]:
+    """Every expression whose value can reach an audit record, across both emitting modules.
+
+    ONE accessor, because three separate checks need the same set and three hand-rolled walks over
+    it is three places to miss a call site.
+
+    BOTH modules, named explicitly. `app.py` builds the five rejection records and calls `audit()`;
+    `audit.py` builds the `audit` record itself, and the literal `"kind": "audit"` lives only there.
+    """
+    found: list[_Emission] = []
+    unresolved = 0
+    for module in (app_module, audit_module):
+        module_found, module_unresolved = _emissions_in(module)
+        found.extend(module_found)
+        unresolved += module_unresolved
+    assert not unresolved, (
+        f"{unresolved} audit logger calls have a payload this walk cannot resolve to a dict "
+        f"literal, so their fields are unchecked by every caller of this accessor"
+    )
+    assert found, "no audit payload was resolved at all, so every check over this is vacuous"
+    return found
+
+
+# The ONE config attribute an audit expression may read, and the field it may read it for. Every
+# other attribute of the config object is off limits inside a record, which is what makes this a
+# closure rather than a sample.
+PERMITTED_AUDIT_CONFIG_READ = ("origin_allowed", "allowed_origin")
+# Every `config.<attribute>` the HTTP layer reads, pinned exactly. A new one is a named failure a
+# reviewer sees in the diff, which is the point: this list is short because the layer needs little,
+# and `team_token` is deliberately not on it.
+EXPECTED_CONFIG_READS = frozenset({"allowed_origin", "is_production", "data_dir"})
+
+
+def test_no_audit_expression_can_reach_the_deployed_credential() -> None:
+    """The CLASS closure, and the reason a sampled token axis was never going to be enough.
+
+    Four rounds of this control were sampled: pick two tokens, then five, then five plus a random
+    draw, and assert a boolean or a string does not move with them. Each round the gate found a
+    predicate the sample did not separate, and the last round found several that survive a
+    `token_urlsafe` draw with probability one - `"=" in token`, `"+" in token`, `len(token) < 64`.
+    A sample can only raise the cost of a channel. It cannot close one, and saying "improbable
+    rather than impossible" was the most that framing could ever honestly claim.
+
+    This closes it instead. Every value that reaches an audit record was measured, and exactly ONE
+    of them reads the config object: the `origin_allowed` comparison against `allowed_origin`. The
+    deployed credential is reachable in this application only through `config`, because the token a
+    caller presents is caller-supplied and echoing that is their own disclosure (a recorded
+    residual), while `config.team_token` is the deployment's secret. So an audit expression that
+    cannot read `config` cannot encode the credential, whatever encoding it would have used, and
+    whatever the token happens to look like.
+
+    Every leaking mutation the gate demonstrated goes through `config`: the token hex appended to a
+    path, base64 in a `reason`, hex split across the two halves of a `key`, four token bytes in a
+    `score` mantissa, an attacker-indexed bit in a boolean, and every one of those gated on
+    `config.is_production` so a development-only exercise could not see it. This one rule refuses
+    all of them at once, including the environment-gated forms, because the gate is itself a
+    `config` read.
+    """
+    offenders: list[str] = []
+    for emission in _audit_emission_expressions():
+        for node in ast.walk(emission.expression):
+            if not isinstance(node, ast.Attribute):
+                continue
+            base = node.value
+            if not (isinstance(base, ast.Name) and base.id == "config"):
+                continue
+            if (emission.field, node.attr) == PERMITTED_AUDIT_CONFIG_READ:
+                continue
+            offenders.append(f"{emission.where} {emission.field}= reads config.{node.attr}")
+    assert not offenders, (
+        f"an audit expression reads the deployment's configuration, so it can encode the "
+        f"credential in any form a shape check will accept: {offenders}. The only permitted read "
+        f"is {PERMITTED_AUDIT_CONFIG_READ[0]}= config.{PERMITTED_AUDIT_CONFIG_READ[1]}"
+    )
+    # And the permitted read must still BE there, or this test is pinning a set of zero.
+    reads = {
+        (emission.field, node.attr)
+        for emission in _audit_emission_expressions()
+        for node in ast.walk(emission.expression)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "config"
+    }
+    assert reads == {PERMITTED_AUDIT_CONFIG_READ}, (
+        f"the permitted audit config read is not the one that exists: {sorted(reads)}"
+    )
+
+
+def test_the_http_layer_never_reads_the_deployed_token_at_all() -> None:
+    """The indirect route, closed by the same argument one level out.
+
+    The rule above constrains an audit EXPRESSION, so it does not by itself stop
+    `leaked = config.team_token` on a line above followed by `reason=leaked`. This closes that: the
+    HTTP layer never reads `team_token`, so there is nothing in scope to bind. Comparison happens
+    in `security.authorise`, which takes the config and returns an actor, and that is the whole of
+    the credential's reach.
+
+    The full read set is pinned rather than just the one name refused, because a denylist of
+    attribute names would be one short the moment a config field is added - which is how the ENV
+    name denylist in the boot contract failed seven rounds running before it became an allowlist.
+    """
+    source = Path(app_module.__file__ or "").resolve().read_text(encoding="utf-8")
+    reads = {
+        node.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "config"
+    }
+    assert "team_token" not in reads, (
+        "the HTTP layer reads config.team_token, so the deployed credential is in scope for every "
+        "expression in the module, including the ones that build audit records"
+    )
+    assert reads == EXPECTED_CONFIG_READS, (
+        f"the HTTP layer's config reads have changed: added "
+        f"{sorted(reads - EXPECTED_CONFIG_READS)}, removed "
+        f"{sorted(EXPECTED_CONFIG_READS - reads)}. Each addition widens what an audit "
+        f"expression could reach, so the set is pinned rather than the one name refused"
+    )
+
+
 def test_every_closed_set_pin_is_exactly_what_the_application_can_emit() -> None:
     """The CLASS, not just the `confidence` instance the review found.
 
@@ -3263,36 +3519,33 @@ def test_every_closed_set_pin_is_exactly_what_the_application_can_emit() -> None
     exists to constrain; reading the string literals the handlers actually pass is an independent
     measurement of the same fact.
     """
-    source = Path(app_module.__file__ or "").resolve().read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    emitted: dict[str, set[str]] = {"action": set(), "outcome": set()}
-
-    def collect(name: object, value: ast.expr) -> None:
-        if not isinstance(name, str) or name not in emitted:
-            return
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            emitted[name].add(value.value)
-
-    # THREE forms, because the application uses all three and each earlier version of this walk
-    # found a subset and drew a confident wrong conclusion from it. A dict-literal-only walk found
-    # NOTHING (a check that silently finds nothing passes for the wrong reason, which is why the
-    # emptiness is asserted below). Adding keyword arguments found `assess` and reported the pin's
-    # `read_assessment` as permitted-but-unemitted, which was false: it is emitted POSITIONALLY at
-    # three call sites. So positional arguments are bound to `audit`'s real signature rather than
-    # to hard-coded indices, because an index would be a second copy of the parameter order.
-    audit_parameters = list(inspect.signature(audit).parameters)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Dict):
-            for key, value in zip(node.keys, node.values, strict=True):
-                collect(key.value if isinstance(key, ast.Constant) else None, value)
-        elif isinstance(node, ast.Call):
-            for argument in node.keywords:
-                collect(argument.arg, argument.value)
-            called = node.func
-            if isinstance(called, ast.Name) and called.id == "audit":
-                for index, value in enumerate(node.args):
-                    if index < len(audit_parameters):
-                        collect(audit_parameters[index], value)
+    emitted: dict[str, set[str]] = {field: set() for field in CLOSED_SET_AUDIT_FIELDS}
+    # Collected from the EMISSION SITES ONLY, via the shared accessor, because a walk over every
+    # dict literal in the module proved which literals EXIST, not which ones a record carries. The
+    # gate demonstrated the difference: widening the `outcome` pin to include `"harvest"`, adding
+    # two unrelated `{"outcome": ...}` decoy literals so the walk collected both, and changing the
+    # emission to `outcome="harvest" if ord(token[0]) & 1 else "ok"` left the suite green with a
+    # token bit shipping inside a "closed" set.
+    #
+    # So a closed-set field's emitted expression must be an `ast.Constant`. That is what refuses the
+    # conditional, and it is stronger than collecting its branches would be: an expression is
+    # either one fixed literal or it is a failure with its line number.
+    for emission in _audit_emission_expressions():
+        if emission.field not in emitted:
+            continue
+        expression = emission.expression
+        # A PASS-THROUGH is not a computation. `audit()` forwards `"action": action` from its own
+        # signature, which originates no value; the check is on the sites that supply one. An
+        # earlier version refused the forward and reported it against the wrong module, because the
+        # message hardcoded a filename while the walk covered two.
+        if isinstance(expression, ast.Name) and expression.id in emission.parameters:
+            continue
+        assert isinstance(expression, ast.Constant) and isinstance(expression.value, str), (
+            f"{emission.where} emits {emission.field}= as an expression rather than a literal "
+            f"({ast.unparse(expression)!r}). A closed-set field computed at the call site can "
+            f"carry a bit of anything in scope while every value it produces stays inside the pin"
+        )
+        emitted[emission.field].add(expression.value)
     for field, values in emitted.items():
         assert values, f"no literal {field!r} values found in app.py, so this check is vacuous"
         rule = AUDIT_STRING_VALUES[field]
