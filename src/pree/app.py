@@ -103,11 +103,11 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 # arrives percent-decoded, and json.dumps renders one astral code point as a 12-byte surrogate
 # escape. The worst case is therefore about 12x this number, roughly 2 KB per record, which the
 # test asserts against that exact input rather than against an ASCII one.
+MAX_LOGGED_PATH = 160
 # The store key's shape, enforced at the boundary rather than assumed. Two identifiers of at
 # most 64 characters and the colon between them.
 STORE_KEY_MAX_LENGTH = 129
 STORE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-MAX_LOGGED_PATH = 160
 # The reason string is composed server-side in both handlers that log one: AuthError carries a
 # fixed literal, and StoreError embeds a configured path, never caller input. Truncating it to
 # the actor length cut "could not acquire the store lock at /proc/.../.assessments.json" off
@@ -338,35 +338,16 @@ def _peer_key(request: Request) -> str:
 def _limit_keys(request: Request) -> tuple[str, ...]:
     """Every bucket this request must fit inside. Refused if ANY of them is over.
 
-    ONE key space, not two, and getting back to one took three rounds of making it worse.
+    ONE key space, and the token plays no part in choosing it: a saturated peer is refused
+    identically whether its token is right or wrong, which is what removes the guessing oracle
+    and restores the premise the token-length floor is calculated from. The socket key is
+    unconditional and the forwarded fold is ADDITIONAL, so a forwarding header can only ever add
+    a constraint, never grant a fresh bucket.
 
-    The space was split by the token header's PRESENCE, so an unauthenticated caller reached
-    the operators' budget with `X-Pree-Token: anything`. Splitting by the token's VALIDITY
-    fixed that and made refusal an oracle: after a peer saturated its unauthenticated bucket, a
-    wrong guess returned 429 and the right token returned 200, so a guessing run read the answer
-    off the status code at about 53,000 attempts a minute. Bounding wrong guesses per peer
-    closed the oracle and handed an unauthenticated caller a denial of service against the whole
-    watch floor: twenty wrong tokens from anywhere on the internet locked out every operator,
-    because behind the platform ingress they all present one address. That is strictly worse
-    than what it replaced.
-
-    So there is one bucket per peer and the token plays no part in choosing it. A saturated peer
-    is refused identically whether its token is right or wrong, which removes the oracle and
-    restores the premise the token-length floor is calculated from: 240 attempts a window. The
-    residual is that operators behind a shared ingress share a bucket with everyone else at that
-    address, which is recorded in the security policy as an accepted risk and was accepted long
-    before any of this. A control that has to be repaired twice and is worse each time is a
-    control that should not exist.
-
-    The socket key is ALWAYS the same string, header or no header. The previous version
-    returned a bare `<ip>` without a forwarding header and `socket:<ip>` with one, which are two
-    different keys, so a saturated caller added any forwarding header and got a fresh bucket:
-    measured, 240 then 240 more on the coarse tier and 20 then 20 more on the expensive path,
-    twice the documented budget per peer and four times it at the shipped two workers. The
-    docstring claimed a header "can only ever reduce a caller's allowance" and it doubled it.
-
-    Now the socket key is unconditional and the fold is ADDITIONAL, so a forwarding header can
-    only ever add a constraint.
+    Three earlier designs are recorded in docs/SECURITY.md with their measurements, and the
+    regression test for each is
+    `test_a_forwarding_header_cannot_widen_the_rate_limit_key_space`. The residual, that operators
+    behind a shared ingress share a bucket, is a recorded accepted risk.
     """
     client = request.client
     keys = [f"socket:{client.host if client else 'unknown'}"]

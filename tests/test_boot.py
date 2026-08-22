@@ -12,7 +12,6 @@ import pree.main
 from pree.config import ConfigError
 from pree.main import build
 from tests.conftest import PRODUCTION_TOKEN
-from tests.conftest import PRODUCTION_TOKEN as BOOT_TOKEN
 
 
 def test_boot_wires_a_serving_app_and_seeds_the_store(
@@ -22,8 +21,7 @@ def test_boot_wires_a_serving_app_and_seeds_the_store(
     monkeypatch.setenv("PREE_ENV", "development")
     monkeypatch.setenv("PREE_DATA_DIR", str(data_dir))
     monkeypatch.setenv("PREE_BUILD_ID", "boot-test")
-    monkeypatch.delenv("PREE_TEAM_TOKEN", raising=False)
-    monkeypatch.setenv("PREE_TEAM_TOKEN", BOOT_TOKEN)
+    monkeypatch.setenv("PREE_TEAM_TOKEN", PRODUCTION_TOKEN)
     app = build()
     boot_line = capsys.readouterr().out
     # EXACTLY, and the whole line. Three substring checks with no negative assertion left the
@@ -33,9 +31,9 @@ def test_boot_wires_a_serving_app_and_seeds_the_store(
     # assert it loosely.
     assert boot_line.splitlines()[0] == (
         f"pree boot: build=boot-test env=development port=8080 data_dir={data_dir} "
-        f"data_dir_configured=True auth=on token_len={len(BOOT_TOKEN)} storage=accepted"
+        f"data_dir_configured=True auth=on token_len={len(PRODUCTION_TOKEN)} storage=accepted"
     ), boot_line
-    assert BOOT_TOKEN not in boot_line, "the boot line printed the team token"
+    assert PRODUCTION_TOKEN not in boot_line, "the boot line printed the team token"
     assert (data_dir / "assessments.json").is_file()
     with TestClient(app) as client:
         assert client.get("/healthz").status_code == 200

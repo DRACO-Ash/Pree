@@ -735,3 +735,22 @@ Thirtieth security review, three blockers, one major and three minors:
   on the wire, but it would hide an unservable probe response from an in-process client.
 ● Two of five fabrication runs reported zero failures because the plant had not landed. Both were
   checked rather than counted, and both were red once applied.
+
+Engineering review of rounds twenty-two to thirty-one, one blocker and two majors, plus a
+deliberate subtraction:
+
+● BLOCKER: `EXPECTED_AUDIT_KEYS` asserted completeness on record KINDS and not on field NAMES, so a
+  surplus name was an exemption rather than a pin. `cors_reject` listed `reason`, which that handler
+  never emits, and the value rule permits 512 printable characters there: base64 of the token on a
+  record any unauthenticated caller triggers, 314 tests green. The field check is two-directional
+  now and turned three dead literals red on its first run.
+● The audit `key` rule was a hand-written charset admitting roughly 113 appended characters, so the
+  token's hex appended to the key passed. It reads `STORE_KEY_PATTERN` from the application now.
+● Two ENV tests were strictly subsumed, proved by mutation: one planted credential failed all three,
+  so the two denylists asserted nothing the allowlist did not. Both deleted, history folded into the
+  allowlist docstring. Also removed: a pass-through alias, a subsumed route walk, two duplicated
+  assertions, a duplicated table parse, the suid sweep written twice, the interpreter version
+  written four times, a self-contradicting comment pair, and a dead `delenv`. Net 143 lines out.
+● The four FastAPI documentation routes were pinned by closure qualnames from inside a dependency;
+  they are asserted structurally now, and every fabrication that beat the previous form is still
+  red. What those paths serve is still pinned exactly.

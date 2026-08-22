@@ -33,6 +33,7 @@ from pree.app import (
     MAX_LOGGED_PATH,
     MAX_VALIDATION_ERRORS_LOGGED,
     STORAGE_PROBE_PATH,
+    STORE_KEY_PATTERN,
     UNMETERED_PATHS,
     _limit_keys,
     create_app,
@@ -86,7 +87,10 @@ def test_the_unauthenticated_path_set_is_the_one_the_tests_below_police() -> Non
 
 
 def _all_routes(app: Any) -> list[Any]:
-    """EVERY entry in the route table, whatever its type.
+    """EVERY entry in the route table, whatever its type. Used by every walk in this file.
+
+    Every walk, deliberately: the rule this carries was honoured by convention at ten call sites
+    and by this helper at six, which meant the helper enforced nothing.
 
     Not `[r for r in app.routes if isinstance(r, APIRoute)]`, which is what this was. That
     filter made the control written to make routes visible blind to every other registration
@@ -1461,7 +1465,7 @@ def test_the_liveness_routes_never_occupy_the_shared_request_threadpool(
     app = create_app(config, store, logger=quiet_logger, prober=prober)
     by_path = {
         getattr(route, "path", ""): route
-        for route in app.routes
+        for route in _all_routes(app)
         if getattr(route, "endpoint", None) is not None
     }
     missing = sorted(p for p in EXPECTED_LIVENESS_PATHS if p not in by_path)
@@ -1645,20 +1649,8 @@ def test_the_middleware_stack_is_exactly_the_pinned_one() -> None:
 # Every one of those needed no gate bypass at all: they sit on paths that answer without a token,
 # where the inventory was the only control.
 _LIVENESS = ("pree.app", "register_health_routes.<locals>.liveness")
-_DOC = "fastapi.applications"
 EXPECTED_SERVED_ROUTES: dict[str, tuple[tuple[Any, ...], ...]] = {
     "development": (
-        ("Route", "/openapi.json", ("GET", "HEAD"), _DOC, "FastAPI.setup.<locals>.openapi", False),
-        ("Route", "/docs", ("GET", "HEAD"), _DOC, "FastAPI.setup.<locals>.swagger_ui_html", False),
-        (
-            "Route",
-            "/docs/oauth2-redirect",
-            ("GET", "HEAD"),
-            _DOC,
-            "FastAPI.setup.<locals>.swagger_ui_redirect",
-            False,
-        ),
-        ("Route", "/redoc", ("GET", "HEAD"), _DOC, "FastAPI.setup.<locals>.redoc_html", False),
         ("APIRoute", "/", ("GET", "HEAD"), *_LIVENESS, False),
         ("APIRoute", "/healthz", ("GET", "HEAD"), *_LIVENESS, False),
         ("APIRoute", "/readyz", ("GET", "HEAD"), *_LIVENESS, False),
@@ -1698,9 +1690,15 @@ EXPECTED_SERVED_ROUTES: dict[str, tuple[tuple[Any, ...], ...]] = {
         ),
     ),
 }
-# Production is the development table without the four documentation routes. Written as a slice so
-# the two cannot drift apart, and the absence of the doc paths is asserted separately below.
-EXPECTED_SERVED_ROUTES["production"] = EXPECTED_SERVED_ROUTES["development"][4:]
+# The four FastAPI documentation routes are NOT in this table, deliberately. They were, by their
+# `FastAPI.setup.<locals>.*` closure qualnames, which pins four strings from inside
+# `fastapi/applications.py` on one FastAPI version: a routine dependency bump would then print two
+# thirteen-row tuples for what may be a one-string change, and read to whoever did not write it as
+# a compromise rather than an upgrade. They are asserted STRUCTURALLY instead, below: exactly
+# `Route`, path in `EXPECTED_DOC_PATHS`, no gate. A forged documentation route must satisfy all
+# three, and what those paths actually serve is pinned by body and header at
+# `test_the_unauthenticated_paths_on_the_listener_disclose_nothing`.
+EXPECTED_SERVED_ROUTES["production"] = EXPECTED_SERVED_ROUTES["development"]
 
 _STARLETTE_ROUTE_APP = "request_response.<locals>.app"
 
@@ -1708,7 +1706,7 @@ _STARLETTE_ROUTE_APP = "request_response.<locals>.app"
 def _served_inventory(app: Any) -> tuple[tuple[Any, ...], ...]:
     """Every route in table ORDER, as the tuples EXPECTED_SERVED_ROUTES pins."""
     rows: list[tuple[Any, ...]] = []
-    for route in app.routes:
+    for route in _all_routes(app):
         endpoint = getattr(route, "endpoint", None)
         rows.append(
             (
@@ -1762,19 +1760,30 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
     """
     for env in ("development", "production"):
         with _listener(env, tmp_path) as app:
-            inventory = _served_inventory(app)
+            # This project's OWN routes, exactly and in order.
+            inventory = tuple(row for row in _served_inventory(app) if row[3] == "pree.app")
             expected = EXPECTED_SERVED_ROUTES[env]
             assert inventory == expected, (
                 f"the {env} listener serves a different route table than the pinned one.\n"
                 f"served:   {inventory}\nexpected: {expected}"
             )
+            # And FastAPI's documentation routes, structurally: exactly `Route`, on a pinned path,
+            # ungated. Nothing else may be in the table at all.
+            foreign = [row for row in _served_inventory(app) if row[3] != "pree.app"]
+            for kind, path, _methods, _module, _qualname, gated in foreign:
+                assert (kind, path in EXPECTED_DOC_PATHS, gated) == ("Route", True, False), (
+                    f"the {env} listener carries a route this suite cannot account for: "
+                    f"{(kind, path, gated)}"
+                )
+            if env == "production":
+                assert not foreign, f"production serves routes outside pree.app: {foreign}"
             # The EXECUTED callable, by identity. FastAPI runs `dependant.call`, and pinning the
             # endpoint's NAME let `route.dependant.call = leak` change what runs while every
             # pinned field stayed correct. A name is a string an attacker can assign; identity is
             # not, and neither is the file the code object came from.
             forged = [
                 f"{route.path}: dependant.call={getattr(route.dependant.call, '__qualname__', '?')}"
-                for route in app.routes
+                for route in _all_routes(app)
                 if type(route) is APIRoute and route.dependant.call is not route.endpoint
             ]
             assert not forged, (
@@ -1785,7 +1794,7 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
             source = inspect.getsourcefile(app_module)
             outside = [
                 f"{route.path}: {route.endpoint.__code__.co_filename}"
-                for route in app.routes
+                for route in _all_routes(app)
                 if type(route) is APIRoute and route.endpoint.__code__.co_filename != source
             ]
             assert not outside, (
@@ -1793,7 +1802,7 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
             )
             swapped = [
                 f"{route.path} -> {route.app.__qualname__}"
-                for route in app.routes
+                for route in _all_routes(app)
                 if type(route) is APIRoute and route.app.__qualname__ != _STARLETTE_ROUTE_APP
             ]
             assert not swapped, (
@@ -1802,7 +1811,7 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
                 f"{swapped}"
             )
             if env == "production":
-                served = {str(getattr(route, "path", "")) for route in app.routes}
+                served = {str(getattr(route, "path", "")) for route in _all_routes(app)}
                 overlap = served & EXPECTED_DOC_PATHS
                 assert not overlap, (
                     f"the production LISTENER serves a documentation path: {sorted(overlap)}. The "
@@ -1823,7 +1832,7 @@ def test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set
         with _listener(env, tmp_path) as app:
             answered: list[str] = []
             with TestClient(app) as probe:
-                for route in app.routes:
+                for route in _all_routes(app):
                     path = getattr(route, "path", None)
                     if path is None or path in UNAUTHENTICATED_PATHS:
                         continue
@@ -1884,7 +1893,7 @@ CORS_HEADER_VALUES = {
 }
 
 
-def _header_complaints(
+def _header_findings(
     response: Any, secret: str, where: str, origin: str = "", *, docs: bool = False
 ) -> list[str]:
     """Every complaint about a response's headers: a bad value, or the secret in one."""
@@ -1944,13 +1953,6 @@ def _header_complaints(
     return complaints
 
 
-def _header_findings(
-    response: Any, secret: str, where: str, origin: str = "", *, docs: bool = False
-) -> list[str]:
-    """Retained name for the call sites; the pin is exact now, per value."""
-    return _header_complaints(response, secret, where, origin, docs=docs)
-
-
 def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Path) -> None:
     """The behavioural half for the paths that ANSWER without a token, which had none.
 
@@ -1973,7 +1975,7 @@ def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Pa
         with _listener(env, tmp_path) as app:
             complaints: list[str] = []
             with TestClient(app) as probe:
-                served = {str(getattr(route, "path", "")) for route in app.routes}
+                served = {str(getattr(route, "path", "")) for route in _all_routes(app)}
                 # The PROBE paths, whose bodies are JSON and pinned. The documentation paths are
                 # also unauthenticated, and they serve HTML, so they are checked separately below
                 # for the header channel and for token absence but not for a body shape.
@@ -2140,7 +2142,7 @@ def test_every_request_handling_surface_of_the_built_app_is_pinned(
                 # route's type is checked, because one is enough.
                 subclassed = [
                     f"{type(route).__name__} {getattr(route, 'path', route)!r}"
-                    for route in app.routes
+                    for route in _all_routes(app)
                     if type(route) is not APIRoute
                     # A plain Route is permitted only at a DOCUMENTATION path. This clause used
                     # to accept `type(route) is Route` anywhere, so `app.add_route(...)` on any
@@ -2192,28 +2194,6 @@ def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestCl
     assert checked == 3, f"expected three gated routes, walked {checked}"
 
 
-def test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set(
-    client: TestClient,
-) -> None:
-    """The behavioural half: the gate is asserted by asking, not by reading the wiring.
-
-    A dependency that is present but does not enforce would satisfy the introspection above.
-    Every entry in the table is asked, whatever its type, because asking needs no knowledge of
-    how the route was registered.
-    """
-    answered: list[str] = []
-    for route in _all_routes(client.app):
-        path = getattr(route, "path", None)
-        if path is None or path in UNAUTHENTICATED_PATHS:
-            continue
-        target = path.replace("{key}", "probe:key")
-        for method in sorted((getattr(route, "methods", None) or set()) - {"HEAD", "OPTIONS"}):
-            response = client.request(method, target, json={})
-            if response.status_code != 401:
-                answered.append(f"{method} {target} -> {response.status_code}")
-    assert not answered, f"a gated route answered without a token: {answered}"
-
-
 # The fields each audit record kind may carry. Pinned because nothing pinned them: a record is a
 # disclosure channel with no body and no header, and `token=config.team_token` added to the success
 # audit call wrote the shared credential into the pod log store on every write with the suite green.
@@ -2232,11 +2212,17 @@ AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str]] = {
     ),
     "action": frozenset({"assess", "read_assessment"}),
     "actor": re.compile(r"^[A-Za-z0-9 ._:@-]{0,64}$"),
-    "outcome": frozenset(
-        {"ok", "created", "disclosed", "not_found", "not_modified", "error", "refused"}
-    ),
+    # The five outcomes the application actually emits. "created" and "refused" were in this set
+    # and produced by nothing, which is the same standing-exemption defect as the `reason` field
+    # below, one value wide instead of one field wide.
+    "outcome": frozenset({"ok", "error", "disclosed", "not_modified", "not_found"}),
     "confidence": frozenset({"low", "medium", "high"}),
-    "key": re.compile(r"^[A-Za-z0-9:._-]{1,129}$"),
+    # The APPLICATION's own pattern, not a hand-written charset. The charset admitted roughly 113
+    # characters of appended hex on a typical key, so 80 hex characters of the token appended to
+    # the audit key passed. STORE_KEY_PATTERN requires exactly one colon with each half at most 64
+    # characters, so an appended encoding overflows it, and importing the constant deletes a
+    # duplicated fact at the same time.
+    "key": re.compile(STORE_KEY_PATTERN),
     "path": re.compile(r"^[!-~]{1,160}$"),
     "reason": re.compile(r"^[ -~]{0,512}$"),
 }
@@ -2250,7 +2236,6 @@ EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
         "duration_ms",
         "outcome",
         "key",
-        "indicator_count",
         # The assessment's own summary, which the operator needs in the trail. Each of these was
         # found by this pin on its first honest run, which is the pin working: the fields are
         # legitimate and were nonetheless unasserted by anything.
@@ -2261,7 +2246,11 @@ EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
     "auth_reject": {"kind", "path", "reason"},
     "validation_reject": {"kind", "path", "error_count", "errors"},
     "http_reject": {"kind", "path", "reason", "status"},
-    "cors_reject": {"kind", "path", "reason", "origin_allowed"},
+    # NO "reason". The CORS handler emits kind, path and origin_allowed only, so a pinned name that
+    # is never produced is not a pin: it is a standing exemption, and `reason` permits 512
+    # printable characters on a record any unauthenticated caller triggers with one refused
+    # preflight. Measured: base64 of the team token in that field, 314 tests green.
+    "cors_reject": {"kind", "path", "origin_allowed"},
     "store_error": {"kind", "path", "reason"},
 }
 
@@ -2439,6 +2428,22 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
         if set(found) - EXPECTED_AUDIT_KEYS[found["kind"]]
     ]
     assert not unexpected, f"an audit record carries a field no test pins: {unexpected}"
+    # BOTH DIRECTIONS, the way the kind check above already is. A surplus field NAME asserts
+    # nothing and quietly permits whatever `AUDIT_STRING_VALUES` allows for it, which is how
+    # `reason` became 512 free characters on the `cors_reject` record. Three literals were dead
+    # when this assertion was written and it turned all three red.
+    produced: dict[str, set[str]] = {}
+    for found in emitted:
+        produced.setdefault(found["kind"], set()).update(found)
+    surplus = {
+        kind: sorted(fields - produced.get(kind, set()))
+        for kind, fields in EXPECTED_AUDIT_KEYS.items()
+        if fields - produced.get(kind, set())
+    }
+    assert not surplus, (
+        f"these field names are pinned and never emitted, so they are exemptions rather than "
+        f"pins: {surplus}"
+    )
     # The VALUES, not only the field names. `EXPECTED_AUDIT_KEYS` pinned names, and the only value
     # control on this channel was a raw substring search, so `key=key + "#" + base64(token)` put
     # the credential in the pod log store on every write and passed. Every string-valued field is

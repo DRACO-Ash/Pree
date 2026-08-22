@@ -53,13 +53,11 @@ _DOCKERFILE_KEYWORDS = frozenset(
 )
 
 
-# What counts as a sentence about the team token, and the retired rules that must not return.
-# "credential" is here because a fabricated sentence naming only "the shared operator
-# credential" stated a 16-character floor and was not checked at all.
-# What counts as a line about the team token. This IS a table, it IS short, and it has now been
-# one entry short twice: "secret" and "passphrase" were added after a fabrication used them, and
-# "key" after "the shared access key as 16 random characters" stated a wrong floor with a full
-# size word in it and passed.
+# What counts as a SENTENCE about the team token, and the retired rules that must not return. The
+# unit is a sentence, not a line: `_claim_units` was rebuilt to split on terminators after line
+# windows lost twice. This table has been one entry short three times, "secret", "passphrase" and
+# "key" each added after a fabrication used it, which is a residual recorded in the token-floor
+# test rather than a claim of completeness.
 _TOKEN_TERMS = (
     "token",
     "pree_team_token",
@@ -485,57 +483,6 @@ def test_the_resolved_runtime_user_is_the_non_root_numeric_one() -> None:
     assert users[-1] == "10001:10001", f"the effective runtime user is {users[-1]!r}"
 
 
-def test_no_stage_bakes_the_port_or_the_data_directory() -> None:
-    """An ENV default beats the code fallback chain and defeats platform injection.
-
-    Checked per resolved instruction and in both syntaxes: `ENV KEY=VALUE` and the legacy
-    `ENV KEY VALUE`, the latter of which slipped past a grep for `ENV PORT=`.
-    """
-    baked: list[str] = []
-    for instruction in _instructions():
-        if instruction.keyword != "ENV":
-            continue
-        for assignment in instruction.argument.split():
-            name = assignment.split("=")[0]
-            if name in _PLATFORM_INJECTED:
-                baked.append(f"{instruction.keyword} {instruction.argument}")
-        first = instruction.argument.split(None, 1)[0] if instruction.argument else ""
-        if "=" not in first and first in _PLATFORM_INJECTED:
-            baked.append(f"{instruction.keyword} {instruction.argument}")
-    assert not baked, f"platform-injected values baked into the image: {baked}"
-
-
-# The variables the PLATFORM injects, which an image-level default silently beats. The set held
-# PORT, PREE_DATA_DIR and STORAGE_MOUNT_PATH, and PREE_ENV was the worse omission: it defaults to
-# production in the loader, so `ENV PREE_ENV=development` in the ship stage passed all 307 tests
-# and would turn the whole posture over. Development permits no token at all, serves the three
-# documentation paths unauthenticated, exempts them from the Content-Security-Policy, and admits a
-# credentialed cleartext origin. That is precisely the failure this guard exists to stop, one
-# variable further along. The token and the origin are here for the same reason: baking either is
-# a credential or a trust decision frozen into a layer.
-_PLATFORM_INJECTED = frozenset(
-    {
-        "PORT",
-        "PREE_DATA_DIR",
-        "STORAGE_MOUNT_PATH",
-        "PREE_ENV",
-        "PREE_TEAM_TOKEN",
-        "PREE_ALLOWED_ORIGIN",
-    }
-)
-
-
-# The ENV and ARG names this Dockerfile is allowed to set. An ALLOWLIST, because the denylist it
-# replaces was one entry short for the seventh time: `ENV PREE_AUTH=<value>` carries a credential,
-# reads like a credential to a human, and matches no term in any list either net held. Widening a
-# term table is a loop this project has now run seven times and lost seven times.
-#
-# Inverted, the burden lands where it belongs: this image needs four environment variables, so a
-# fifth is a decision somebody makes and a reviewer sees in the diff. A credential cannot be baked
-# under ANY name, because no new name is permitted at all.
-# And their VALUES, because a permitted name with an arbitrary value is still a place to freeze a
-# credential into a layer: `ENV PYTHONUNBUFFERED="Ab3-Cd6-Ef9-..."` still unbuffers, still ships,
-# and was allowed by the name allowlist and by both hook rules, all of which match on names. The
 # flag variables take exactly "1". PATH is checked separately against the guarded directories,
 # because its value is a list rather than a constant.
 _ALLOWED_ENV_VALUES = {
@@ -550,10 +497,21 @@ _ALLOWED_ENV_NAMES = frozenset({*_ALLOWED_ENV_VALUES, "PATH"})
 def test_no_stage_sets_an_environment_variable_outside_the_allowlist() -> None:
     """FAIL CLOSED on an unknown name, rather than recognising a growing list of bad ones.
 
-    The credential nets were two name denylists, and `ENV PREE_AUTH=Ab3-Cd6...` in the shipped
-    stage was allowed by both: the pre-write hook exited 0 and the suite exited 0, with a
-    credential frozen into a layer against a hard rule in CLAUDE.md. Adding "auth" to the term
-    tables would be the eighth iteration of the same loop. Naming what is permitted ends it.
+    This replaced two denylists, one of platform-injected names and one of credential terms, and it
+    strictly subsumes both: no name on the allowlist contains a credential term or a
+    platform-injected name, so neither denylist could ever fire first. Proved by mutation, where a
+    single planted credential failed all three tests, so two of them were asserting nothing new.
+
+    The history is why the shape changed. Those term tables were one entry short seven times
+    running: `keys?` as a delimited word missed `keyring`; "key" was missing after "secret" and
+    "passphrase" had been added for the same reason; `passwd` and `pwd` were absent while the
+    pre-write hook had known them from the start; and finally `ENV PREE_AUTH=<value>` matched no
+    term in any list. Adding "auth" would have been the eighth iteration. Naming what is PERMITTED
+    ends the loop: this image needs four flag variables and a PATH, so a fifth name is a decision
+    somebody makes and a reviewer sees, and a credential cannot be baked under any name because no
+    new name is permitted at all. PREE_ENV matters most of the four platform names it replaced,
+    because the loader defaults it to production, so baking `development` would permit no token,
+    serve the documentation paths unauthenticated and admit a cleartext origin.
     """
     unexpected: list[str] = []
     for instruction in _instructions():
@@ -583,48 +541,6 @@ def test_no_stage_sets_an_environment_variable_outside_the_allowlist() -> None:
         f"credential into a layer, so a new name is a deliberate decision: add it to "
         f"_ALLOWED_ENV_NAMES with a reason"
     )
-
-
-def test_no_credential_is_baked_into_an_env_assignment() -> None:
-    """The second net under the pre-write hook, which the unquoted form walked past.
-
-    The hook's generic-credential rule required a QUOTED value, so
-    `ENV PREE_TEAM_TOKEN=Ab3-...` was allowed while the same line quoted was blocked, and no test
-    caught a baked token either: 307 of 307 green with the credential in the shipped stage. A name
-    that reads like a credential may not be assigned a value here at all, whatever its quoting,
-    which is a stricter and simpler rule than judging the value.
-    """
-    baked: list[str] = []
-    for instruction in _instructions():
-        if instruction.keyword not in {"ENV", "ARG"}:
-            continue
-        for name, value in _env_assignments(instruction.argument):
-            if any(term in name.lower() for term in _CREDENTIAL_TERMS) and value:
-                baked.append(f"{instruction.keyword} {name}=[REDACTED:credential]")
-    assert not baked, (
-        f"a credential is assigned a value in the image, which freezes it into a layer and ships "
-        f"it to anyone who can pull: {baked}"
-    )
-
-
-# Name fragments that make an assignment a credential. The same shape the packaging scan uses, and
-# deliberately plain substrings: "keys?" as a delimited word missed `keyring` and `keystore` for
-# three rounds.
-# `passwd` and `pwd` were missing while the pre-write hook's own generic rule had known them from
-# the start, so `ENV DB_PASSWD=...` was allowed by BOTH nets: a baked credential in a shipped
-# layer, and a realistic shape for a UDL integration where the credential is a password. That is
-# the sixth time a term table in this project has been one entry short, which is why the packaging
-# scan's own residual paragraph names this class of gap rather than claiming completeness.
-_CREDENTIAL_TERMS = (
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "pwd",
-    "passphrase",
-    "key",
-    "credential",
-)
 
 
 def _resolved_launch_command() -> str:
@@ -776,6 +692,19 @@ def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
     assert not misplaced, misplaced
 
 
+# The interpreter version, in ONE place. It feeds the vetted pip-removal command, the guarded
+# importable trees and the pip-removal assertion, and it is checked against the base image tag by
+# `test_the_guarded_python_version_is_the_one_the_base_image_ships`. It used to be written out
+# four times, so a base bump needed four coordinated edits for one fact.
+# The suid sweep, in ONE place. It was written out twice, byte-identically, as its own constant
+# and as the last entry of _VETTED_RUNS, so changing the sweep meant editing the same
+# eighty-character command in two places.
+SUID_SWEEP = (
+    "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +"
+)
+_PYTHON_VERSION = "3.12"
+_PYTHON_ZIP_VERSION = _PYTHON_VERSION.replace(".", "")
+
 # The RUN commands that are allowed to mention an executable directory, pinned by exact text
 # the way the sweep is. Anything else naming one of those directories is an offence, so there is
 # no verb list to be one entry short. Changing any of these means changing this literal, which
@@ -784,15 +713,16 @@ _VETTED_RUNS = (
     "python -m venv /opt/venv",
     "pip install --require-hashes --no-deps -r requirements.txt",
     "apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*",
-    "rm -rf /opt/venv/lib/python3.12/site-packages/pip* /opt/venv/bin/pip* "
-    "/usr/local/lib/python3.12/site-packages/pip* "
-    "/usr/local/lib/python3.12/site-packages/setuptools* "
-    "/usr/local/lib/python3.12/ensurepip /usr/local/bin/pip /usr/local/bin/pip3 "
-    "/usr/local/bin/pip3.12 && rm -rf /var/lib/apt /var/cache/apt /etc/apt /usr/bin/apt "
+    f"rm -rf /opt/venv/lib/python{_PYTHON_VERSION}/site-packages/pip* /opt/venv/bin/pip* "
+    f"/usr/local/lib/python{_PYTHON_VERSION}/site-packages/pip* "
+    f"/usr/local/lib/python{_PYTHON_VERSION}/site-packages/setuptools* "
+    f"/usr/local/lib/python{_PYTHON_VERSION}/ensurepip /usr/local/bin/pip /usr/local/bin/pip3 "
+    f"/usr/local/bin/pip{_PYTHON_VERSION} && rm -rf /var/lib/apt /var/cache/apt /etc/apt "
+    "/usr/bin/apt "
     "/usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/sbin/dpkg-* /var/lib/dpkg/info "
     "&& useradd --uid 10001 --user-group --system --no-create-home "
     "--shell /usr/sbin/nologin appuser && chown -R 10001:10001 /app",
-    "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +",
+    SUID_SWEEP,
 )
 # The COPY instructions allowed to write over a guarded tree, pinned by exact text the way the
 # vetted RUNs are. Every COPY in this Dockerfile is listed, which is the point rather than a
@@ -810,47 +740,16 @@ _VETTED_COPIES = (
     "src ./src",
     "requirements.txt ./",
 )
-SUID_SWEEP = (
-    "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +"
-)
-# Paths a mutation could plant a no-op binary on to neuter a command whose text is pinned.
-# `COPY --from=build /bin/true /usr/bin/find` was one line and left 22 of 22 tests green.
+# Every place a shim could be planted over a binary or a module the pinned commands rely on: each
+# directory on the shipped PATH, and each importable tree on a venv interpreter's sys.path.
 #
-# `/opt/venv/bin/` was MISSING, and it is the FIRST entry on the shipped PATH: it holds the
-# gunicorn the pinned CMD execs and the python the HEALTHCHECK runs.
-# `COPY --from=build /bin/true /opt/venv/bin/gunicorn` in the prep stage passed 300 of 300, and
-# the image would then exec whatever that shim is, which makes every assertion about the launch
-# command a statement about a name that no longer resolves to gunicorn. The RUN spelling of the
-# same attack was caught only by accident, because "/opt/venv/bin/gunicorn" happens to contain
-# the substring "/bin/" that the RUN branch tests loosely and the COPY branch does not: two
-# branches of one guard disagreeing about the same file.
-#
-# So the list is now every directory on the shipped PATH plus the site-packages tree, and
-# `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` asserts it against the
-# Dockerfile's own ENV rather than trusting this literal to stay current.
-#
-# And the two IMPORTABLE trees, wholesale, not their site-packages leaves. A venv interpreter's
-# `sys.path` carries the BASE prefix's standard library, which in this image is `/usr/local/lib`,
-# and CPython imports `sitecustomize` from anywhere on `sys.path` at startup. So
-# `COPY requirements.in /usr/local/lib/python3.12/sitecustomize.py` was attacker code running in
-# the gunicorn master, both workers and the health-check python, with 303 of 303 green and no
-# PATH manipulation at all: strictly more powerful than the `/opt/venv/bin/gunicorn` shim, and
-# outside a list that guarded only the two site-packages directories. A write ANYWHERE under an
-# importable tree is the offence.
-#
-# The interpreter version is read from the base image tag rather than written here twice. Moving
-# the base to 3.13 used to leave this literal guarding a directory that no longer exists, and
-# nothing pointed at it, because site-packages is not on the PATH the derivation test reads.
-#
-# And `sys.path` is wider than the lib DIRECTORIES. CPython puts `{base_prefix}/lib/pythonXY.zip`
-# on the path of a venv interpreter AHEAD of the standard library, so
-# `COPY x.zip /usr/local/lib/python312.zip` was startup code execution with the loop green: the
-# zip is neither under `/usr/local/lib/python3.12/` nor an ancestor of it. The shipped launch
-# command also puts `/app/src` on the path with `--pythonpath`, so
-# `COPY evil.py /app/src/pree/security.py` replaced the authentication module unflagged. Both are
-# guarded now, and the one legitimate write into `/app/src` is vetted by exact text.
-_PYTHON_VERSION = "3.12"
-_PYTHON_ZIP_VERSION = _PYTHON_VERSION.replace(".", "")
+# Four defeat classes are recorded rather than described, because each cost a round. A COPY over
+# /usr/bin/find neutered the sweep. `/opt/venv/bin/` was missing while being FIRST on the PATH,
+# holding the gunicorn the CMD execs. `{base_prefix}/lib/pythonXY.zip` sits ahead of the standard
+# library on sys.path, so a COPY over the zip is startup code execution. And `--pythonpath
+# /app/src` puts the source tree on sys.path, so a COPY over the auth module replaces it. The
+# measurements are in docs/SECURITY.md; `test_the_guarded_directories_cover_every_entry_on_the_
+# shipped_path` derives the PATH half from the Dockerfile's own ENV so this list cannot drift.
 _EXECUTABLE_DIRECTORIES = (
     "/bin/",
     "/sbin/",
@@ -1113,23 +1012,10 @@ def _binary_write_offences(instructions: list[_Instruction]) -> list[str]:
         collapsed = " ".join(instruction.argument.split())
         if collapsed in vetted:
             continue
-        # A non-vetted RUN may not build a path from anything this file cannot read. The COPY
-        # branch has refused `$` since round sixteen on exactly this reasoning, and the RUN
-        # branch read literals only, so three forms walked through: `/usr/b?n/find` (a glob that
-        # matches a binary present in the base image), `D=/usr/b; … ${D}in/find`, and
-        # `"$(printf '/usr/%s/find' bin)"`.
-        #
-        # `*` was MISSING from this tuple, and it is the most natural glob of the set:
-        # `RUN cp /usr/b*n/true /usr/b*n/find` passed 292 of 292 tests, resolved to
-        # /usr/bin/find, and left every setuid and setgid bit in the base image shipped. The
-        # same attack as `/usr/b?n/find`, one metacharacter over. Brace expansion is the third
-        # spelling, so `{` and `}` go with it.
-        #
-        # Refusing them costs NOTHING, and the comment that used to sit here said otherwise: it
-        # claimed the vetted RUNs "contain none of these characters except `*`", which is beside
-        # the point. A vetted RUN never reaches this loop; the `continue` above exempts it by
-        # exact text first. The cost of a refused character is only ever borne by a RUN somebody
-        # adds without vetting it.
+        # A non-vetted RUN may not build a path from anything this file cannot read. Every
+        # spelling below reached /usr/bin/find in a round of its own: a `?` glob, a `*` glob, a
+        # shell variable, a command substitution, a character class and a brace expansion. A
+        # vetted RUN never reaches this loop, so refusing these costs nothing.
         for opaque in ("$", "`", "?", "*", "[", "]", "{", "}"):
             assert opaque not in collapsed, (
                 f"a RUN builds a path from a substitution or a glob, so what it writes cannot be "
@@ -1530,45 +1416,31 @@ def _numbers_in(unit: str, size: re.Pattern[str], *, words: bool) -> set[str]:
 
 
 def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
-    """Inverted, after nineteen attempts at matching forms.
+    """INVERTED, after nineteen attempts at matching forms.
 
-    Every previous version asked "does this look like a floor?" and lost, because the answer
-    depends on a complete table of number words, a complete table of size words, a complete
-    table of token synonyms and a complete notion of adjacency, and each round the reviewer
-    found the entry that was missing: "ten" and "thirty" were not in the number table,
-    "octets" was not in the size table, "secret" was not in the token table, and an adjective
-    between the figure and the word broke adjacency.
+    Every earlier version asked "does this look like a floor?" and lost, because the answer needs
+    complete tables of number words, size words and token synonyms plus a notion of adjacency, and
+    each round found the missing entry. The rule is the other way round now: in any unit that
+    mentions the token AND a size, the enforced constant must appear and no other number may. That
+    buys a NUMBER side needing no table, which is where five consecutive defeats came from. The
+    round-by-round history is in docs/SECURITY.md.
 
-    The rule is now the other way round. In any unit that mentions the token AND mentions a
-    size, the enforced constant must appear, and no OTHER number may.
+    FOUR residuals, recorded rather than implied away.
 
-    That is NOT a rule needing no table, and an earlier version of this docstring claimed it
-    was. `size.search` gates the whole check, so the size-word set is still a table and still
-    incomplete: "Generate PREE_TEAM_TOKEN as 16 random units" states a wrong floor with no size
-    word in it and passes. What the inversion actually buys is that the NUMBER side needs no
-    table, which is where five consecutive rounds of defeats came from.
+    1. The pronoun split. A floor across two sentences, one naming the token without a number and
+       one carrying the number without the token, passes. Pairing adjacent sentences catches it and
+       flags unrelated prose, so it is not done.
+    2. The pairing reach. A colon sentence pairs with the next three units, so a wrong floor in the
+       fourth bullet or row after it passes. Measured, and asserted in the splitter's own test.
+    3. The size-word table. `size.search` gates the whole check, so "16 random units" states a
+       floor with no size word in it and passes. An earlier docstring claimed this rule needed no
+       table; it needs this one.
+    4. The token-synonym table. "the shared access key as 16 random characters" passed until "key"
+       was added, after "secret" and "passphrase" had been added for the same reason.
 
-    FOUR residuals remain, all recorded rather than implied away.
-
-    First, the pronoun split: a floor stated across two sentences, where the one naming the token
-    carries no number and the one carrying the number names no token, passes. Pairing adjacent
-    sentences catches it and flags unrelated prose, so it is not done.
-
-    Second, the pairing REACH. A sentence ending in a colon pairs with the next three units, so a
-    wrong floor stated in the fourth bullet or row after it passes. Measured: "● 16, minimum." as
-    the first bullet under a colon sentence is caught and as the fourth is not. The bound is
-    deliberate, because an unbounded reach runs a colon sentence together with the next section
-    and starts flagging true statements, and it is asserted in the splitter's own test.
-
-    And two tables, both of which have been one entry short. The size-word set: "16 random units"
-    states a floor with no size word in it. And the token-synonym set: "the shared access key as
-    16 random characters" has a full size word and passed because "key" was missing, after
-    "secret" and "passphrase" had already been added for the same reason. The consequence of
-    either gap is a misled operator and a fail-closed boot refusal rather than a weak token in
-    production, and both are written down here rather than implied to be solved.
-
-    The other cost is real too: a legitimate sentence pairing the token with any other figure
-    fails, and two in this repository did.
+    The consequence of 3 or 4 is a misled operator and a fail-closed boot refusal, not a weak token
+    in production. The cost of the inversion is real too: a legitimate sentence pairing the token
+    with any other figure fails, and two in this repository did.
     """
     floor = str(importlib.import_module("pree.config").MIN_PRODUCTION_TOKEN_LENGTH)
     size = re.compile(
@@ -1794,6 +1666,32 @@ def _defined_test_names() -> set[str]:
     return names
 
 
+def _control_rows() -> list[tuple[str, str, str]]:
+    """Every control-table row as (control, where, verified-by), parsed once.
+
+    Both control-table tests parsed the separator and split the cells themselves, so a change to
+    the table's shape had to be made in two places.
+    """
+    lines = _controls_section()
+    separator = next(
+        i for i, line in enumerate(lines) if set(line.strip()) <= set("|- ") and "|" in line
+    )
+    rows: list[tuple[str, str, str]] = []
+    malformed: list[str] = []
+    for line in lines[separator + 1 :]:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) != 3:
+            malformed.append(stripped[:80])
+            continue
+        rows.append((cells[0], cells[1], cells[2]))
+    assert not malformed, f"control-table rows that do not have three cells: {malformed}"
+    assert len(rows) > 20, f"only {len(rows)} rows parsed; the parser has drifted"
+    return rows
+
+
 def test_every_control_row_cites_a_test_that_exists() -> None:
     """A control row whose evidence cannot be checked is an unverifiable claim.
 
@@ -1808,30 +1706,17 @@ def test_every_control_row_cites_a_test_that_exists() -> None:
     position rather than by its text, and requires each row to cite at least one real TEST, not
     merely something that exists.
     """
+    # The stray-row guard stays with this test, because a pipe-leading line above the separator
+    # renders as literal text and still reads as a control claim.
     lines = _controls_section()
     separator = next(
         i for i, line in enumerate(lines) if set(line.strip()) <= set("|- ") and "|" in line
     )
-    # Nothing may precede the header row but the heading and blank lines. A pipe-leading line
-    # above the separator renders as literal text, but it still reads as a control claim.
     stray = [line.strip()[:80] for line in lines[: separator - 1] if line.strip().startswith("|")]
     assert not stray, f"lines that look like control rows before the table header: {stray}"
+
     defined = _defined_test_names()
-
-    rows: list[tuple[str, str]] = []
-    malformed: list[str] = []
-    for line in lines[separator + 1 :]:
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            continue
-        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-        if len(cells) != 3:
-            malformed.append(stripped[:80])
-            continue
-        rows.append((cells[0], cells[2]))
-
-    assert not malformed, f"control-table rows that do not have three cells: {malformed}"
-    assert len(rows) > 20, f"only {len(rows)} rows parsed; the parser has drifted"
+    rows = [(control, evidence) for control, _where, evidence in _control_rows()]
 
     uncited: list[str] = []
     unresolvable: list[str] = []
@@ -1859,21 +1744,12 @@ def test_every_control_row_cites_a_test_that_exists() -> None:
 
 
 def test_the_where_column_of_every_control_row_points_at_a_real_file() -> None:
-    lines = _controls_section()
-    separator = next(
-        i for i, line in enumerate(lines) if set(line.strip()) <= set("|- ") and "|" in line
-    )
-    missing: list[str] = []
-    for line in lines[separator + 1 :]:
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            continue
-        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-        if len(cells) != 3:
-            continue
-        for token in re.findall(r"`([^`]+)`", cells[1]):
-            if not (REPO_ROOT / token).exists():
-                missing.append(f"{cells[0]} -> {token}")
+    missing = [
+        f"{control} -> {token}"
+        for control, where, _evidence in _control_rows()
+        for token in re.findall(r"`([^`]+)`", where)
+        if not (REPO_ROOT / token).exists()
+    ]
     assert not missing, f"control rows whose Where column names a missing file: {missing}"
 
 

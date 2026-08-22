@@ -118,7 +118,6 @@ the assessment store.
 | No parser directive survives, so no build frontend can be substituted | `Dockerfile` | `test_no_parser_directive_survives_the_first_line` |
 | A RUN building a path opaquely is refused, glob and brace included | `tests/test_boot_contract.py` | `test_the_write_guard_refuses_a_path_built_opaquely` |
 | Every route outside the probe set carries the token gate | `src/pree/app.py` | `test_every_route_outside_the_probe_set_carries_the_token_gate` |
-| No route answers an unauthenticated caller outside the probe set | `src/pree/app.py` | `test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set` |
 | The team token reaches no response body, header or log record | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_header_or_log_record` |
 | The 405 Allow set is derived from the route table, not a hand-written map | `src/pree/app.py` | `test_every_method_not_allowed_names_the_methods_that_are` |
 | A colon sentence pairs with the bullet, fence or row that follows it | `tests/test_boot_contract.py` | `test_the_claim_unit_splitter_pairs_a_colon_sentence_with_what_follows` |
@@ -143,9 +142,7 @@ the assessment store.
 | The boot line is pinned exactly and carries no token | `src/pree/main.py` | `test_boot_wires_a_serving_app_and_seeds_the_store` |
 | Every permitted ENV name has a pinned value, and PATH is guarded in every stage | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | The storage 503 body discloses the errno and the directory, nothing else | `src/pree/health.py` | `test_the_storage_failure_body_discloses_the_errno_and_nothing_else` |
-| Every ENV and ARG name is on an allowlist, so no credential can be baked under any name | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
-| No credential is baked into an ENV or ARG assignment | `Dockerfile` | `test_no_credential_is_baked_into_an_env_assignment` |
-| No platform-injected variable has an image-level default, PREE_ENV included | `Dockerfile` | `test_no_stage_bakes_the_port_or_the_data_directory` |
+| Every ENV and ARG name is on an allowlist with a pinned value, so no credential and no platform default can be baked | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 
 ## Deliberately accepted risks
 
@@ -1543,6 +1540,54 @@ On the application itself: nine rounds, no finding, thirteen live attacks this r
 judgement, which I share and record here rather than paraphrase, is that further rounds aimed at
 `src/pree/` are buying very little, and that the remaining review budget belongs on the completeness
 of the pins.
+
+### Engineering review of rounds 22 to 31: one blocker, two majors, and a subtraction
+
+I asked the engineering gate the blunt question - has the test layer passed the point where it
+helps - and it answered with measurement rather than opinion. The pin count was not the problem and
+the runtime was not: the two things I suspected of costing time, the packaging zips and the double
+walk, cost 0.60 seconds of a 31-second suite, and the 31 seconds is mostly deliberate waits on a
+timeout, a lock and a cap. What was wrong was one specific thing, and it was this session's own
+defect class written into this session's own fix.
+
+`EXPECTED_AUDIT_KEYS` asserted completeness on its record KINDS and not on its field NAMES, so
+every surplus name in it was a standing exemption rather than a pin. `cors_reject` listed `reason`,
+which that handler never emits, and `AUDIT_STRING_VALUES` permits 512 printable characters in a
+`reason`: base64 of the team token in that field, on a record any unauthenticated caller triggers
+with one refused preflight, and 314 tests green. Two more literals were dead the same way,
+`indicator_count` and the outcomes `created` and `refused`. The field check is two-directional now,
+the way the kind check already was, and it turned all three red on the first run.
+
+The second major was a hand-written charset where the application's own constant existed.
+`AUDIT_STRING_VALUES["key"]` admitted roughly 113 characters of appended hex, so the token's hex
+appended to the audit key passed. It uses `STORE_KEY_PATTERN` now, which requires exactly one colon
+with each half at most 64 characters, so an appended encoding overflows it and a duplicated fact
+disappears.
+
+**And then the subtraction, which is the part worth recording.** Two whole tests were strictly
+subsumed and proved so by mutation: a planted credential failed all three ENV tests, so the
+platform-injected denylist and the credential-term denylist were asserting nothing that the name
+and value allowlist did not already catch. Seven rounds of adding one more term to those tables,
+and the fix that ended it also made them redundant. Both are gone, with the history folded into the
+allowlist's docstring where it explains why the shape changed. Also gone: a pass-through alias whose
+only caller was itself, a factory-level walk the listener version covers in both environments, two
+duplicated assertions, a duplicated table parse, the suid sweep written out twice byte-identically,
+the interpreter version written out four times, a stale comment paragraph contradicting the one
+below it, and a `delenv` immediately followed by the matching `setenv`. Net 143 lines out.
+
+Two fragile pins were also refactored rather than kept. The four FastAPI documentation routes were
+pinned by their `FastAPI.setup.<locals>.*` closure qualnames, which is four strings from inside a
+dependency on one version: a routine bump would print two thirteen-row tuples for what might be a
+one-string change, and read to a stranger as a compromise rather than an upgrade. They are asserted
+structurally now - exactly `Route`, path on the pinned list, ungated - and what those paths serve is
+still pinned exactly by body and header. Every fabrication that beat the previous version is still
+red: a plain Route squatting `/openapi.json`, an ungated route added in the listener, and a Mount.
+
+One process note, because it cost me the same mistake twice in one session. Restoring a file from a
+snapshot taken BEFORE a legitimate edit silently undoes that edit. It happened to a documentation
+fix earlier and to two source edits this round; both times the tree looked clean and the work was
+gone. Diffing against the snapshot is what caught it, which is why that diff is part of the routine
+rather than a flourish.
 
 ## Not accepted, and why it is not a risk here
 
