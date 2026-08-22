@@ -12,14 +12,17 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException, Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from pree.app import (
+    DOC_PATHS,
     LIVENESS_PATHS,
     MAX_BODY_BYTES,
     MAX_LOGGED_PATH,
     MAX_VALIDATION_ERRORS_LOGGED,
     STORAGE_PROBE_PATH,
+    UNMETERED_PATHS,
     _limit_keys,
     create_app,
 )
@@ -34,6 +37,37 @@ from tests.conftest import AUTH, TEST_TOKEN, build_client, make_config
 # contract in CLAUDE.md and in the deployment sheet; a test that reads them from the constant
 # it is checking cannot notice the constant shrinking.
 EXPECTED_LIVENESS_PATHS = frozenset({"/", "/healthz", "/readyz", "/livez", "/ping"})
+# The paths that may answer without a token, by design: the platform's probes, and the
+# development documentation. Everything else on the route table is gated, and the two tests
+# below walk the table rather than listing the routes, because a hand-written list cannot see a
+# route somebody adds. `@app.post("/v1/debug")` returning the team token, unauthenticated,
+# passed 292 of 292 tests and did not trip the coverage floor: one line, and the shared
+# credential goes to any client on the internet with a green gate.
+UNAUTHENTICATED_PATHS = frozenset(UNMETERED_PATHS) | frozenset(DOC_PATHS)
+
+
+def _api_routes(app: Any) -> list[Any]:
+    """The routes this application declares, excluding the framework's own error handlers."""
+    return [route for route in app.routes if isinstance(route, APIRoute)]
+
+
+def _dependency_names(route: APIRoute) -> set[str]:
+    """Every dependency callable in the route's dependant tree, by name.
+
+    The tree, not the top level: a dependency added through a router or a nested Depends is as
+    load-bearing as one written on the decorator, and reading only `route.dependencies` would
+    miss it.
+    """
+    names: set[str] = set()
+    pending = list(route.dependant.dependencies)
+    while pending:
+        dependant = pending.pop()
+        call = getattr(dependant, "call", None)
+        if call is not None:
+            names.add(getattr(call, "__name__", ""))
+        pending.extend(dependant.dependencies)
+    return names
+
 
 # A label that sanitisation visibly changes: newline, braces, quotes and over-length. Using
 # an actor that survives sanitisation unchanged is what let the enforcement point go unpinned.
@@ -925,20 +959,24 @@ def test_every_method_not_allowed_names_the_methods_that_are(client: TestClient)
     and HEAD into two routes made a liveness path advertise `GET` alone while the resource also
     serves HEAD, because Starlette builds Allow from the matched route's own methods.
     """
-    for path in ("/healthz", "/", STORAGE_PROBE_PATH, "/diagnostics", "/v1/assess"):
-        response = client.request("DELETE", path, headers=AUTH)
-        assert response.status_code == 405, f"{path} gave {response.status_code}"
+    # DERIVED from the route table, not hand-written. The previous version mapped five literal
+    # paths to their expected sets, so four registered paths were never checked and a route
+    # added later was invisible to it. The table is the fact; the assertion reads the fact.
+    checked = 0
+    for route in _api_routes(client.app):
+        target = route.path.replace("{key}", "probe:key")
+        expected = route.methods - {"OPTIONS"}
+        refused = next(iter({"DELETE", "PUT", "PATCH"} - expected))
+        response = client.request(refused, target, headers=AUTH)
+        assert response.status_code == 405, f"{refused} {target} gave {response.status_code}"
         allowed = response.headers.get("allow")
-        assert allowed, f"405 on {path} carries no Allow header"
+        assert allowed, f"405 on {target} carries no Allow header"
         advertised = {method.strip() for method in allowed.split(",")}
-        expected = {
-            "/v1/assess": {"POST"},
-            STORAGE_PROBE_PATH: {"GET"},
-            "/diagnostics": {"GET"},
-        }.get(path, {"GET", "HEAD"})
         assert advertised == expected, (
-            f"405 on {path} advertises {sorted(advertised)}; the resource serves {sorted(expected)}"
+            f"405 on {target} advertises {sorted(advertised)}; the route serves {sorted(expected)}"
         )
+        checked += 1
+    assert checked >= 9, f"only {checked} routes were checked; the table has more"
 
 
 def test_the_probe_exemption_is_per_path_and_per_method(tmp_path: Path) -> None:
@@ -1362,3 +1400,83 @@ def test_every_documented_liveness_path_is_exempt_from_rate_limiting(
         assert limited.get("/v1/assessments/a:b", headers=AUTH).status_code == 429
         for path in sorted(EXPECTED_LIVENESS_PATHS):
             assert limited.get(path).status_code == 200, f"{path} was metered"
+
+
+def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestClient) -> None:
+    """Walked from the route table, so a route added later cannot be invisible to it.
+
+    Gating used to be asserted route by route, by hand, and nothing looked at the table. The
+    complement matters as much as the rule: a probe path that GAINS the gate would fail the
+    platform's liveness check and restart the pod, so both directions are asserted here.
+    """
+    for route in _api_routes(client.app):
+        gated = "require_token" in _dependency_names(route)
+        if route.path in UNAUTHENTICATED_PATHS:
+            assert not gated, (
+                f"{route.path} is a probe or documentation path and must answer without a "
+                "token; gating it turns a platform probe into a restart loop"
+            )
+            continue
+        assert gated, (
+            f"{route.path} carries no token gate. Every route outside "
+            f"{sorted(UNAUTHENTICATED_PATHS)} is gated; its dependencies are "
+            f"{sorted(_dependency_names(route))}"
+        )
+
+
+def test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set(
+    client: TestClient,
+) -> None:
+    """The behavioural half: the gate is asserted by asking, not by reading the wiring.
+
+    A dependency that is present but does not enforce would satisfy the introspection above.
+    """
+    answered: list[str] = []
+    for route in _api_routes(client.app):
+        if route.path in UNAUTHENTICATED_PATHS:
+            continue
+        target = route.path.replace("{key}", "probe:key")
+        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+            response = client.request(method, target, json={})
+            if response.status_code != 401:
+                answered.append(f"{method} {target} -> {response.status_code}")
+    assert not answered, f"a gated route answered without a token: {answered}"
+
+
+def test_the_team_token_reaches_no_response_body_and_no_log_record(
+    tmp_path: Path, prober: StorageProber
+) -> None:
+    """The credential is compared, never echoed, and never logged, on any path.
+
+    /diagnostics reports the token's LENGTH and whether it is set, deliberately, so a caller can
+    confirm the deployment without learning the value. This walks every route, in both the
+    authenticated and the rejected case, and greps the whole captured log stream as well as
+    every body: a single interpolation of the value into an audit line or an error detail would
+    put the shared credential in the platform's log aggregator.
+
+    The token as read from `x-pree-token`, and a query string, which is the operator mistake the
+    access-log filter exists to redact. NOT the token planted in a path segment or in the actor
+    header: the audit line records the requested path and the caller-declared actor because that
+    is what makes it an audit line, so a caller who writes their own credential into either has
+    disclosed it themselves and no server-side redaction can un-write it. That boundary is
+    recorded here rather than papered over, because a redaction wide enough to catch it would
+    take the store key out of the audit trail.
+    """
+    stream = io.StringIO()
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    logger = build_logger(stream)
+    with build_client(config, logger, prober) as probe:
+        bodies: list[str] = []
+        for route in _api_routes(probe.app):
+            target = route.path.replace("{key}", "probe:key")
+            for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
+                for headers in (AUTH, {"x-pree-token": "wrong-token-value"}, {}):
+                    bodies.append(probe.request(method, target, headers=headers, json={}).text)
+        # And the shapes that reflect caller input back: a validation failure whose detail
+        # echoes the rejected body, and the token in a query string, which is the documented
+        # operator mistake the access-log filter redacts.
+        bodies.append(probe.post("/v1/assess", headers=AUTH, json={"bad": TEST_TOKEN}).text)
+        bodies.append(probe.get(f"/healthz?token={TEST_TOKEN}").text)
+    leaked = [body for body in bodies if TEST_TOKEN in body]
+    assert not leaked, f"a response body carried the team token: {leaked}"
+    assert TEST_TOKEN not in stream.getvalue(), "the audit log carried the team token"

@@ -1,5 +1,13 @@
-# syntax=docker/dockerfile:1
 # Pree container image for the Bluestaq App Store python template.
+#
+# NO PARSER DIRECTIVE, deliberately, and the boot contract refuses any line that would add one.
+# This file used to open `# syntax=docker/dockerfile:1`. A syntax value is a build FRONTEND
+# image: BuildKit pulls it and hands it this file and the whole build context, so whatever it
+# emits is the image, and every text assertion in tests/test_boot_contract.py becomes a
+# statement about a document nothing executes. The shipped value was also a floating tag, in a
+# file that pins its base images by digest precisely so a base cannot be swapped. Nothing here
+# needs a BuildKit-only feature (no --mount, no heredoc, no COPY --link), so the built-in
+# frontend builds it and there is no frontend image to pull, pin or substitute.
 #
 # Three stages, in this order for a reason:
 #   build : resolves the hash-locked requirements into an isolated venv, so pip never reaches

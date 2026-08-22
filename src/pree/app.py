@@ -539,7 +539,10 @@ def register_health_routes(
 
     for path in LIVENESS_PATHS:
         # The storage proof lives on its own path below, where a hard timeout bounds it.
-        # ONE route carrying both methods, with an explicit operation id.
+        # ONE route carrying both methods, and out of the schema. NO operation id is passed,
+        # and two earlier versions of this comment claimed one was: the claim was left behind
+        # when the fix moved from pinning an id to leaving the schema, and a comment asserting a
+        # control that is not in the code is worse than no comment.
         #
         # FastAPI does not add HEAD for a GET route, so `HEAD /healthz` was a 405: wrong for a
         # liveness path a probe may be configured to HEAD, and the cheapest way into the
@@ -550,7 +553,8 @@ def register_health_routes(
         # warning and broke something quieter: Starlette builds a 405's Allow header from the
         # matched route's own methods, so `DELETE /healthz` advertised `GET` alone while the
         # resource also serves HEAD. RFC 9110 wants the methods the RESOURCE supports. One route
-        # with a pinned id gives a correct Allow and a valid document at once.
+        # kept out of the schema gives a correct Allow and a valid document at once; see the
+        # include_in_schema argument below for why no choice of id does.
         app.add_api_route(
             path,
             liveness,
@@ -925,8 +929,10 @@ def create_app(
         over = _refuse_over_limit(request)
         return over if over is not None else await call_next(request)
 
-    # --- second-outermost: CORS, so it wraps every rejection the layers below emit. The
-    # hardening headers are registered after this and are therefore outermost. ---
+    # --- third-outermost: CORS, so it wraps every rejection the layers below emit. Registered
+    # before the framing guard and the hardening headers, both of which therefore wrap it: with
+    # Starlette middleware, later-registered is further out. This comment said
+    # "second-outermost", and so did the framing guard's; only one layer can be. ---
     # Fail-closed by construction: only the configured origin, and load_config refuses to
     # start on a wildcard origin with a token, so by here the origin is absent or safe.
     register_cors(app, config, audit_log, _meter_preflight)

