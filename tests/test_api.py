@@ -32,6 +32,7 @@ from pree.app import (
 )
 from pree.audit import build_logger
 from pree.health import StorageProber
+from pree.main import build
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
 from pree.security import MAX_ACTOR_LENGTH, sanitise_actor
 from pree.store import JsonStore, StoreError
@@ -1546,6 +1547,28 @@ def _middleware_stack(app: Any) -> tuple[tuple[str, str | None], ...]:
     return tuple(stack)
 
 
+# The exception types with a registered handler. A handler runs INSTEAD of the route, so one that
+# returns a body of its own is a request handler that no route table and no middleware pin can
+# see: a delegating `@app.exception_handler(404)` returned the team token to an unauthenticated
+# caller while every other 404 stayed generic and audited, with the whole loop green.
+#
+# WebSocketRequestValidationError is Starlette's own default, present because FastAPI registers
+# it on every app; HTTPException is the base the StarletteHTTPException handler binds to.
+EXPECTED_EXCEPTION_HANDLERS = frozenset(
+    {
+        "HTTPException",
+        "RequestValidationError",
+        "WebSocketRequestValidationError",
+        "AuthError",
+        "StoreError",
+    }
+)
+
+
+def _handler_names(app: Any) -> frozenset[str]:
+    return frozenset(getattr(key, "__name__", str(key)) for key in app.exception_handlers)
+
+
 def test_the_middleware_stack_is_exactly_the_pinned_one() -> None:
     """A layer nobody declared is a layer nothing asserts, and it answers before the router.
 
@@ -1561,6 +1584,63 @@ def test_the_middleware_stack_is_exactly_the_pinned_one() -> None:
                 "answers before the router and appears in no route table, so an undeclared one "
                 "is an ungated request handler"
             )
+
+
+def test_every_request_handling_surface_of_the_built_app_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FOUR surfaces, and the middleware pin covered one of them.
+
+    `app.user_middleware` is not the only way to handle a request. Each of these was measured
+    with the whole verification loop green, and each served the team token to an unauthenticated
+    caller or granted one full access:
+
+    ● a middleware added in `main.py` AFTER the factory returns, which the factory's own pin
+      cannot see because it asserts on `create_app`'s output and gunicorn launches `build()`;
+    ● a delegating `@app.exception_handler(404)`, which runs instead of the route;
+    ● `FastAPI(dependencies=[...])`, a router-level dependency that stamped the token into a
+      response header on unauthenticated `/healthz`;
+    ● `app.router.route_class`, which forged the token header on every request, so `/diagnostics`
+      and `/v1/assess` both opened while `require_token` stayed visible in every route's
+      dependant tree and the gate walk saw nothing wrong.
+
+    So the assertion is made on what LISTENS, not on what the factory returns.
+    """
+    # The real listener, built through the real environment, with storage pointed at a
+    # throwaway directory so the call cannot write into the repository.
+    monkeypatch.setenv("PREE_ENV", "development")
+    monkeypatch.setenv("PREE_DATA_DIR", str(tmp_path / "listener"))
+    monkeypatch.setenv("PREE_BUILD_ID", "surface-pin")
+    monkeypatch.delenv("PREE_TEAM_TOKEN", raising=False)
+    monkeypatch.delenv("PREE_ALLOWED_ORIGIN", raising=False)
+
+    for env, expected in EXPECTED_MIDDLEWARE.items():
+        with _app_in(env) as factory_app:
+            surfaces = (("create_app", factory_app),) + (
+                (("build", build()),) if env == "development" else ()
+            )
+            for name, app in surfaces:
+                assert _middleware_stack(app) == expected, (
+                    f"{name} in {env} has middleware {_middleware_stack(app)}, not {expected}"
+                )
+                assert _handler_names(app) == EXPECTED_EXCEPTION_HANDLERS, (
+                    f"{name} registers exception handlers "
+                    f"{sorted(_handler_names(app))}, not {sorted(EXPECTED_EXCEPTION_HANDLERS)}. A "
+                    "handler runs instead of the route and appears in no route table"
+                )
+                assert app.router.route_class is APIRoute, (
+                    f"{name} uses route class {app.router.route_class.__name__}; a custom route "
+                    "class rewrites every request before the gate reads it, and leaves the gate "
+                    "visible in the dependant tree while it does"
+                )
+                assert app.router.dependencies == [], (
+                    f"{name} carries router-level dependencies {app.router.dependencies}, which "
+                    "run on every route including the unauthenticated probes"
+                )
+                assert app.dependency_overrides == {}, (
+                    f"{name} carries dependency overrides {app.dependency_overrides}, which can "
+                    "replace the token gate with anything at all"
+                )
 
 
 def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestClient) -> None:

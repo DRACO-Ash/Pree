@@ -126,10 +126,12 @@ the assessment store.
 | The upload archive is flat, with the source and the suite at its root | `scripts/package-appstore.sh` | `test_the_archive_is_flat_and_carries_the_files_the_platform_builds_from` |
 | The route table holds nothing the gate tests cannot read | `src/pree/app.py` | `test_the_route_table_holds_nothing_but_api_routes_and_the_documentation` |
 | The unauthenticated path set is pinned, not derived from the constant it polices | `src/pree/app.py` | `test_the_unauthenticated_path_set_is_the_one_the_tests_below_police` |
-| Every directory on the shipped PATH is guarded, matched by key equality | `Dockerfile` | `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` |
-| The interpreter's importable trees are guarded, not their site-packages leaves | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
+| Every ENV assignment is parsed by key, and the legacy space form is refused | `Dockerfile` | `test_the_guarded_directories_cover_every_entry_on_the_shipped_path` |
+| Every entry on `sys.path` is guarded: the PATH, both lib trees, the stdlib zip and `/app/src` | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
 | The guarded interpreter version is the base image's | `Dockerfile` | `test_the_guarded_python_version_is_the_one_the_base_image_ships` |
-| The middleware stack is exactly the pinned one, per environment | `src/pree/app.py` | `test_the_middleware_stack_is_exactly_the_pinned_one` |
+| A vetted RUN or COPY names an instruction the file actually has | `Dockerfile` | `test_every_vetted_instruction_is_one_the_dockerfile_actually_has` |
+| The middleware stack is the pinned one, per environment | `src/pree/app.py` | `test_the_middleware_stack_is_exactly_the_pinned_one` |
+| Middleware, handlers, route class and router dependencies are pinned on the LISTENER | `src/pree/main.py` | `test_every_request_handling_surface_of_the_built_app_is_pinned` |
 
 ## Deliberately accepted risks
 
@@ -1209,6 +1211,58 @@ the thing under test, and a claim of completeness that covered one mechanism. Th
 that has actually worked is narrow and worth keeping: refuse by construction rather than enumerate,
 pin the expected value as a literal, and invoke the control on synthetic input whose outcome is
 known. Where this round applied all three, the fabrications turned red on the first attempt.
+
+### Twenty-fourth review: one blocker, two majors, one minor
+
+The blocker is the same lesson as the round before it, and I did not learn it far enough. Round 24
+pinned the middleware stack after a middleware layer served the team token past a route walk. The
+pin was asserted on `create_app`'s output, and `app.user_middleware` is one of FOUR surfaces that
+handle a request. Each of these was measured with the whole loop green:
+
+● a middleware added in `main.py` AFTER the factory returns, which the factory's own pin cannot
+  see, and `build()` is what gunicorn launches;
+● a delegating `@app.exception_handler(404)`, which runs instead of the route and returned the
+  token for one path while every other 404 stayed generic and audited;
+● `FastAPI(dependencies=[...])`, a router-level dependency that stamped the token into a response
+  header on an unauthenticated `/healthz`;
+● `app.router.route_class`, which forged the token header on every request, so `/diagnostics` and
+  `/v1/assess` both opened while `require_token` stayed visible in every route's dependant tree
+  and the gate walk saw nothing wrong.
+
+The pin is on the LISTENER now, not on the factory's return value, and it covers the middleware
+stack, the registered exception handler types, the route class, the router-level dependencies and
+the dependency overrides. Four fabrications, four assertions, each measured red.
+
+The legacy-ENV refusal added last round tested `"=" in argument`, which an `=` anywhere in the
+VALUE satisfies. Docker inspects the first word only, so `ENV PATH /opt/tools/exec=1:...` is the
+legacy form to docker and a parseable assignment to this guard, which then read the key as `exec`,
+saw no PATH assignment, and passed with the shipped search path beginning at an unguarded
+directory. The predicate is the first word now, which is what the ENV PORT guard in the same file
+had been doing correctly all along.
+
+And `sys.path` is wider than the two lib directories. CPython puts `{base_prefix}/lib/pythonXY.zip`
+on a venv interpreter's path AHEAD of the standard library, so a COPY over
+`/usr/local/lib/python312.zip` was startup code execution in the master, both workers and the
+health-check interpreter, and the zip is neither under the guarded directory nor an ancestor of it.
+The shipped launch command also puts `/app/src` on the path with `--pythonpath`, so a COPY over
+`/app/src/pree/security.py` replaced the authentication module unflagged. Both spellings of the
+zip, and `/app/src/`, are guarded now. Guarding `/app/src/` made the ancestor rule flag the two
+COPYs that legitimately write into `/app`, so all four of this file's COPYs are vetted by exact
+text: that is the inverted burden working as intended rather than a weakening, and a new test
+asserts every vetted string matches exactly one instruction actually present, so an entry cannot
+become a standing exemption for whatever is added next.
+
+Three control rows in this file overstated what the tests assert and are restated above. That is
+the fifth false claim of mine this session, and the pattern in them is consistent: each described
+the control's intent rather than its coverage, and each was written in the same commit as the
+control. A row that says "exactly" or "every" is a claim about a complement, and a complement is
+the thing these guards keep getting wrong.
+
+The review found nothing in the application, and said so rather than reaching for a fifth finding.
+That is four consecutive rounds with the boundary holding under a full live probe: the method and
+path matrix, prototype pollution, oversized and lying bodies, both framings on one connection,
+traversal in four encodings, the limiter under a rotating forwarding header, the actor label, the
+access log, and the token absent from every body, log line and store file.
 
 ## Not accepted, and why it is not a risk here
 

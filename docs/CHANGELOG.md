@@ -607,3 +607,21 @@ Twenty-third security review, three majors and three minors:
   pinned by exact text.
 ● Two claims in `docs/SECURITY.md` were false, one control row and one sentence of narrative.
   Both restated to what the tests assert.
+
+Twenty-fourth security review, one blocker, two majors and one minor:
+
+● BLOCKER: the middleware pin added the round before asserted on `create_app`'s output, and
+  `app.user_middleware` is one of four request-handling surfaces. A layer added in `main.py` after
+  the factory returns, a delegating `@app.exception_handler(404)`, a router-level dependency and a
+  custom `route_class` each served the team token or granted full access with the whole loop
+  green, and the route-class forgery left `require_token` visible in every dependant tree while it
+  did. The pin is on the listener now and covers all five surfaces.
+● The legacy-ENV refusal tested `"=" in argument`, satisfied by an `=` anywhere in the value, so
+  `ENV PATH /opt/tools/exec=1:...` was the legacy form to docker and a parsed assignment here. The
+  predicate is the first word, which the ENV PORT guard in the same file already used.
+● `sys.path` is wider than the lib directories: a venv interpreter carries
+  `{base_prefix}/lib/pythonXY.zip` ahead of the standard library, and the shipped command puts
+  `/app/src` on the path with `--pythonpath`. A COPY over either was startup code execution or a
+  replaced authentication module. Both are guarded, all four COPYs are vetted by exact text as a
+  consequence, and a new test asserts every vetted entry names an instruction that exists.
+● Three control rows in `docs/SECURITY.md` overstated their coverage and are restated.

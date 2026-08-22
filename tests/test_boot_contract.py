@@ -673,12 +673,20 @@ _VETTED_RUNS = (
     "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +",
 )
 # The COPY instructions allowed to write over a guarded tree, pinned by exact text the way the
-# vetted RUNs are. The first flattens the whole prepared filesystem into the ship stage and the
-# second installs the venv, so both legitimately write into directories a shim could hide in;
-# every other COPY that reaches one is an offence.
+# vetted RUNs are. Every COPY in this Dockerfile is listed, which is the point rather than a
+# weakness: the burden is inverted, so ADDING a COPY that touches a guarded tree means adding it
+# here, which is a decision somebody makes and a reviewer sees in the diff. The flattening COPY
+# and the venv install write into directories a shim could hide in; the other two write a single
+# file and a source tree into /app, which became guarded once `--pythonpath /app/src` was
+# recognised as putting it on `sys.path`.
+#
+# `test_every_vetted_instruction_is_one_the_dockerfile_actually_has` stops an entry here from
+# being a standing exemption for an instruction added later.
 _VETTED_COPIES = (
     "--from=prep / /",
     "--from=build /opt/venv /opt/venv",
+    "src ./src",
+    "requirements.txt ./",
 )
 SUID_SWEEP = (
     "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +"
@@ -711,7 +719,16 @@ SUID_SWEEP = (
 # The interpreter version is read from the base image tag rather than written here twice. Moving
 # the base to 3.13 used to leave this literal guarding a directory that no longer exists, and
 # nothing pointed at it, because site-packages is not on the PATH the derivation test reads.
+#
+# And `sys.path` is wider than the lib DIRECTORIES. CPython puts `{base_prefix}/lib/pythonXY.zip`
+# on the path of a venv interpreter AHEAD of the standard library, so
+# `COPY x.zip /usr/local/lib/python312.zip` was startup code execution with the loop green: the
+# zip is neither under `/usr/local/lib/python3.12/` nor an ancestor of it. The shipped launch
+# command also puts `/app/src` on the path with `--pythonpath`, so
+# `COPY evil.py /app/src/pree/security.py` replaced the authentication module unflagged. Both are
+# guarded now, and the one legitimate write into `/app/src` is vetted by exact text.
 _PYTHON_VERSION = "3.12"
+_PYTHON_ZIP_VERSION = _PYTHON_VERSION.replace(".", "")
 _EXECUTABLE_DIRECTORIES = (
     "/bin/",
     "/sbin/",
@@ -721,7 +738,10 @@ _EXECUTABLE_DIRECTORIES = (
     "/usr/local/sbin/",
     "/opt/venv/bin/",
     f"/usr/local/lib/python{_PYTHON_VERSION}/",
+    f"/usr/local/lib/python{_PYTHON_VERSION}.zip",
+    f"/usr/local/lib/python{_PYTHON_ZIP_VERSION}.zip",
     "/opt/venv/lib/",
+    "/app/src/",
 )
 
 
@@ -740,7 +760,13 @@ def _env_assignments(argument: str) -> list[tuple[str, str]]:
     all, so it is refused rather than parsed: this Dockerfile uses the `=` form throughout and a
     parser that silently returns nothing for the other form reports a pass for an unread line.
     """
-    assert "=" in argument, (
+    # The FIRST WORD, which is what docker inspects. `"=" in argument` was satisfied by an `=`
+    # anywhere in the value, so `ENV PATH /opt/tools/exec=1:/opt/venv/bin:…` passed: docker finds
+    # no `=` in the first word, takes the legacy form, and the shipped PATH begins with an
+    # unguarded directory, while the regex below parsed `exec=1` as the assignment and saw no
+    # PATH at all. The correct predicate was already in this file, at the ENV PORT guard.
+    first = argument.split(None, 1)[0] if argument.split() else ""
+    assert "=" in first, (
         f"an ENV instruction uses the legacy space-separated form, which this parser does not "
         f"read and docker honours: {argument[:80]}"
     )
@@ -799,6 +825,29 @@ def test_the_guarded_directories_cover_every_entry_on_the_shipped_path() -> None
         f"these directories are on the shipped PATH and not guarded, so a shim planted in one "
         f"replaces a binary the pinned commands name: {unguarded}"
     )
+
+
+def test_every_vetted_instruction_is_one_the_dockerfile_actually_has() -> None:
+    """An exemption for an instruction that is not there is an exemption waiting for one.
+
+    Both vetted tuples invert the burden: naming an instruction exempts it, so a reviewer sees
+    the diff. That only holds if an entry cannot be added ahead of the instruction it excuses.
+    Each vetted string must match exactly one instruction in the file today.
+    """
+    for keyword, vetted in (("RUN", _VETTED_RUNS), ("COPY", _VETTED_COPIES)):
+        present = [
+            " ".join(instruction.argument.split())
+            for instruction in _instructions()
+            if instruction.keyword == keyword
+        ]
+        for text in vetted:
+            collapsed = " ".join(text.split())
+            count = present.count(collapsed)
+            assert count == 1, (
+                f"the vetted {keyword} {collapsed[:60]!r} matches {count} instructions in the "
+                f"Dockerfile; a vetted entry with no instruction is a standing exemption for "
+                f"whatever is added next. Present: {present}"
+            )
 
 
 def test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit() -> None:
