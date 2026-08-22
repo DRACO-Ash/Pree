@@ -1,8 +1,10 @@
 """Environment-only configuration with fail-closed validation.
 
-Every value is resolved from the environment at boot. Nothing is hard-coded and nothing is
-baked into the image, because an image-level default always beats a code fallback chain and
-would silently defeat the value the platform injects.
+Every value is resolved from the environment at boot. Nothing is hard-coded and nothing is baked
+into the image. Not because an image default always beats an injected value, which is false: a
+runtime value overrides image ENV. It is because a baked value shadows the fallback below it, and
+for the data directory the resolution order here means a baked PREE_DATA_DIR is preferred over the
+platform's STORAGE_MOUNT_PATH, which would send every write to the ephemeral layer.
 
 Resolution order for the data directory is explicit variable, then platform-injected
 variable, then a local default. A control that cannot be verified is treated as failed.

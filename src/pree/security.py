@@ -57,7 +57,18 @@ def sanitise_actor(value: str | None) -> str:
     """
     if not value:
         return "anonymous"
-    return _scrub(value, empty="anonymous")
+    return _scrub(value, empty="anonymous", limit=MAX_ACTOR_LENGTH)
+
+
+def sanitise_log_path(value: str, limit: int) -> str:
+    """The same scrub for a request path, at the path's own length bound.
+
+    A separate cap because the two differ and the difference matters: the longest LEGITIMATE path
+    this app serves is `/v1/assessments/` plus a 129-character store key, so capping a path at the
+    actor's 64 would truncate a real key out of every rejection record and destroy the diagnosis
+    those records exist to give.
+    """
+    return _scrub(value, empty=UNPRINTABLE_MARKER, limit=limit)
 
 
 def sanitise_log_part(value: str) -> str:
@@ -68,11 +79,11 @@ def sanitise_log_part(value: str) -> str:
     and became indistinguishable from an anonymous caller in the one field that exists for
     diagnosis.
     """
-    return _scrub(value, empty=UNPRINTABLE_MARKER)
+    return _scrub(value, empty=UNPRINTABLE_MARKER, limit=MAX_ACTOR_LENGTH)
 
 
-def _scrub(value: str, *, empty: str) -> str:
+def _scrub(value: str, *, empty: str, limit: int) -> str:
     cleaned = _UNSAFE_LOG_CHARS.sub("", value).strip()
     if not cleaned:
         return empty
-    return cleaned[:MAX_ACTOR_LENGTH]
+    return cleaned[:limit]

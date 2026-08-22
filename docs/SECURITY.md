@@ -1815,14 +1815,25 @@ one unguarded. Refused outright.
 The reviewer found the claim "a reference app FastAPI builds for itself, which is the thing that
 cannot be forged" in the section that exists to correct claims of exactly that shape. Struck.
 
-More substantially, `CLAUDE.md` gave a technically WRONG mechanism for a hard rule. It said an
-image-level `ENV PORT` "beats the code fallback chain and defeats platform injection". The second
-half is false: a runtime-injected value overrides image `ENV` in both Docker and Kubernetes. The
-rule is still right, for two other reasons - an image `ENV` SHADOWS the code's documented default, so
-that default becomes unreachable and untestable, and the image asserts a port the platform may not
-use. The clause is repaired in `CLAUDE.md` and in the Dockerfile comment that repeated it, because a
-rule with a false mechanism does not survive the first engineer who tests it. The rule text itself is
-unchanged.
+More substantially, `CLAUDE.md` gave a technically WRONG mechanism for a hard rule, and my first
+repair substituted a narrower wrong claim, which the next review measured. The rule bars `ENV PORT`
+and `ENV PREE_DATA_DIR` for DIFFERENT reasons:
+
+● For `PORT`, an image default does NOT defeat the injection, because a runtime value overrides
+  image `ENV` in both Docker and Kubernetes. It shadows the code's own default, which is then never
+  reached in the container, and it asserts a port the platform may not use.
+● For `PREE_DATA_DIR` it genuinely DOES defeat the injection, and this is the worse of the two.
+  `load_config` resolves `PREE_DATA_DIR or STORAGE_MOUNT_PATH`, a precedence chain inside the code
+  rather than an environment override, so a baked value wins over the platform's mount and every
+  write lands on the ephemeral layer. Measured: baked `/data` plus injected
+  `STORAGE_MOUNT_PATH=/mnt/platform-volume` resolves to `/data`.
+
+My flat "it does not defeat platform injection" was therefore true of one variable and false of the
+other, in a clause governing both. The split is now written out in `CLAUDE.md`, in the Dockerfile
+comment, in `src/pree/main.py` and in `src/pree/config.py`, which is all four places the claim
+appeared; the first repair reached two of them. The rule text is unchanged throughout. I also wrote
+that the shadowed default is "untestable", which is too strong: it is unit-testable and unreachable
+in the container.
 
 The same reviewer confirmed the baseline finding and added to it: the licensing clause is
 `.claude/skills/release-and-deploy/SKILL.md:45`, "never set `ENV PORT=` to a DIFFERENT value", which
@@ -1849,6 +1860,51 @@ What it wants a human to see, in its order, recorded here because it is the shor
    audit stream is part of the control rather than incidental to it.
 5. **`securityContext.fsGroup=10001` on the deployment.** Without it every write to the FILE_STORAGE
    mount returns EACCES, which is a deployment parameter rather than a code defect.
+
+### Thirty-seventh review: PASS, with five minors closed on the way past
+
+The security gate passed. What it found on the way is worth keeping, because four of the five were
+prose accuracy and the fifth was the only application finding left.
+
+**The audited request path was not scrubbed**, while `loc` beside it was, on the identical
+reasoning. `GET /%1b%5b2J` emitted a control character into the rejection record. The record stays
+one JSON line, so a JSON-lines consumer is safe and the harm is a `jq -r` or terminal reader, which
+is exactly the harm the `loc` comment names. The pin was already correct and never fired, because
+nothing in the exercise sent such a path: the same "a rule that never fires pins nothing" pattern,
+for the fourth time in this project. The path now goes through the scrub with its OWN length bound,
+which matters: `sanitise_log_part` caps at the actor's 64 characters, and the longest legitimate
+path here is 145, so reusing it would have truncated a real store key out of every rejection record
+and destroyed the diagnosis those records exist to give. That is the regression the 160-character
+bound was chosen to avoid in the first place.
+
+A side effect worth recording as a genuine improvement rather than a fix: the scrub removes the byte
+amplification that the truncation used to bound. A control character rendered as six JSON bytes and
+an astral character as a twelve-byte surrogate pair, so 160 characters could cost nearly 2 KB a
+record. Both classes are now stripped rather than counted, and the test asserts the tighter property
+with a legitimate-character path as the case that exercises the truncation.
+
+**The `fullmatch` fix had no canary**, so reverting `_Pattern` entirely left the suite green: the
+existing canaries only caught the anchor-strip half. Every pattern rule now has a trailing-newline
+canary, and the set of canaries is asserted to cover the set of pattern rules, so a new pattern rule
+without one is red. This is the same defect class as that round's own major, which is the argument
+for the assertion rather than for another pattern.
+
+The remaining three were the mechanism split above, and the backslash refusal's message, which said
+docker "strips" a backslash where it UN-ESCAPES one. `a\\b` becomes `a\b`, not `ab`. The refusal is
+right and its stated reason was wrong, which is the same fault as the `ENV PORT` clause on a smaller
+scale.
+
+### Recorded residuals, so they are not rediscovered as surprises
+
+● **`duration_ms` is a covert channel of about 5.7 bits a record**, bounded by 50 milliseconds and
+  not closed. Demonstrated green at 39 milliseconds. Closing it means not reporting a duration,
+  which costs the operator the one field that shows a slow store, so who may read the audit stream
+  is part of this control rather than incidental to it.
+● **A combined attack defeats both route checks**: poison `FastAPI.setup` at import AND compile the
+  endpoint with FastAPI's own filename, and identity and origin both hold. It needs import-time code
+  execution in the process, which is already total compromise, so the hash-locked
+  `requirements.txt` is the real control. Recorded, not claimed defended.
+● **A legitimately doubled backslash in an ENV value is refused.** None exists; the refusal is loud.
 
 ## Not accepted, and why it is not a risk here
 

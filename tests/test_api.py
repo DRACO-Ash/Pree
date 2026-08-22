@@ -442,23 +442,33 @@ def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path
     # json.dumps renders it as a 12-byte surrogate pair. The first version of this test tried
     # only %01 and asserted a 1,024-byte ceiling that the emoji input already exceeded, so the
     # bound held and the assertion about it did not.
-    worst_case = 0
+    # THREE inputs now, because the path is scrubbed as well as truncated and the two bound
+    # different things. The escapes used to be the whole test: %01 rendered as six JSON bytes and
+    # an emoji as a 12-byte surrogate pair, so 160 characters could cost nearly 2 KB a record. The
+    # scrub strips both classes outright, which removes the amplification rather than bounding it,
+    # so a legitimate-character path is now the case that exercises the truncation.
     with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
-        for escaped in ("%01", "%F0%9F%98%80"):
+        for escaped in ("%01", "%F0%9F%98%80", "a"):
             path = "/v1/assessments/" + escaped * 4_000
             assert bounded.get(path, headers={"x-pree-token": "wrong"}).status_code == 401
 
     lines = [line for line in stream.getvalue().splitlines() if "auth_reject" in line]
-    assert len(lines) == 2, f"expected one audit line per rejection, got {len(lines)}"
-    for line in lines:
-        worst_case = max(worst_case, len(line))
-        # 12 bytes per character is the surrogate-escape ceiling, plus the fixed JSON envelope.
-        assert len(line) <= MAX_LOGGED_PATH * 12 + 256, (
-            f"audit line is {len(line)} bytes, above the bound the truncation implies"
+    assert len(lines) == 3, f"expected one audit line per rejection, got {len(lines)}"
+    paths = [json.loads(line)["path"] for line in lines]
+    for line, path in zip(lines, paths, strict=True):
+        assert len(path) <= MAX_LOGGED_PATH, f"the logged path is {len(path)} characters"
+        # One byte per character now, plus the JSON envelope, because every character that cost
+        # more than one has been scrubbed away rather than merely counted.
+        assert len(line) <= MAX_LOGGED_PATH + 256, (
+            f"audit line is {len(line)} bytes, above the bound the scrub and truncation imply"
         )
-        assert len(json.loads(line)["path"]) <= MAX_LOGGED_PATH
-    # And state the measured figure, so a later change that quietly worsens it is visible.
-    assert worst_case > MAX_LOGGED_PATH, "the test never exercised the truncation at all"
+        assert all(character.isprintable() for character in path), (
+            f"a control or astral character survived into the logged path: {path!r}"
+        )
+    # The legitimate-character case must actually reach the cap, or nothing exercised truncation.
+    assert max(len(path) for path in paths) == MAX_LOGGED_PATH, (
+        f"the truncation was never exercised: {[len(path) for path in paths]}"
+    )
 
 
 def test_every_rejection_uses_one_error_contract_and_is_audited(tmp_path: Path) -> None:
@@ -2437,6 +2447,44 @@ EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
 }
 
 
+def _drive_every_error_shape(probe: TestClient, record: Any) -> None:
+    """Every error shape, each built by a different handler.
+
+    A helper because the walk that calls it only ever produces 401s and 422s, and a header set on
+    one of the others would have been invisible to it. Extracted so the caller stays under the
+    statement limit rather than because the list is reusable.
+    """
+    record(probe.post("/v1/assess", headers=AUTH, json={"bad": TEST_TOKEN}), "422 assess")
+    # A HOSTILE field name, so the `loc` rule bites on the input class it exists for. Without it
+    # the rule was only ever handed `body`, `protected_asset_id` and `candidate_id`, so reverting
+    # the application's scrub back to a bare length cap left the suite green.
+    record(
+        probe.post(
+            "/v1/assess",
+            headers=AUTH,
+            json={'x"}\n{"kind":"audit","actor":"root"}\x1b[2J': 1},
+        ),
+        "422 hostile field name",
+    )
+    # A field name that scrubs to EMPTY, which is the one input `sanitise_log_part` exists for.
+    record(probe.post("/v1/assess", headers=AUTH, json={"*": 1}), "422 unprintable field name")
+    record(probe.get(f"/healthz?token={TEST_TOKEN}"), "query string")
+    record(probe.request("DELETE", "/v1/assess", headers=AUTH), "405")
+    record(probe.get("/nowhere-at-all", headers=AUTH), "404")
+    # A control character in the PATH, so the `path` rule bites on its own input class. The rule
+    # was correct and never fired, because nothing in the exercise sent such a path, which is how
+    # the audited path stayed unscrubbed while `loc` beside it was scrubbed.
+    record(probe.get("/v1/%1b%5b2J", headers=AUTH), "404 control character in the path")
+    record(probe.post("/v1/assess", headers=AUTH, content=b"x" * (MAX_BODY_BYTES + 1)), "413")
+    record(
+        probe.options(
+            "/v1/assess",
+            headers={"origin": "https://evil.example", "access-control-request-method": "POST"},
+        ),
+        "cors preflight",
+    )
+
+
 def _exercise_every_surface(
     tmp_path: Path, prober: StorageProber
 ) -> tuple[list[str], list[str], str, int]:
@@ -2508,49 +2556,10 @@ def _exercise_every_surface(
                         f"{method} {target}",
                         docs=target in DOC_PATHS,
                     )
-        # And the shapes that reflect caller input back: a validation failure whose detail
-        # echoes the rejected body, and the token in a query string, which is the documented
-        # operator mistake the access-log filter redacts.
-        record(probe.post("/v1/assess", headers=AUTH, json={"bad": TEST_TOKEN}), "422 assess")
-        # A HOSTILE field name, so the `loc` rule bites on the input class it exists for. Without
-        # it the rule was only ever handed `body`, `protected_asset_id` and `candidate_id`, so
-        # reverting the application's scrub back to a bare length cap left the suite green.
-        record(
-            probe.post(
-                "/v1/assess",
-                headers=AUTH,
-                json={'x"}\n{"kind":"audit","actor":"root"}\x1b[2J': 1},
-            ),
-            "422 hostile field name",
-        )
-        # A field name that scrubs to EMPTY, which is the one input `sanitise_log_part` exists for.
-        # Without it, reverting the application to `sanitise_actor` left the suite green, and the
-        # marker the application emits was a value the `loc` rule itself rejected: the two halves of
-        # that fix disagreed and nothing could say which was wrong.
-        record(probe.post("/v1/assess", headers=AUTH, json={"*": 1}), "422 unprintable field name")
-        record(probe.get(f"/healthz?token={TEST_TOKEN}"), "query string")
-        # EVERY error shape, because the walk above only ever produces 401s and 422s and each of
-        # these is built by a different handler. A header set on one of them would have been
-        # invisible to a walk over the happy and rejected paths alone.
-        record(probe.request("DELETE", "/v1/assess", headers=AUTH), "405")
-        record(probe.get("/nowhere-at-all", headers=AUTH), "404")
-        record(
-            probe.post("/v1/assess", headers=AUTH, content=b"x" * (MAX_BODY_BYTES + 1)),
-            "413",
-        )
-        record(
-            probe.options(
-                "/v1/assess",
-                headers={
-                    "origin": "https://evil.example",
-                    "access-control-request-method": "POST",
-                },
-            ),
-            "cors preflight",
-        )
+        _drive_every_error_shape(probe, record)
         # A SUCCESSFUL privileged call, so a success audit record reaches the stream. The walk
         # above sends `json={}` everywhere, which is a 422, so only REJECTION lines were ever
-        # greped: `token=config.team_token` in the success audit call wrote the shared credential
+        # grepped: `token=config.team_token` in the success audit call wrote the shared credential
         # into the pod log store on every write with the suite green.
         created = probe.post("/v1/assess", headers=AUTH, json=FULL_BODY)
         assert created.status_code == 200, created.text
@@ -2667,6 +2676,17 @@ def _check_audit_value(
 # the canary the dead `_ScrubIdempotent` needed: it was never consulted, and no test noticed,
 # because mypy sees nothing wrong with an unreachable branch and coverage measures `src/` only, so
 # this table is checked by neither gate.
+# A TRAILING NEWLINE per pattern rule, because reverting `_Pattern` to `re.match` with a `$`
+# anchor left the whole suite green: `$` matches before a newline, so every pattern admitted the
+# one character it exists to exclude, and the anchor-strip half of the fix was the only part any
+# canary could see. Same class as the round's own major: a fix whose absence nothing detects.
+AUDIT_PATTERN_NEWLINE_CANARIES: dict[str, str] = {
+    "key": "a:b\n",
+    "path": "/v1/assess\n",
+    "reason": "token rejected\n",
+    "type": "value_error\n",
+}
+
 AUDIT_RULE_CANARIES: dict[str, str] = {
     "kind": "not_a_kind",
     "action": "exfiltrate",
@@ -2714,6 +2734,17 @@ def test_every_audit_value_rule_can_actually_reject_something() -> None:
         assert rule.rejects(bad), (
             f"the rule for {field!r} accepts {bad!r}, so it pins nothing: {rule.description}"
         )
+    # Every PATTERN rule must reject a trailing newline. `re.match` with `$` accepts one.
+    for field, bad in AUDIT_PATTERN_NEWLINE_CANARIES.items():
+        rule = AUDIT_STRING_VALUES[field]
+        assert isinstance(rule, _Pattern), f"{field!r} is no longer a pattern rule: {rule!r}"
+        assert rule.rejects(bad), (
+            f"the rule for {field!r} accepts a trailing newline, so `$` is anchoring rather than "
+            f"`fullmatch`: {rule.description}"
+        )
+    assert set(AUDIT_PATTERN_NEWLINE_CANARIES) == {
+        field for field, rule in AUDIT_STRING_VALUES.items() if isinstance(rule, _Pattern)
+    }, "every pattern rule needs a trailing-newline canary"
     # And the dispatch itself must refuse a rule it cannot evaluate, rather than passing the value.
     complaints: list[str] = []
     _check_audit_value("actor", "anything", "canary.actor", {}, complaints)

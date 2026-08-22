@@ -52,6 +52,7 @@ from .security import (
     authorise,
     sanitise_actor,
     sanitise_log_part,
+    sanitise_log_path,
 )
 from .store import SCHEMA_VERSION, JsonStore, StoreError
 
@@ -388,7 +389,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "auth_reject",
-                    "path": request.url.path[:MAX_LOGGED_PATH],
+                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
                     "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
@@ -413,7 +414,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "validation_reject",
-                    "path": request.url.path[:MAX_LOGGED_PATH],
+                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
                     "errors": [
                         {
                             # SCRUBBED, not merely capped: each part is a caller-supplied field
@@ -473,7 +474,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "http_reject",
-                    "path": request.url.path[:MAX_LOGGED_PATH],
+                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
                     "status": exc.status_code,
                     "reason": str(exc.detail)[:MAX_LOGGED_REASON],
                 },
@@ -498,7 +499,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "store_error",
-                    "path": request.url.path[:MAX_LOGGED_PATH],
+                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
                     "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
@@ -793,7 +794,7 @@ def register_cors(
                 json.dumps(
                     {
                         "kind": "cors_reject",
-                        "path": request.url.path[:MAX_LOGGED_PATH],
+                        "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
                         # The ACTUAL reason. This field said origin_allowed=false for every 400
                         # on a preflight, including one raised for the allowed origin by a
                         # different control, so the only record of the event misstated it.

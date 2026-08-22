@@ -843,3 +843,20 @@ Thirty-sixth security review, one major and five minors, all closed:
   injection, because a runtime value overrides image ENV. The rule stands for two other reasons and
   the clause is repaired here and in the Dockerfile comment that repeated it. An overclaim in
   docs/SECURITY.md is struck.
+
+Thirty-seventh security review: PASS. Five minors closed on the way:
+
+● The audited request path was not scrubbed while `loc` beside it was, so `GET /%1b%5b2J` put a
+  control character in the rejection record. It goes through the scrub with its OWN length bound,
+  because the actor's 64-character cap would have truncated a real store key out of every record.
+  The scrub also removes the byte amplification the truncation used to bound.
+● The `fullmatch` fix had no canary, so reverting `_Pattern` entirely left the suite green. Every
+  pattern rule now has a trailing-newline canary, and the canary set must cover the rule set.
+● The `ENV PORT` mechanism is split per variable, in all four places the claim appeared: a baked
+  PORT shadows the code default and asserts a port the platform may not use; a baked PREE_DATA_DIR
+  genuinely defeats the injection, because load_config prefers it over STORAGE_MOUNT_PATH, so every
+  write would land on the ephemeral layer. My first repair was right for one and wrong for the
+  other, in a clause governing both.
+● The backslash refusal said docker "strips" a backslash where it un-escapes one.
+● Three residuals are recorded rather than implied closed: duration_ms as a 5.7-bit channel, the
+  combined route-check bypass needing import-time execution, and a doubled backslash refused.

@@ -72,10 +72,12 @@ EXPOSE 8080
 # timeout, so the check either confirms the mount or names the errno.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["/opt/venv/bin/python", "-c", "import os,sys,urllib.request;p=os.environ.get('PORT','8080');sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz/storage',timeout=3).status==200 else 1)"]
-# No ENV PORT and no ENV PREE_DATA_DIR anywhere in this file. The platform injects both, and an
-# image-level default would SHADOW the code fallback chain rather than defeat the injection: a
-# runtime value overrides image ENV, but with the ENV present the code's documented default is
-# unreachable and untestable, and the image asserts a port the platform may not use. exec so SIGTERM reaches gunicorn.
+# No ENV PORT and no ENV PREE_DATA_DIR anywhere in this file, for two DIFFERENT reasons. A
+# runtime value overrides image ENV, so a baked PORT does not defeat the injection: it shadows the
+# code's own default, which is then never reached in the container, and it asserts a port the
+# platform may not use. A baked PREE_DATA_DIR is worse, and does defeat the injection, because
+# load_config prefers PREE_DATA_DIR over the injected STORAGE_MOUNT_PATH, so every write would
+# land on the ephemeral layer. exec so SIGTERM reaches gunicorn.
 #
 # --forwarded-allow-ips is pinned to 255.255.255.255, the limited broadcast address, which can
 # never be the source of a TCP connection. gunicorn validates the value as an IP or network, so

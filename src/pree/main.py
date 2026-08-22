@@ -1,7 +1,9 @@
 """The listener. Reads the port from the environment, binds every interface, and starts.
 
-Never set the port in the image. The platform injects PORT and the code defaults to 8080; an
-image-level default would beat the injected value and break the readiness probe.
+Never set the port in the image. The platform injects PORT and the code defaults to 8080. An
+image-level default does NOT beat the injected value, because a runtime value overrides image ENV;
+it shadows the code's own default so that default is never reached in the container, and it asserts
+a port the platform may not use.
 """
 
 from __future__ import annotations
