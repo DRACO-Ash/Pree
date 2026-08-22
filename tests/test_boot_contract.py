@@ -550,7 +550,21 @@ def test_no_credential_is_baked_into_an_env_assignment() -> None:
 # Name fragments that make an assignment a credential. The same shape the packaging scan uses, and
 # deliberately plain substrings: "keys?" as a delimited word missed `keyring` and `keystore` for
 # three rounds.
-_CREDENTIAL_TERMS = ("token", "secret", "password", "passphrase", "key", "credential")
+# `passwd` and `pwd` were missing while the pre-write hook's own generic rule had known them from
+# the start, so `ENV DB_PASSWD=...` was allowed by BOTH nets: a baked credential in a shipped
+# layer, and a realistic shape for a UDL integration where the credential is a password. That is
+# the sixth time a term table in this project has been one entry short, which is why the packaging
+# scan's own residual paragraph names this class of gap rather than claiming completeness.
+_CREDENTIAL_TERMS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "passphrase",
+    "key",
+    "credential",
+)
 
 
 def _resolved_launch_command() -> str:

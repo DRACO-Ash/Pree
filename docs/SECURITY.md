@@ -133,8 +133,10 @@ the assessment store.
 | The middleware stack is the pinned one, per environment | `src/pree/app.py` | `test_the_middleware_stack_is_exactly_the_pinned_one` |
 | Middleware, handler types, route class, router dependencies and overrides are pinned on the LISTENER | `src/pree/main.py` | `test_every_request_handling_surface_of_the_built_app_is_pinned` |
 | Every route's type is APIRoute EXACTLY, so a subclass cannot wrap the handler | `src/pree/app.py` | `test_the_route_table_holds_nothing_but_api_routes_and_the_documentation` |
-| The LISTENER serves exactly the pinned route inventory, gate included | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
+| The LISTENER's route table matches the pinned order, types, endpoints and gate | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
+| The LISTENER executes each route's own endpoint, by identity and by source file | `src/pree/main.py` | `test_the_listener_serves_exactly_the_pinned_route_inventory` |
 | The LISTENER refuses every unauthenticated caller outside the probe set | `src/pree/main.py` | `test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set` |
+| The LISTENER's unauthenticated paths disclose no token and hold their body shape | `src/pree/main.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
 | No credential is baked into an ENV or ARG assignment | `Dockerfile` | `test_no_credential_is_baked_into_an_env_assignment` |
 | No platform-injected variable has an image-level default, PREE_ENV included | `Dockerfile` | `test_no_stage_bakes_the_port_or_the_data_directory` |
 
@@ -1345,6 +1347,47 @@ One structural limit, stated because no static pin can close it: a surface regis
 environment variable the suite never sets is present cannot be seen by any of these controls. The
 behavioural listener probe narrows it, since it asks the app that runs, but it asks under the
 environments the suite constructs.
+
+### Twenty-seventh review: one blocker, two minors
+
+The blocker is the third consecutive round in which the previous round's fix was right about the
+mechanism and loose about the property. Round 26 pinned the listener's route inventory as a
+literal, and the literal recorded LABELS. Four one-region edits in `main.py` each served the team
+token to an unauthenticated caller in production with 310 of 310 green, and each defeated a
+different property of that literal:
+
+● `route.dependant.call = leak` on `/healthz`. FastAPI executes `dependant.call`; the pin read
+  `route.endpoint.__qualname__`. What runs and what was pinned were two different attributes.
+● an endpoint substituted with `__qualname__` and `__module__` assigned to match. A label is a
+  string the attacker sets.
+● `app.add_route("/openapi.json", leak)` in production. The inventory covered APIRoutes only, and
+  the "production serves no documentation path" assertion read a factory-built app, not the
+  listener.
+● a duplicate, tuple-identical `/healthz` route inserted at index 0. The inventory was a frozenset,
+  so the duplicate deduped away, and nothing pinned the count. Starlette matches the first route.
+
+None of the four needed a gate bypass. All four sat on paths that answer without a token, where the
+label-based literal was the only control, and every route walk in the suite skips those paths by
+design. That is the actual lesson: the exemption set had no behavioural half at all. It has one
+now, asking each unauthenticated path on the listener and asserting the token appears nowhere in
+the body and the liveness bodies hold their exact three keys.
+
+The inventory itself is now an ordered tuple over every route, carrying the type name, the path,
+the methods, the endpoint's module and qualified name and the gate; and separately the executed
+callable is checked by IDENTITY (`route.dependant.call is route.endpoint`) and by source file
+(`endpoint.__code__.co_filename`), because identity and provenance are the two things a label
+cannot fake. The production listener is asserted to carry no documentation path.
+
+Two minors on the credential nets, both the same one-entry-short problem this project has now hit
+six times. `passwd` and `pwd` were absent from the boot contract's term list while the pre-write
+hook's own generic rule had known them from the start, so `ENV DB_PASSWD=...` was allowed by both
+nets: a realistic shape for a UDL integration, where the credential is a password. And the hook's
+new rule required the term to END the name, so `ENV TEAM_TOKEN_VALUE=`, `ENV PREE_TOKEN_2=` and
+`ENV PREE_TOKEN_FILE=` walked past it, quoted or not, with a value floor of eight characters that
+`abc123` slipped under. The term may now sit anywhere in the name and the floor is four. Measured
+across every tracked file at the wider setting: no new match, so the widening costs nothing.
+
+The running application was probed again and holds. Six rounds now with no finding in it.
 
 ## Not accepted, and why it is not a risk here
 

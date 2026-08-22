@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 
+from pree import app as app_module
 from pree.app import (
     DOC_PATHS,
     LIVENESS_PATHS,
@@ -1610,59 +1611,103 @@ def test_the_middleware_stack_is_exactly_the_pinned_one() -> None:
             )
 
 
-# The route inventory of the app that LISTENS, as a literal. Path, methods, the endpoint's
-# qualified name, whether the token gate is in its dependant tree, and the ASGI callable the
-# route actually invokes.
+# The ORDERED inventory of every route on the app that LISTENS, per environment. Type name, path,
+# methods, the endpoint's module and qualified name, and whether the token gate is in its dependant
+# tree.
 #
-# A literal, because every derived form of this control has been beaten. The gate was asserted on
-# `create_app`'s output while gunicorn launches `build()`, so ONE line added in main.py after the
-# factory returns served the team token to an unauthenticated caller in production configuration
-# with 307 of 307 green: measured against the real listener with curl. Types were pinned on the
-# listener and gating was not, so pinning types was not enough. And swapping an existing route's
-# `route.app` for a wrapper kept the type, the dependant tree and the route count intact while the
-# callable that ran was the attacker's.
+# A tuple, not a frozenset, and every route rather than the APIRoutes. Four one-region edits in
+# `main.py` after the factory returns each served the team token to an unauthenticated caller in
+# production with 310 of 310 green, and each defeated a different property of the previous version:
 #
-# `request_response.<locals>.app` is Starlette's own wrapper, which is what a route built by
-# FastAPI carries. Pinning it means a dependency bump that changes the wrapper fails loudly here,
-# which is the safe direction: a loud failure gets read, a silent pass does not.
-_STARLETTE_ROUTE_APP = "request_response.<locals>.app"
-EXPECTED_SERVED_ROUTES = frozenset(
-    {
-        ("/", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
-        ("/healthz", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
-        ("/readyz", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
-        ("/livez", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
-        ("/ping", ("GET", "HEAD"), "register_health_routes.<locals>.liveness", False),
+# ● `route.dependant.call = leak` on /healthz. FastAPI executes `dependant.call`, and the pin read
+#   `route.endpoint.__qualname__`, so what runs and what is pinned were two different attributes.
+# ● an endpoint substituted with `__qualname__` and `__module__` assigned to match. A label is a
+#   string an attacker can set; identity is not.
+# ● `app.add_route("/openapi.json", leak)` in production, where no documentation path may exist.
+#   The inventory covered APIRoutes only, and the "production serves no documentation path"
+#   assertion read a factory-built app rather than the listener.
+# ● a duplicate, tuple-identical /healthz APIRoute inserted at index 0. A frozenset deduped it, and
+#   nothing pinned the count. Starlette matches the FIRST route, so the duplicate answered.
+#
+# Every one of those needed no gate bypass at all: they sit on paths that answer without a token,
+# where the inventory was the only control.
+_LIVENESS = ("pree.app", "register_health_routes.<locals>.liveness")
+_DOC = "fastapi.applications"
+EXPECTED_SERVED_ROUTES: dict[str, tuple[tuple[Any, ...], ...]] = {
+    "development": (
+        ("Route", "/openapi.json", ("GET", "HEAD"), _DOC, "FastAPI.setup.<locals>.openapi", False),
+        ("Route", "/docs", ("GET", "HEAD"), _DOC, "FastAPI.setup.<locals>.swagger_ui_html", False),
         (
+            "Route",
+            "/docs/oauth2-redirect",
+            ("GET", "HEAD"),
+            _DOC,
+            "FastAPI.setup.<locals>.swagger_ui_redirect",
+            False,
+        ),
+        ("Route", "/redoc", ("GET", "HEAD"), _DOC, "FastAPI.setup.<locals>.redoc_html", False),
+        ("APIRoute", "/", ("GET", "HEAD"), *_LIVENESS, False),
+        ("APIRoute", "/healthz", ("GET", "HEAD"), *_LIVENESS, False),
+        ("APIRoute", "/readyz", ("GET", "HEAD"), *_LIVENESS, False),
+        ("APIRoute", "/livez", ("GET", "HEAD"), *_LIVENESS, False),
+        ("APIRoute", "/ping", ("GET", "HEAD"), *_LIVENESS, False),
+        (
+            "APIRoute",
             "/healthz/storage",
             ("GET",),
+            "pree.app",
             "register_health_routes.<locals>.storage_health",
             False,
         ),
-        ("/diagnostics", ("GET",), "register_health_routes.<locals>.read_diagnostics", True),
-        ("/v1/assess", ("POST",), "register_api_routes.<locals>.create_assessment", True),
         (
+            "APIRoute",
+            "/diagnostics",
+            ("GET",),
+            "pree.app",
+            "register_health_routes.<locals>.read_diagnostics",
+            True,
+        ),
+        (
+            "APIRoute",
+            "/v1/assess",
+            ("POST",),
+            "pree.app",
+            "register_api_routes.<locals>.create_assessment",
+            True,
+        ),
+        (
+            "APIRoute",
             "/v1/assessments/{key}",
             ("GET",),
+            "pree.app",
             "register_api_routes.<locals>.read_assessment",
             True,
         ),
-    }
-)
+    ),
+}
+# Production is the development table without the four documentation routes. Written as a slice so
+# the two cannot drift apart, and the absence of the doc paths is asserted separately below.
+EXPECTED_SERVED_ROUTES["production"] = EXPECTED_SERVED_ROUTES["development"][4:]
+
+_STARLETTE_ROUTE_APP = "request_response.<locals>.app"
 
 
-def _served_inventory(app: Any) -> frozenset[tuple[str, tuple[str, ...], str, bool]]:
-    """The API route inventory, as the tuples EXPECTED_SERVED_ROUTES pins."""
-    return frozenset(
-        (
-            route.path,
-            tuple(sorted((route.methods or set()) - {"OPTIONS"})),
-            route.endpoint.__qualname__,
-            "require_token" in _dependency_names(route),
+def _served_inventory(app: Any) -> tuple[tuple[Any, ...], ...]:
+    """Every route in table ORDER, as the tuples EXPECTED_SERVED_ROUTES pins."""
+    rows: list[tuple[Any, ...]] = []
+    for route in app.routes:
+        endpoint = getattr(route, "endpoint", None)
+        rows.append(
+            (
+                type(route).__name__,
+                getattr(route, "path", None),
+                tuple(sorted((getattr(route, "methods", None) or set()) - {"OPTIONS"})),
+                getattr(endpoint, "__module__", None),
+                getattr(endpoint, "__qualname__", None),
+                type(route) is APIRoute and "require_token" in _dependency_names(route),
+            )
         )
-        for route in app.routes
-        if type(route) is APIRoute
-    )
+    return tuple(rows)
 
 
 @contextmanager
@@ -1695,24 +1740,44 @@ def _listener(env: str, directory: Path) -> Iterator[Any]:
 def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) -> None:
     """Asserted on `build()`, because `build()` is what gunicorn launches.
 
-    Every gate control read a `create_app` app, and the one test that read `build()` checked types
-    only. So `app.add_api_route("/v1/support", support, methods=["GET"])` in `main.py`, after the
-    factory returns, served the team token to an unauthenticated caller in production
-    configuration with 307 of 307 green, 100% coverage and pip-audit clean, confirmed against the
-    real listener over the wire. Pinning types on the listener while asserting the gate elsewhere
-    left the gate unasserted on the thing that runs.
+    Every gate control used to read a `create_app` app, and the one test that read `build()`
+    checked types only. So `app.add_api_route("/v1/support", support, methods=["GET"])` in
+    `main.py`, after the factory returns, served the team token to an unauthenticated caller in
+    production configuration with 307 of 307 green, confirmed against a real listener over the
+    wire. Pinning types on the listener while asserting the gate elsewhere left the gate
+    unasserted on the thing that runs.
     """
     for env in ("development", "production"):
         with _listener(env, tmp_path) as app:
             inventory = _served_inventory(app)
-            assert inventory == EXPECTED_SERVED_ROUTES, (
-                f"the {env} listener serves a different route inventory than the pinned one.\n"
-                f"unexpected: {sorted(inventory - EXPECTED_SERVED_ROUTES)}\n"
-                f"missing:    {sorted(EXPECTED_SERVED_ROUTES - inventory)}"
+            expected = EXPECTED_SERVED_ROUTES[env]
+            assert inventory == expected, (
+                f"the {env} listener serves a different route table than the pinned one.\n"
+                f"served:   {inventory}\nexpected: {expected}"
             )
-            # And the callable each route INVOKES, which the tuple above cannot see. Replacing
-            # `route.app` with a wrapper left the path, the methods, the endpoint, the gate and
-            # the count all correct while the wrapper answered the request.
+            # The EXECUTED callable, by identity. FastAPI runs `dependant.call`, and pinning the
+            # endpoint's NAME let `route.dependant.call = leak` change what runs while every
+            # pinned field stayed correct. A name is a string an attacker can assign; identity is
+            # not, and neither is the file the code object came from.
+            forged = [
+                f"{route.path}: dependant.call={getattr(route.dependant.call, '__qualname__', '?')}"
+                for route in app.routes
+                if type(route) is APIRoute and route.dependant.call is not route.endpoint
+            ]
+            assert not forged, (
+                f"the {env} listener executes a callable that is not the route's own endpoint, so "
+                f"the pinned inventory names something that does not run: {forged}"
+            )
+            # And the endpoint's code must come from the reviewed module, not merely claim to.
+            source = inspect.getsourcefile(app_module)
+            outside = [
+                f"{route.path}: {route.endpoint.__code__.co_filename}"
+                for route in app.routes
+                if type(route) is APIRoute and route.endpoint.__code__.co_filename != source
+            ]
+            assert not outside, (
+                f"the {env} listener serves an endpoint defined outside {source}: {outside}"
+            )
             swapped = [
                 f"{route.path} -> {route.app.__qualname__}"
                 for route in app.routes
@@ -1723,6 +1788,14 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
                 f"wrapper, so the handler that runs is not the endpoint the inventory names: "
                 f"{swapped}"
             )
+            if env == "production":
+                served = {str(getattr(route, "path", "")) for route in app.routes}
+                overlap = served & EXPECTED_DOC_PATHS
+                assert not overlap, (
+                    f"the production LISTENER serves a documentation path: {sorted(overlap)}. The "
+                    "factory-level assertion does not reach main.py, so a plain Route squatting "
+                    "/openapi.json passed it"
+                )
 
 
 def test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set(
@@ -1747,7 +1820,36 @@ def test_the_listener_refuses_every_unauthenticated_caller_outside_the_probe_set
                         code = probe.request(method, target, json={}).status_code
                         if code != 401:
                             answered.append(f"{env}: {method} {target} -> {code}")
-            assert not answered, f"the listener answered without a token: {answered}"
+            assert not answered, (
+                f"a gated route on the listener answered without a token: {answered}"
+            )
+
+
+def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Path) -> None:
+    """The behavioural half for the paths that ANSWER without a token, which had none.
+
+    Every route walk skips these paths, so the pinned inventory was the only control on them, and
+    all four of the fabrications that beat it sat here: they needed no gate bypass because these
+    paths are meant to answer. Asking is what a label cannot fake. The liveness body is pinned to
+    its exact key set, because a handler that adds a field is a handler that can add a credential.
+    """
+    for env in ("development", "production"):
+        with _listener(env, tmp_path) as app, TestClient(app) as probe:
+            for path in sorted(UNAUTHENTICATED_PATHS):
+                if path not in {str(getattr(r, "path", "")) for r in app.routes}:
+                    continue
+                response = probe.get(path)
+                assert response.status_code in {200, 503}, (
+                    f"{env}: GET {path} gave {response.status_code}"
+                )
+                assert PRODUCTION_TOKEN not in response.text, (
+                    f"{env}: the unauthenticated body of {path} carries the team token"
+                )
+                if path in EXPECTED_LIVENESS_PATHS:
+                    assert set(response.json()) == {"status", "service", "version"}, (
+                        f"{env}: the liveness body of {path} is "
+                        f"{sorted(response.json())}, not the pinned three keys"
+                    )
 
 
 def test_every_request_handling_surface_of_the_built_app_is_pinned(

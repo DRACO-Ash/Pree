@@ -656,3 +656,21 @@ Twenty-sixth security review, one blocker, one major and two minors:
   assignment form walked past the net CLAUDE.md says stops a credential before it lands. Two nets
   now, and the first attempt at the rule was reverted for firing on five legitimate files including
   this changelog.
+
+Twenty-seventh security review, one blocker and two minors:
+
+● BLOCKER: the listener inventory pinned by round 26 recorded LABELS, and four one-region edits in
+  `main.py` each served the team token to an unauthenticated caller in production with 310 of 310
+  green: a `dependant.call` swap, since FastAPI runs that and the pin read `endpoint.__qualname__`;
+  an endpoint with `__qualname__` and `__module__` assigned to match; a plain Route squatting
+  `/openapi.json`, which the APIRoute-only inventory missed and the factory-level doc assertion did
+  not reach; and a duplicate tuple-identical route inserted first, which the frozenset deduped.
+  None needed a gate bypass: all four sat on paths that answer without a token, where every route
+  walk skips by design and the literal was the only control. The inventory is an ordered tuple over
+  every route now, the executed callable is checked by identity and by source file, and the
+  unauthenticated paths have a behavioural half for the first time.
+● `passwd` and `pwd` were missing from the boot contract's credential terms while the pre-write
+  hook had known them from the start, so `ENV DB_PASSWD=...` was allowed by both nets.
+● The hook's credential rule required the term to end the name, so `ENV TEAM_TOKEN_VALUE=` and
+  `ENV PREE_TOKEN_2=` walked past, and its eight-character value floor let `abc123` through. The
+  term may sit anywhere now and the floor is four, measured to cost no false positive.

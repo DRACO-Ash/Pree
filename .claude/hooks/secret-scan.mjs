@@ -45,7 +45,13 @@ const RULES = [
   // "Token: anything", and the keyword argument `token=require_token,`. A net that flags a
   // repository's own documentation gets switched off rather than obeyed, so the name must END in
   // a credential term after a separator, which keeps MONKEY out of it.
-  ['Baked credential assignment', /^\s*(?:ENV|ARG|export)\s+(?:[A-Za-z0-9]+_)*(?:TOKEN|SECRET|PASSWORD|PASSPHRASE|KEY|CREDENTIAL)\s*=\s*\S{8,}/im],
+  // The term may sit ANYWHERE in the name, not only at the end: `ENV TEAM_TOKEN_VALUE=`,
+  // `ENV PREE_TOKEN_2=` and `ENV PREE_TOKEN_FILE=` all walked past a name-must-end-in-term rule.
+  // `PASSWD` and `PWD` are here because the generic rule above has known them all along and this
+  // one did not, so `ENV DB_PASSWD=...` was allowed by both: a real shape for a UDL integration,
+  // where the credential is a password. The value floor is 4, not 8, because `abc123` is a
+  // credential too. Measured across every tracked file at this width: no new match.
+  ['Baked credential assignment', /^\s*(?:ENV|ARG|export)\s+(?:[A-Za-z0-9]+_)*(?:TOKEN|SECRET|PASSWORD|PASSWD|PWD|PASSPHRASE|KEY|CREDENTIAL)(?:_[A-Za-z0-9]+)*\s*=\s*\S{4,}/im],
   // Banned anti-pattern: any platform-injected variable given an image-level default. PREE_ENV is
   // the worst of them, because the loader defaults it to production, so baking `development`
   // turns off the token requirement, serves the docs unauthenticated and admits a cleartext
