@@ -860,3 +860,23 @@ Thirty-seventh security review: PASS. Five minors closed on the way:
 ● The backslash refusal said docker "strips" a backslash where it un-escapes one.
 ● Three residuals are recorded rather than implied closed: duration_ms as a 5.7-bit channel, the
   combined route-check bypass needing import-time execution, and a doubled backslash refused.
+
+Engineering review after the security PASS, three majors and six minors:
+
+● A removal the engineering gate itself had ordered cost a control: the ENV allowlist's subsumption
+  claim lived only in a docstring, so two lines shipped `ENV PREE_ENV=development` with the suite
+  green. The walk stays deleted, the two tables are back as data, and the disjointness is asserted.
+● `origin_allowed` was pinned by name and nothing else, and the value scan returned early on every
+  boolean, so one token bit per refused preflight shipped green. Booleans are pinned by name, and the
+  handler test asserts the field's value in both directions.
+● The path scrub used the actor charset, which deletes `/` and `%`, so `/v1/assess` became
+  `v1assess` and two requests produced an identical record. There is a path charset, the pin matches
+  what the application can emit, and the separator is asserted present.
+● The suid sweep now also has a PROPERTY test, which the engineering gate named as stronger than
+  duplication: no narrowing predicate, and the /6000 mask that is both bits. The three-edit attack
+  that defeats both literal copies turns it red.
+● Minors: a stale byte-cost comment in app.py that cited a test now asserting the opposite; an
+  orphaned comment fragment; one incident narrated four times and one channel three times, cut to
+  the telling nearest each assertion; sixteen stale test-count literals replaced with "the whole
+  suite green", which the changelog already said was the rule; and the `record` seam typed with a
+  Protocol so a caller that drops `docs=` is a type error.

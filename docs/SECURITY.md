@@ -143,6 +143,10 @@ the assessment store.
 | Every permitted ENV name has a pinned value, and PATH is guarded in every stage | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | The storage 503 body discloses the errno and the directory, nothing else | `src/pree/health.py` | `test_the_storage_failure_body_discloses_the_errno_and_nothing_else` |
 | Every ENV and ARG name is on an allowlist with a pinned value, so no credential and no platform default can be baked | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
+| The ENV allowlist cannot admit a platform-injected or credential-shaped name | `Dockerfile` | `test_the_environment_allowlist_cannot_admit_a_platform_or_credential_name` |
+| The suid sweep narrows by nothing and clears both bits, as a property | `Dockerfile` | `test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits` |
+| The audited path keeps its separator and carries no control character | `src/pree/app.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
+| A refused preflight records whether the ORIGIN was allowed, by value | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 
 ## Deliberately accepted risks
 
@@ -1905,6 +1909,54 @@ scale.
   execution in the process, which is already total compromise, so the hash-locked
   `requirements.txt` is the real control. Recorded, not claimed defended.
 ● **A legitimately doubled backslash in an ENV value is refused.** None exists; the refusal is loud.
+
+### Engineering review after the security PASS: three majors, and a reversal worth keeping
+
+The security gate passed and the engineering gate then found three majors in the same tree, all
+security-relevant. That is not a contradiction: they look at different things, and two of these
+three were created by removals the engineering gate itself had ordered.
+
+**The removal that cost a control.** The engineering gate had judged the platform-injected and
+credential-term denylists strictly subsumed by the name-and-value allowlist, and it was right about
+the walk and wrong about the tables. The subsumption claim lived in a docstring, so nothing asserted
+it: adding one line to the value table and one line to the Dockerfile ships
+`ENV PREE_ENV=development` with the whole suite green, and that is the posture flip the deleted test
+named - no token required, documentation paths unauthenticated, a cleartext credentialed origin
+admitted. The walk stays deleted; the tables are back as DATA, and eight lines now assert that the
+allowlist is disjoint from the platform-injected set and contains no credential term. A claim of
+subsumption has to be checkable, or a removal moves a fact from asserted to asserted-by-nobody.
+
+**A one-bit channel nobody was pinning.** `origin_allowed` was in the field list and in nothing
+else, and the value scan returned early on every boolean, so `origin_allowed = bool(token[0] & 1)`
+shipped one bit of the credential per refused preflight - an event any unauthenticated caller
+triggers at will - with the suite green. Booleans are pinned by name now, and the handler-level test
+asserts the field's actual value in both directions, including the case the code comment says the
+field was repaired for and which was untested until now.
+
+**The scrub I added stripped the separator from the thing it was scrubbing.** `_UNSAFE_LOG_CHARS`
+was written for an actor label, and applied to a path it deletes `/` and `%`: `/v1/assess` became
+`v1assess`, so two different requests produced an identical audit record and the field stopped
+identifying its subject, in the records that exist for diagnosis. Neither character can forge a log
+line and both survive `jq -r`, so the loss bought nothing. There is a path charset now, the pin is
+tightened to what the application can actually emit, and the exercise asserts that a logged path
+keeps its separator - because the old pin admitted `/` while the code was deleting it, so the shape
+was unasserted in both directions.
+
+### The reversal, and the rule that came out of it
+
+The engineering gate reversed itself on the suid-sweep duplication and gave the boundary, which is
+worth keeping because it cuts against ordinary instinct: **duplication earns its place when the fact
+is not derivable from the artefact under test, so the test file has no choice but to restate it, AND
+the copies are independent, so a mutation must be made consistently in more than one place.** It does
+not generalise to duplicated logic over the same input: the control-table parse and the factory walk
+read the same file twice and derived the same conclusion, so a second copy added edit cost and
+nothing a reviewer would not see in the diff, and drift between them is its own defect source.
+
+And it named the stronger move, which is now implemented. Two literal copies raise the cost of
+neutering the sweep from one coordinated edit to two, which is real but finite. A PROPERTY is not
+satisfiable by any number of coordinated edits, because there is no literal to bring into line. So
+the sweep is now also asserted to carry no narrowing predicate and to test the `/6000` mask that is
+both bits: the three-edit attack that defeats both literals turns the property red.
 
 ## Not accepted, and why it is not a risk here
 

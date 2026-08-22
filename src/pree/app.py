@@ -106,10 +106,10 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 # between them), which is 145 characters, so 96 truncated a real key out of every 401 and 503
 # record and destroyed the diagnosis it exists to give.
 #
-# The bound is on CHARACTERS and the cost is in BYTES, and the two are not the same: the path
-# arrives percent-decoded, and json.dumps renders one astral code point as a 12-byte surrogate
-# escape. The worst case is therefore about 12x this number, roughly 2 KB per record, which the
-# test asserts against that exact input rather than against an ASCII one.
+# The bound is on CHARACTERS and the cost WAS in bytes: the path arrives percent-decoded, and
+# json.dumps rendered one astral code point as a 12-byte surrogate escape, so 160 characters could
+# cost nearly 2 KB. The scrub below removes that amplification rather than bounding it, since every
+# character costing more than one is now stripped, and the test asserts one byte per character.
 MAX_LOGGED_PATH = 160
 # The store key's shape, enforced at the boundary rather than assumed. Two identifiers of at
 # most 64 characters and the colon between them.

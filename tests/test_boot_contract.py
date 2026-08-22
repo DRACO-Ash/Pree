@@ -203,7 +203,7 @@ def _instructions(text: str | None = None) -> list[_Instruction]:
     # and rstrip strips those plus NBSP and every Unicode space. Either width made a line
     # ending `\` + VT a continuation here and a COMPLETE instruction to docker, so
     # `LABEL org.opencontainers.image.title=pree\<0x0b>` above `USER root` swallowed the USER
-    # into a LABEL argument: 292 tests green, shipped user root, and a 0x0b invisible in an
+    # into a LABEL argument: the whole suite green, shipped user root, and a 0x0b invisible in an
     # editor and in a diff. That is the round-twenty blocker reopened one byte to the side.
     for raw in text.split("\n"):
         line = raw.rstrip("\r\n")
@@ -303,7 +303,7 @@ def test_the_parser_follows_buildkit_continuation_semantics() -> None:
     Every previous defect in this file was a defect in the parser, and four of them were found by
     a reviewer rather than by the suite, because nothing asserted what the parser does. Mutating
     the continuation rule, the joiner, the opaque-path refusal and the abbreviation shielding all
-    left 289 tests green: the guards were load-bearing against the Dockerfile and the parser
+    left the whole suite green: the guards were load-bearing against the Dockerfile and the parser
     underneath them was load-bearing against nothing.
 
     BuildKit's rule is `lineContinuationRegex = ([^\\])\\[ \t]*$|^\\[ \t]*$`, and its joiner
@@ -483,8 +483,37 @@ def test_the_resolved_runtime_user_is_the_non_root_numeric_one() -> None:
     assert users[-1] == "10001:10001", f"the effective runtime user is {users[-1]!r}"
 
 
-# flag variables take exactly "1". PATH is checked separately against the guarded directories,
-# because its value is a list rather than a constant.
+# The VALUES the permitted names may take. A permitted name with an arbitrary value is still a
+# place to freeze a credential into a layer, so the flag variables take exactly "1". PATH is
+# checked separately against the guarded directories, because its value is a list rather than a
+# constant.
+#
+# And the two tables the allowlist REPLACED, kept as data rather than as prose. The docstring below
+# claims the allowlist subsumes them; that claim was prose and nothing asserted it, so adding one
+# line here plus one line to the Dockerfile shipped `PREE_ENV=development` with the whole suite
+# green. A claim of subsumption has to be checkable, or the removal moves a fact from asserted to
+# asserted-by-nobody.
+_PLATFORM_INJECTED = frozenset(
+    {
+        "PORT",
+        "PREE_DATA_DIR",
+        "STORAGE_MOUNT_PATH",
+        "PREE_ENV",
+        "PREE_TEAM_TOKEN",
+        "PREE_ALLOWED_ORIGIN",
+    }
+)
+_CREDENTIAL_TERMS = (
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "passphrase",
+    "key",
+    "credential",
+    "auth",
+)
 _ALLOWED_ENV_VALUES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "PIP_NO_CACHE_DIR": "1",
@@ -492,6 +521,34 @@ _ALLOWED_ENV_VALUES = {
     "PYTHONUNBUFFERED": "1",
 }
 _ALLOWED_ENV_NAMES = frozenset({*_ALLOWED_ENV_VALUES, "PATH"})
+
+
+def test_the_environment_allowlist_cannot_admit_a_platform_or_credential_name() -> None:
+    """The subsumption claim, asserted instead of stated.
+
+    The allowlist replaced two denylists on the argument that it strictly subsumes them, and that
+    argument lived only in a docstring. Adding `"PREE_ENV": "development"` to the value table and
+    `ENV PREE_ENV=development` to the ship stage is a two-line edit that shipped with the whole
+    suite green, and `PREE_ENV=development` is the posture flip the deleted test named: no token
+    required, documentation paths unauthenticated, a cleartext credentialed origin admitted.
+
+    Eight lines make the claim checkable. The removal of the second Dockerfile walk stands; what
+    was wrong was removing the tables that the walk read.
+    """
+    platform = _ALLOWED_ENV_NAMES & _PLATFORM_INJECTED
+    assert not platform, (
+        f"these names are on the allowlist and are injected by the platform, so an image-level "
+        f"value would shadow or defeat the injection: {sorted(platform)}"
+    )
+    credential = sorted(
+        name
+        for name in _ALLOWED_ENV_NAMES
+        if any(term in name.lower() for term in _CREDENTIAL_TERMS)
+    )
+    assert not credential, (
+        f"these names are on the allowlist and read like a credential, so a value could be frozen "
+        f"into a layer under one: {credential}"
+    )
 
 
 def test_no_stage_sets_an_environment_variable_outside_the_allowlist() -> None:
@@ -667,7 +724,7 @@ def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
     """Position within a stage is worthless if the stage is not the one that ships.
 
     Both halves of this were asserted and neither was joined to the other. Moving the sweep
-    from `prep` into `build` left all 238 tests green while the shipped filesystem kept every
+    from `prep` into `build` left the whole suite green while the shipped filesystem kept every
     setuid binary python:3.12-slim carries, among them su, mount, passwd and newgrp; and
     repointing the shipped COPY at `build` shipped the unswept stage with pip in it. Each
     hardening step is now required to be in the stage the shipped layer is copied from.
@@ -950,6 +1007,58 @@ def test_every_vetted_instruction_is_one_the_dockerfile_actually_has() -> None:
             )
 
 
+def test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits() -> None:
+    """A PROPERTY the sweep must have, not a literal it must equal.
+
+    The two exact-text copies raise the cost of neutering the sweep from one coordinated edit to
+    two, which is real but finite: a property is not satisfiable by any number of coordinated
+    edits, because there is no literal to bring into line. This is the control that should
+    eventually replace them.
+
+    What a neutered sweep looks like, from four rounds of trying: a predicate that narrows the set
+    `find` visits (`-uid`, `-user`, `-group`, `-newer`, `-regex`, `-name`, `-path`, `-mtime`) or a
+    permission test that clears one bit and not the other. The `/6000` mask is both the setuid and
+    the setgid bit; `-perm -4000` alone leaves every setgid binary in place.
+    """
+    sweep = next(i for i in _instructions() if "-perm" in i.argument and "chmod" in i.argument)
+    collapsed = " ".join(sweep.argument.split())
+    narrowing = [
+        predicate
+        for predicate in (
+            "-uid",
+            "-user",
+            "-group",
+            "-gid",
+            "-newer",
+            "-regex",
+            "-iregex",
+            "-name",
+            "-iname",
+            "-path",
+            "-ipath",
+            "-mtime",
+            "-mmin",
+            "-size",
+            "-maxdepth",
+            "-not",
+            "!",
+        )
+        if f" {predicate} " in f" {collapsed} "
+    ]
+    assert not narrowing, (
+        f"the suid sweep carries a predicate that narrows the set it visits, so it clears fewer "
+        f"bits than it appears to: {narrowing} in {collapsed[:80]}"
+    )
+    assert " -perm /6000 " in f" {collapsed} ", (
+        f"the sweep must test the /6000 mask, which is the setuid AND setgid bits together; "
+        f"anything else leaves one class in place: {collapsed[:80]}"
+    )
+    assert " -exec /bin/chmod a-s " in f" {collapsed} ", (
+        f"the sweep must clear both bits for all three classes with an absolute chmod: "
+        f"{collapsed[:80]}"
+    )
+
+
 def test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit() -> None:
     """An ALLOWLIST of one. `find`'s predicate grammar is open-ended, so a denylist loses.
 
@@ -1131,7 +1240,7 @@ def test_the_write_guard_refuses_a_path_built_opaquely() -> None:
 
     The test this replaces looped over four fabrications and asserted that each contained one of
     the refused characters: a statement about its own string constants, true whatever the guard
-    does. Deleting the refusal loop outright left all 292 tests green, which is the same defect
+    does. Deleting the refusal loop outright left the whole suite green, which is the same defect
     the fabrications were written to catch, one level up.
     """
     for fabrication in (

@@ -60,6 +60,14 @@ def sanitise_actor(value: str | None) -> str:
     return _scrub(value, empty="anonymous", limit=MAX_ACTOR_LENGTH)
 
 
+# A path's separator is not a log-injection risk and IS its meaning. The actor charset was written
+# for a label and deletes `/` and `%`, so applied to a path it turned `/v1/assess` into `v1assess`
+# and made two different requests produce an identical audit record: the field stopped identifying
+# its subject, in the records that exist for diagnosis. Neither character can forge a log line, and
+# both survive `jq -r` intact, so removing them bought nothing at all.
+_UNSAFE_PATH_CHARS = re.compile(r"[^\w./%@:\- ]")
+
+
 def sanitise_log_path(value: str, limit: int) -> str:
     """The same scrub for a request path, at the path's own length bound.
 
@@ -68,7 +76,7 @@ def sanitise_log_path(value: str, limit: int) -> str:
     actor's 64 would truncate a real key out of every rejection record and destroy the diagnosis
     those records exist to give.
     """
-    return _scrub(value, empty=UNPRINTABLE_MARKER, limit=limit)
+    return _scrub(value, empty=UNPRINTABLE_MARKER, limit=limit, unsafe=_UNSAFE_PATH_CHARS)
 
 
 def sanitise_log_part(value: str) -> str:
@@ -82,8 +90,8 @@ def sanitise_log_part(value: str) -> str:
     return _scrub(value, empty=UNPRINTABLE_MARKER, limit=MAX_ACTOR_LENGTH)
 
 
-def _scrub(value: str, *, empty: str, limit: int) -> str:
-    cleaned = _UNSAFE_LOG_CHARS.sub("", value).strip()
+def _scrub(value: str, *, empty: str, limit: int, unsafe: re.Pattern[str] | None = None) -> str:
+    cleaned = (unsafe or _UNSAFE_LOG_CHARS).sub("", value).strip()
     if not cleaned:
         return empty
     return cleaned[:limit]
