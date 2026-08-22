@@ -54,7 +54,14 @@ _DOCKERFILE_KEYWORDS = frozenset(
 # What counts as a sentence about the team token, and the retired rules that must not return.
 # "credential" is here because a fabricated sentence naming only "the shared operator
 # credential" stated a 16-character floor and was not checked at all.
-_TOKEN_TERMS = ("token", "pree_team_token", "credential")
+_TOKEN_TERMS = (
+    "token",
+    "pree_team_token",
+    "credential",
+    "secret",
+    "passphrase",
+    "password",
+)
 _RETIRED_TOKEN_RULES = (
     "distinct character",
     "character variety",
@@ -76,13 +83,16 @@ _FLOOR_PHRASES = (
     "raised to",
     "must be",
 )
-_WORD_NUMBERS = {
+_NUMBER_WORDS = {
     "eight": 8,
+    "ten": 10,
     "twelve": 12,
     "sixteen": 16,
     "twenty": 20,
     "twenty-four": 24,
+    "thirty": 30,
     "thirty-two": 32,
+    "forty-eight": 48,
     "sixty-four": 64,
 }
 
@@ -159,6 +169,16 @@ def _instructions() -> list[_Instruction]:
         parts = line.split(None, 1)
         keyword = parts[0].upper()
         argument = parts[1] if len(parts) > 1 else ""
+        # SHELL is refused, not merely parsed. It changes HOW every later RUN is executed
+        # without changing a character of the RUN itself, so `SHELL ["/bin/true"]` above the
+        # suid sweep turned the exact-match allowlist below into a statement about a string
+        # docker never runs: the whole suite stayed green while nothing was swept. This
+        # Dockerfile needs no SHELL, the same reasoning already applied to heredocs and to
+        # unknown parser directives.
+        assert keyword != "SHELL", (
+            "SHELL changes how every later RUN is executed while leaving its text untouched, "
+            "which defeats every assertion about a RUN's command; it is refused outright"
+        )
         assert keyword in _DOCKERFILE_KEYWORDS, (
             f"unrecognised Dockerfile keyword {keyword!r} in {line[:60]!r}; an unknown line "
             "may be a heredoc body or a typo, and either way it must not be classified silently"
@@ -267,6 +287,37 @@ def test_the_effective_launch_command_binds_every_interface_and_execs() -> None:
     )
     exposed = [i.argument.strip() for i in final if i.keyword == "EXPOSE"]
     assert exposed == ["8080"], f"the final stage exposes {exposed}, not the platform port"
+
+
+def test_every_base_image_is_pinned_by_digest() -> None:
+    """ "The base digest is pinned" was a comment, asserted nowhere.
+
+    Replacing the digest reference with the bare `python:3.12-slim` tag in both stages left the
+    suite green, and so did swapping the base at build time with `--build-arg BASE_DIGEST=`. A
+    floating tag means the image scanned in CI and the image that ships can differ.
+    """
+    instructions = _instructions()
+    defaults = {
+        name: value
+        for name, _, value in (
+            i.argument.partition("=") for i in instructions if i.keyword == "ARG"
+        )
+    }
+    unpinned: list[str] = []
+    for instruction in instructions:
+        if instruction.keyword != "FROM":
+            continue
+        reference = instruction.argument.split()[0]
+        if reference.lower() == "scratch":
+            continue
+        resolved = re.sub(
+            r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?",
+            lambda match: defaults.get(match.group(1), ""),
+            reference,
+        )
+        if not re.search(r"@sha256:[0-9a-f]{64}$", resolved):
+            unpinned.append(f"{reference} resolves to {resolved!r}")
+    assert not unpinned, f"a base image is not pinned to a digest: {unpinned}"
 
 
 def test_the_suid_sweep_is_the_last_mutating_instruction_of_its_stage() -> None:
@@ -409,6 +460,14 @@ def test_the_shipped_stage_is_exactly_one_copied_layer() -> None:
     runs = [i.argument for i in final if i.keyword == "RUN"]
     assert len(copies) == 1, f"the shipped stage copies {len(copies)} times: {copies}"
     assert copies[0].startswith("--from="), f"the single copy is not from a stage: {copies[0]}"
+    # Every TOKEN of the copy, not just its first. Asserting only that it starts with --from=
+    # left its flags unguarded, and `COPY --from=prep --chmod=0777 --chown=0:0 / /` ships the
+    # whole filesystem world-writable and root-owned with the suite green: --chmod undoes the
+    # suid sweep's whole purpose and --chown undoes the numeric user.
+    tokens = copies[0].split()
+    assert len(tokens) == 3 and tokens[1:] == ["/", "/"], (
+        f"the shipped copy carries flags or paths beyond --from=<stage> / /: {copies[0]!r}"
+    )
     assert not runs, f"the shipped stage runs commands, adding layers: {runs}"
     assert any(i.keyword == "FROM" and i.argument.strip().lower() == "scratch" for i in final), (
         "the shipped stage is not FROM scratch"
@@ -457,7 +516,9 @@ def _claim_units(path: Path) -> list[str]:
     lines = [
         re.sub(r"\s+", " ", raw).strip() for raw in path.read_text(encoding="utf-8").splitlines()
     ]
-    units = [line.strip(" ●■") for line in lines if line]
+    # A leading ordered-list marker is stripped: "8." at the start of a line is the item's
+    # index, not a claim about anything, and the inverted rule below would read it as one.
+    units = [re.sub(r"^\d+\.\s+", "", line.strip(" ●■")) for line in lines if line]
     units += [
         f"{first} {second}"
         for first, second in itertools.pairwise(lines)
@@ -466,42 +527,38 @@ def _claim_units(path: Path) -> list[str]:
     return units
 
 
-def _sizes_claimed_in(unit: str, size: str) -> list[int]:
-    """Every number this unit attaches to a size word, in either order.
-
-    The joiner allows up to two intervening words, because "24 printable characters", "16 or
-    more characters" and "8 (eight) characters" all walked through a punctuation-only joiner.
-    Two words is the limit: three starts matching across clause boundaries, which is how the
-    previous attempt at generality ended up reading a 70-row table as one claim.
-    """
+def _numbers_in(unit: str) -> set[str]:
+    """Every integer and number-word in this unit, as written."""
     lowered = unit.lower()
-    gap = r"(?:[\s:=~,()-]{0,3}(?:[a-z(]{1,12}[)\s]{1,3}){0,2}[\s:=~,()-]{0,3})"
-    number = r"(?:\d[\d,]*\+?|" + "|".join(sorted(_WORD_NUMBERS, key=len, reverse=True)) + r")"
-    found: list[int] = []
-    for pattern in (rf"\b({number}){gap}{size}\b", rf"\b{size}{gap}({number})\b"):
-        for raw in re.findall(pattern, lowered):
-            cleaned = raw.replace(",", "").rstrip("+")
-            value = int(cleaned) if cleaned.isdigit() else _WORD_NUMBERS.get(cleaned)
-            if value is not None:
-                found.append(value)
-    return found
+    digits = set(re.findall(r"\b\d[\d,]*\b", lowered))
+    words = {
+        word for word in re.findall(r"\b[a-z]+(?:-[a-z]+)?\b", lowered) if word in _NUMBER_WORDS
+    }
+    return digits | words
 
 
-def test_no_document_states_a_character_figure_for_the_token_but_the_enforced_one() -> None:
-    """Assert the ABSENCE of a wrong number, not the presence of a right one.
+def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
+    """Inverted, after nineteen attempts at matching forms.
 
-    Two rounds of pattern-matching prose caught eight forms and admitted four more each time:
-    a comparator I had not listed, a "24+" with the plus inside the number, a floor stated in
-    bytes rather than characters, and a floor split across two lines of a table, which the
-    per-line fragmenting introduced while fixing the single-row case. Chasing forms is a losing
-    game, so the rule is inverted: within any line that mentions the token, EVERY figure
-    attached to a size word must be the enforced constant, whatever the surrounding phrasing.
-    That needs no comparator list, no word-number table and no notion of a sentence.
+    Every previous version asked "does this look like a floor?" and lost, because the answer
+    depends on a complete table of number words, a complete table of size words, a complete
+    table of token synonyms and a complete notion of adjacency, and each round the reviewer
+    found the entry that was missing: "ten" and "thirty" were not in the number table,
+    "octets" was not in the size table, "secret" was not in the token table, and an adjective
+    between the figure and the word broke adjacency.
+
+    The rule is now the other way round. In any unit that mentions the token AND mentions a
+    size, the enforced constant must appear, and no OTHER number may. That needs no complete
+    table of anything: a wrong floor is wrong because it is a number that is not 32, whatever
+    words surround it. The cost is that a legitimate sentence pairing the token with any other
+    figure now fails, which is a cost worth paying for a rule that stops needing repairs.
     """
-    floor = importlib.import_module("pree.config").MIN_PRODUCTION_TOKEN_LENGTH
-    checked = 0
-    wrong: list[str] = []
-    retired: list[str] = []
+    floor = str(importlib.import_module("pree.config").MIN_PRODUCTION_TOKEN_LENGTH)
+    size = re.compile(
+        r"char|byte|octet|bit\b|digit|letter|glyph|symbol|code ?point|length|long|floor|"
+        r"minimum|shorter|longer|fewer",
+        re.IGNORECASE,
+    )
     scanned = [
         REPO_ROOT / "docs" / "DEPLOYMENT.md",
         REPO_ROOT / "docs" / "SECURITY.md",
@@ -510,9 +567,9 @@ def test_no_document_states_a_character_figure_for_the_token_but_the_enforced_on
         REPO_ROOT / "CLAUDE.md",
         REPO_ROOT / ".env.example",
     ]
-    # A size word, whatever unit it claims. A floor stated in bytes is still a floor, and
-    # "at least 16 bytes" was admitted by a guard that only understood characters.
-    size = r"(?:char(?:acter)?s?|bytes?|bits?|digits?|long|length|minimum|floor)"
+    checked = 0
+    wrong: list[str] = []
+    retired: list[str] = []
     for path in scanned:
         if not path.is_file():
             continue
@@ -523,38 +580,24 @@ def test_no_document_states_a_character_figure_for_the_token_but_the_enforced_on
             if path.name == "DEPLOYMENT.md" and any(
                 phrase in lowered for phrase in _RETIRED_TOKEN_RULES
             ):
-                retired.append(f"{path.name}: {unit}")
-            # No exemption list. There was one, and it was the hole: 20 is the per-actor rate
-            # limit AND a plausible wrong floor, so exempting it admitted "no fewer than twenty
-            # printable characters". Adjacency to a size word already localises the claim, which
-            # is what an exemption list was standing in for, so the list is gone rather than
-            # trimmed. A number next to "characters" in a line about the token is a claim about
-            # the token's size, and there is no second reading.
-            for value in _sizes_claimed_in(unit, size):
-                checked += 1
-                if value != floor:
-                    wrong.append(f"{path.name}: {unit[:160]} (states {value})")
-
-    # The constant by name, wherever it appears with a value. A fenced block is prose to the
-    # reader and its own line to the scan above, but `MIN_PRODUCTION_TOKEN_LENGTH` has no word
-    # boundary before "LENGTH" (an underscore is a word character), so the size-word patterns
-    # never fire on it.
-    for path in scanned:
-        if not path.is_file():
-            continue
-        body = path.read_text(encoding="utf-8")
-        for value in re.findall(r"MIN_PRODUCTION_TOKEN_LENGTH\s*[=:]\s*(\d+)", body):
+                retired.append(f"{path.name}: {unit[:160]}")
+            if not size.search(unit):
+                continue
+            numbers = _numbers_in(unit)
+            if not numbers:
+                continue
             checked += 1
-            if int(value) != floor:
-                wrong.append(f"{path.name}: MIN_PRODUCTION_TOKEN_LENGTH stated as {value}")
+            others = {n for n in numbers if n != floor and _NUMBER_WORDS.get(n) != int(floor)}
+            if floor not in numbers or others:
+                wrong.append(f"{path.name}: {unit[:160]} (numbers {sorted(numbers)})")
 
     assert checked, (
-        "no document states a size for the team token; the operator has no way to know what "
-        "production will refuse"
+        "no document pairs the team token with a size at all; the operator has no way to know "
+        "what production will refuse"
     )
     assert not wrong, (
-        f"the code refuses a token shorter than {floor} characters, and these lines say "
-        f"otherwise: {wrong}"
+        f"production refuses a token shorter than {floor} characters. Every line that mentions "
+        f"the token and a size must state {floor} and no other number: {wrong}"
     )
     assert not retired, (
         f"a rule the code no longer has is still documented for the operator: {retired}"
@@ -686,9 +729,18 @@ def _controls_section() -> list[str]:
 
 
 def _defined_test_names() -> set[str]:
+    """Every test the suite defines, sync and async alike.
+
+    The pattern used to be `^def (test_...)`, which cannot see an `async def`. Every async test
+    in the suite was therefore invisible to the register, so a row citing one failed as though
+    the test did not exist. That failed closed rather than open, but it pushed the register
+    towards citing file paths instead of test names, which is weaker evidence for no reason.
+    """
     names: set[str] = set()
     for path in (REPO_ROOT / "tests").glob("test_*.py"):
-        names |= set(re.findall(r"^def (test_[a-z0-9_]+)", path.read_text(encoding="utf-8"), re.M))
+        names |= set(
+            re.findall(r"^(?:async )?def (test_[a-z0-9_]+)", path.read_text(encoding="utf-8"), re.M)
+        )
     return names
 
 

@@ -56,6 +56,9 @@ STORAGE_PROBE_PATH = "/healthz/storage"
 # container HEALTHCHECK to 429 and restart the pod, which is a cheaper denial of service than
 # attacking the application itself.
 UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
+# Any header by which a proxy claims to speak for someone else. Their PRESENCE collapses the
+# rate-limit key rather than being trusted for its content.
+_FORWARD_HEADERS = frozenset({"x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"})
 GENERIC_CLIENT_ERROR = "request rejected"
 STORE_UNAVAILABLE_ERROR = "could not store the assessment"
 RATE_LIMITED_ERROR = "rate limited"
@@ -133,9 +136,29 @@ class BodySizeLimit:
         self._app = app
         self._max_bytes = max_bytes
 
+    @staticmethod
+    def _ambiguously_framed(scope: Any) -> bool:
+        """Refuse a request that declares BOTH a Transfer-Encoding and a Content-Length.
+
+        RFC 9112 section 6.1 requires this to be rejected or the connection closed, and h11
+        instead frames by Transfer-Encoding and leaves the Content-Length bytes in the buffer,
+        where they are served as a pipelined request: one such request produced a 401 for the
+        declared body followed by a 200 for a smuggled GET /healthz. It is only exploitable
+        against a front end that frames by Content-Length where h11 frames by chunks, which a
+        modern ingress rejects, so this is a primitive rather than a live path. It is also
+        three lines in the one place that already walks the headers, which makes leaving it a
+        choice rather than an oversight.
+        """
+        names = {name.lower() for name, _ in scope.get("headers", ())}
+        return b"transfer-encoding" in names and b"content-length" in names
+
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") != "http" or scope.get("method") in self._BODYLESS_METHODS:
             await self._app(scope, receive, send)
+            return
+
+        if self._ambiguously_framed(scope):
+            await self._reject(send, status.HTTP_400_BAD_REQUEST, close=True)
             return
 
         if self._declared_over_cap(scope):
@@ -182,18 +205,21 @@ class BodySizeLimit:
                     return False
         return False
 
-    async def _reject(self, send: Any) -> None:
+    async def _reject(
+        self, send: Any, code: int = status.HTTP_413_CONTENT_TOO_LARGE, close: bool = False
+    ) -> None:
+        """Answer from the middleware, without the application ever seeing the request."""
         body = json.dumps({"error": GENERIC_CLIENT_ERROR}).encode("utf-8")
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status.HTTP_413_CONTENT_TOO_LARGE,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode("ascii")),
-                ],
-            }
-        )
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ]
+        if close:
+            # RFC 9112 section 6.1 says reject OR close on an ambiguous frame. Doing both means
+            # the bytes after a frame two parsers would read differently cannot be reused as a
+            # pipelined request on this connection, whatever the front end made of them.
+            headers.append((b"connection", b"close"))
+        await send({"type": "http.response.start", "status": code, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
 
@@ -232,9 +258,29 @@ def _client_key(request: Request) -> str:
     Keying the fine tier on the actor header let a caller mint a fresh label per request and
     bypass the tier entirely. The peer address is not perfect behind a shared proxy, which is
     recorded in the security policy, but it is not chosen by the caller.
+
+    Two defences beyond that, both learned the hard way.
+
+    The peer address itself was caller-chosen for two rounds, because uvicorn's proxy-header
+    middleware rewrites it above the application from an X-Forwarded-For the caller sends. The
+    launch command now refuses to trust that header, but the whole control living in a launch
+    command is how the original defect stayed invisible: if the platform ever supplies its own
+    command or an entrypoint wrapper, it vanishes and nothing here can tell. So a request that
+    carries a forwarding header at all is folded into ONE shared key. That is deliberately
+    pessimistic: it cannot be gamed, and in the shipped topology no such header arrives.
+
+    And the key space is split by whether a token was presented, because the coarse tier runs
+    before authentication. Sharing one space let an unauthenticated caller consume the
+    operators' whole budget and hold them at 429 for the rest of the window.
     """
-    client = request.client
-    return client.host if client else "unknown"
+    headers = request.headers
+    if _FORWARD_HEADERS & {name.lower() for name in headers}:
+        peer = "forwarded"
+    else:
+        client = request.client
+        peer = client.host if client else "unknown"
+    space = "auth" if headers.get(_TOKEN_HEADER) else "unauth"
+    return f"{space}:{peer}"
 
 
 def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
@@ -532,6 +578,15 @@ def create_app(
         openapi_url=OPENAPI_PATH if serve_docs else None,
         docs_url=DOCS_PATH if serve_docs else None,
         redoc_url=REDOC_PATH if serve_docs else None,
+        # Starlette redirects a trailing slash by default, and it does so BEFORE any dependency
+        # runs. `POST /v1/assess/` answered 307 with an absolute Location built from the
+        # caller's own Host header, unauthenticated, and a 307 preserves the method, the body
+        # and the headers: an operator who typed a trailing slash and followed redirects would
+        # re-send the team token to a host the caller named. Pinning the forwarded trust list
+        # in the previous commit made it worse, not better, because the scheme is now
+        # unconditionally http, so that resend would be in cleartext. There is no route here
+        # that needs the convenience, so the redirect is off and a trailing slash is a 404.
+        redirect_slashes=False,
     )
 
     def probe_now() -> StorageProbe:

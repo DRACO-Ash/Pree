@@ -114,3 +114,39 @@ async def test_a_second_read_of_the_body_returns_a_disconnect_not_the_body_again
     assert seen[0]["type"] == "http.request"
     assert seen[0]["body"] == b"abc"
     assert seen[1]["type"] == "http.disconnect"
+
+
+@pytest.mark.anyio
+async def test_a_request_declaring_both_framings_is_refused() -> None:
+    """Transfer-Encoding AND Content-Length together is a smuggling primitive.
+
+    RFC 9112 section 6.1 requires the request to be rejected or the connection closed. h11
+    frames by Transfer-Encoding and leaves the Content-Length bytes in the buffer, where they
+    are served as a pipelined request: against the running server one such request produced a
+    401 for the declared body followed by a 200 for a smuggled `GET /healthz`. It is only
+    exploitable through a front end that frames by Content-Length where h11 frames by chunks,
+    which a modern ingress rejects, so this is a primitive rather than a live path. It is also
+    three lines in the middleware that already walks the headers, which makes leaving it a
+    choice rather than an oversight.
+    """
+    scope = _post_scope([(b"transfer-encoding", b"chunked"), (b"content-length", b"6")])
+    sent = await _run(BodySizeLimit(_echo), scope, [{"type": "http.request", "body": b"0"}])
+    assert sent[0]["status"] == 400, (
+        f"a request declaring both framings reached the application with {sent[0]['status']}"
+    )
+    headers = dict(sent[0]["headers"])
+    assert headers.get(b"connection") == b"close", (
+        "the connection stays open after an ambiguous frame, so the trailing bytes can still be "
+        "read as a pipelined request"
+    )
+    assert b"request rejected" in sent[1]["body"]
+
+
+@pytest.mark.anyio
+async def test_either_framing_header_alone_is_still_accepted() -> None:
+    """The refusal is about the PAIR. Refusing either alone would break every normal request."""
+    for header in ((b"content-length", b"1"), (b"transfer-encoding", b"chunked")):
+        sent = await _run(
+            BodySizeLimit(_echo), _post_scope([header]), [{"type": "http.request", "body": b"x"}]
+        )
+        assert sent[0]["status"] == 200, f"{header!r} alone was refused"

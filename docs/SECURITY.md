@@ -65,7 +65,7 @@ the assessment store.
 | The Dockerfile contract is asserted by parsing, not by substring | `Dockerfile` | `tests/test_boot_contract.py` |
 | A rejected body cannot write an unbounded audit line | `src/pree/app.py` | `test_a_rejected_body_cannot_write_an_unbounded_audit_line` |
 | The body cap is bounded against the granted memory | `src/pree/app.py` | `test_the_body_cap_is_derived_from_the_memory_the_platform_grants` |
-| No document states a token size but the enforced one | `docs/` | `test_no_document_states_a_character_figure_for_the_token_but_the_enforced_one` |
+| No document states a token size but the enforced one | `docs/` | `test_no_document_states_a_token_size_but_the_enforced_one` |
 | Sonar scans `src` only, read as a resolved property | `sonar-project.properties` | `test_the_sonar_configuration_scopes_sources_to_src` |
 | The upload archive carries no credential-shaped path | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
 | No handler writes an audit line an unauthenticated caller can size | `src/pree/app.py` | `test_a_long_request_path_cannot_write_an_unbounded_audit_line` |
@@ -83,6 +83,14 @@ the assessment store.
 | The access log is bounded in the mapping shape gunicorn emits | `src/pree/audit.py` | `test_the_access_log_filter_bounds_the_mapping_shape_gunicorn_emits` |
 | Retry-After is read under the same lock as the count | `src/pree/ratelimit.py` | `test_the_retry_after_read_happens_under_the_same_lock_as_the_count` |
 | A bodiless status never carries a body | `src/pree/app.py` | `test_a_bodiless_status_stays_bodiless` |
+| No pre-auth redirect hands the token to a caller-named host | `src/pree/app.py` | `test_a_trailing_slash_is_a_404_not_a_redirect` |
+| A forwarding header collapses the rate-limit key rather than steering it | `src/pree/app.py` | `test_a_forwarding_header_cannot_widen_the_rate_limit_key_space` |
+| Unauthenticated traffic cannot consume the operators' rate budget | `src/pree/app.py` | `test_an_unauthenticated_flood_does_not_exhaust_the_authenticated_budget` |
+| An ambiguously framed request is refused and the connection closed | `src/pree/app.py` | `test_a_request_declaring_both_framings_is_refused` |
+| SHELL is refused, so a RUN's text is its command | `Dockerfile` | `tests/test_boot_contract.py` |
+| The shipped COPY carries no flags that undo the hardening | `Dockerfile` | `test_the_shipped_stage_is_exactly_one_copied_layer` |
+| Every base image is pinned by digest | `Dockerfile` | `test_every_base_image_is_pinned_by_digest` |
+| The upload archive ships only allowlisted extensions | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
 
 ## Deliberately accepted risks
 
@@ -115,15 +123,31 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    than editing it quietly. uvicorn installs its proxy-header middleware unconditionally and
    gunicorn's trust list defaults to loopback plus whatever `FORWARDED_ALLOW_IPS` holds, so the
    peer address the limiter keys on was being replaced by a caller-supplied `X-Forwarded-For`
-   before the application ran. Measured against the running server: 300 requests with a
-   rotating header were all admitted, where 60 are refused once the trust list is pinned, and
-   60 of 60 writes to `/v1/assess` were accepted where 20 is the limit. A sidecar ingress
-   forwarding over loopback is trusted by that default, and `FORWARDED_ALLOW_IPS=*` is a common
-   platform value, so the environment alone could have turned both tiers off. The launch command
-   now pins `--forwarded-allow-ips=255.255.255.255`, the limited broadcast address, which can
-   never be the source of a TCP connection; an explicit flag beats the environment default, so
-   this cannot be widened from outside the image. If operations later needs real client
-   addresses, set it to the ingress address specifically, never to `*`.
+   before the application ran. A sidecar ingress forwarding over loopback is trusted by that
+   default, and `FORWARDED_ALLOW_IPS=*` is a common platform value, so the environment alone
+   could have turned both tiers off.
+
+   There are now two independent controls. The launch command pins
+   `--forwarded-allow-ips=255.255.255.255`, the limited broadcast address, which can never be
+   the source of a TCP connection, and an explicit flag beats the environment default so this
+   cannot be widened from outside the image. And `_client_key` folds any request that carries a
+   forwarding header at all into one shared key, so the control survives a launch command the
+   platform supplies rather than living entirely in a flag, which is how the original defect
+   stayed invisible.
+
+   Measured at the shipped two workers, 1,000 requests with a rotating header each time:
+   **0 refused** with neither control, **615 refused** with the shipped build, and **671
+   refused** with the flag removed but the in-app fold present. The middle figure is the point:
+   either control alone closes it.
+
+   An earlier version of this entry reported "0 of 300 refused before and 60 of 300 after". Both
+   numbers were taken at one worker while the shipped command runs two, where the effective
+   limit doubles, so the pair could not discriminate and contradicted this entry's own first
+   sentence about worker count. The reviewer caught that, not I, and the figures above replace
+   it at the shipped configuration.
+
+   If operations later needs real client addresses, set the flag to the ingress address
+   specifically, never to `*`, and remove the in-app fold deliberately at the same time.
 5. **Scoring weights and thresholds are operational judgements, not calibrated constants.** Each
    is named and documented at its definition in `src/pree/scoring.py`. They are a starting point
    for the watch floor to tune against real outcomes, and they are stated as such rather than
@@ -444,6 +468,79 @@ plausible wrong floor, so exempting it admitted "no fewer than twenty printable 
 list is gone rather than trimmed. And the first measurement helper for the per-record figure
 invented a record larger than the scorer can emit, 2,354 bytes against a real maximum of 1,679,
 which would have forced the sheet to publish a number 38% above anything real.
+
+Fourteenth review: two majors, and the more serious was not something the last round broke but
+something the last round made worse. Starlette redirects a trailing slash by default, and it
+does so before any dependency runs, so `POST /v1/assess/` answered 307 with an absolute Location
+built from the caller's own Host header, unauthenticated. A 307 preserves the method, the body
+and the headers, so a client that follows it re-sends the team token; measured live with
+`Host: attacker.test`, the Location was `http://attacker.test/v1/assess`. Pinning the forwarded
+trust list in the previous commit removed the only thing that had been keeping that redirect on
+TLS, because the scheme is now unconditionally http. An operator who typed a trailing slash and
+followed redirects would have put the token on the wire in cleartext. The redirect is off; a
+trailing slash is a 404.
+
+The second major was the sweep guard again, and this time with the guarded line untouched.
+`SHELL ["/bin/true"]` above the sweep changes how every later RUN is executed without changing
+a character of it, so an exact-match allowlist became a statement about a string docker never
+runs, and the whole suite stayed green while nothing was swept. `COPY --from=prep --chmod=0777
+--chown=0:0 / /` did the same job from the other end, shipping the filesystem world-writable and
+root-owned past a test that only checked the copy's source. SHELL is now refused outright, and
+the shipped copy's every token is asserted. Three rounds of this guard have now failed in three
+different places, which is what it looks like when a hard rule is verified by text because no
+daemon is available to verify it by building.
+
+Eight minors. Four deserve naming.
+
+The token-floor guard has been rewritten four times and lost four times, and the reason was
+always the same: it asked whether a sentence looked like a floor claim, which needs a complete
+table of number words, of size words, of token synonyms and of adjacency, and each round the
+reviewer found the missing entry. It is now inverted. In any unit that mentions the token and
+mentions a size, the enforced constant must appear and no other number may. That needs no
+complete table of anything, because a wrong floor is wrong for being a number that is not 32,
+whatever surrounds it. The cost is real and worth stating: a legitimate sentence pairing the
+token with any other figure now fails, and two in this repository did, which is why a changelog
+entry was split in two. Twenty fabrications now turn it red.
+
+The packaging scan was a denylist for three rounds and shipped a real private key each time
+under a name one character outside the list: `.crt` was listed and `.cert` was not, `.gpg` and
+not `.pgp`, `.kdbx` and not `.kdb`, `authorized_keys` and not `authorized_keys2`, `deploy_key`
+and not `deploy_key.txt`. Enumerating every name a credential might have is not a finite task.
+The archive is now checked against an allowlist of the extensions this project actually ships,
+so an unknown extension fails by default, AND against the name denylist, because five of the ten
+paths that beat the old scan wear an extension this project genuinely ships. Replacing one net
+with the other was my first attempt and it shipped five of them; both nets are needed.
+
+The per-record volume figure has been wrong three times, each time in a way that flattered it:
+1258 bytes was a best case presented as a worst case, and 1705 was one tidy set of indicator
+values presented as a maximum, 17 bytes under the reachable one. The record's size is dominated
+by float representation rather than by the schema, so it moves with a scoring change that alters
+no field. The suite now searches every present-or-absent indicator combination with the
+longest-serialising values, finds 1722, and the sheet publishes 2048 as a ceiling with headroom
+while asserting both numbers, so the two cannot drift apart in the flattering direction.
+
+And a measurement I reported was wrong. The previous round's entry said "0 of 300 refused before,
+60 of 300 after". Both figures came from a one-worker server while the shipped command runs two,
+where the effective limit doubles, so the pair could not discriminate and contradicted the same
+entry's own first sentence about worker count. The reviewer caught it, not I. Restated at the
+shipped configuration, with a third arm the original lacked: at two workers, 1,000 requests with
+a rotating header, 0 are refused with neither control and 615 with the shipped build.
+
+The remaining four minors are smaller and each closed with a test: the coarse tier runs before
+authentication, so its key space is now split by whether a token was presented, and an
+unauthenticated flood can no longer consume the operators' budget; the forwarded-header control
+no longer lives only in the launch command, because `_client_key` folds any request carrying such
+a header into one key; the base digest, which a comment claimed was pinned, is now asserted; and
+a request declaring both a Transfer-Encoding and a Content-Length is refused with the connection
+closed rather than framed by one parser and re-read by another.
+
+Two of my own tests this round were worthless before they were useful, in the same way. The
+forwarded-header test rotated the header through the test client and asserted a 429, which it got
+with the control removed as well, because the test client's peer address never varies: the
+limiter was refusing for the wrong reason. Varying the peer needs the ASGI scope built by hand.
+And the register guard could not see an `async def`, so any row citing an async test read as
+citing a nonexistent one, which had quietly pushed the register towards citing file paths instead
+of test names, weaker evidence for no reason at all.
 
 Each of these now has a named regression test in the control table above.
 

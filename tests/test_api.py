@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from pree.app import (
@@ -20,6 +20,7 @@ from pree.app import (
     MAX_LOGGED_PATH,
     MAX_VALIDATION_ERRORS_LOGGED,
     STORAGE_PROBE_PATH,
+    _client_key,
     create_app,
 )
 from pree.audit import build_logger
@@ -433,6 +434,91 @@ def test_the_factory_installs_the_access_log_filter(tmp_path: Path) -> None:
             f"building the app left {len(installed)} truncating filters on {logger.name}; the "
             "access log is unbounded in every worker that imports the factory"
         )
+
+
+def test_a_trailing_slash_is_a_404_not_a_redirect(client: TestClient) -> None:
+    """Starlette's slash redirect ran BEFORE the token gate and named the caller's own host.
+
+    `POST /v1/assess/` answered 307 with `location: http://<caller's Host header>/v1/assess`,
+    unauthenticated, and a 307 preserves the method, the body and the headers, so a client that
+    follows it re-sends the team token. Measured live with `Host: attacker.test`, the Location
+    was `http://attacker.test/v1/assess`. Pinning the forwarded trust list made it worse rather
+    than better, because the scheme became unconditionally http, so an operator who typed a
+    trailing slash and followed redirects would put the token on the wire in cleartext.
+    """
+    for path in ("/v1/assess/", "/diagnostics/", "/healthz/storage/"):
+        response = client.get(path, headers=AUTH, follow_redirects=False)
+        assert response.status_code != 307, (
+            f"{path} still redirects to {response.headers.get('location')!r}, before the token "
+            "gate and to a host the caller names"
+        )
+        assert "location" not in response.headers, (
+            f"{path} answered {response.status_code} with a Location header"
+        )
+
+
+def _key_for(peer: str, headers: dict[str, str]) -> str:
+    """The rate-limit key for a fabricated request, exercising _client_key directly.
+
+    Direct, because the test client's peer address is a constant. The first version of the test
+    below rotated X-Forwarded-For through the client and asserted a 429, which it got with the
+    fold removed as well: the peer never varied, so the limiter refused for the wrong reason and
+    the assertion said nothing. Varying the peer is the whole point, and the only way to vary it
+    in process is to build the scope.
+    """
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": (peer, 12345),
+    }
+    return _client_key(Request(scope))
+
+
+def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space() -> None:
+    """Defence in depth for a control that otherwise lives entirely in the launch command.
+
+    The peer address both tiers key on is rewritten above the application by uvicorn's
+    proxy-header middleware, from a header the caller sends. The launch command now refuses to
+    trust it, but if the platform ever supplies its own command that flag disappears and nothing
+    here could tell. So the PRESENCE of a forwarding header collapses the key instead: rotating
+    one cannot mint fresh buckets. Measured at the shipped two workers, 1,000 requests with a
+    rotating header: 0 refused with neither control, 615 with the shipped build.
+    """
+    plain = {_key_for(f"10.0.0.{n}", {}) for n in range(8)}
+    assert len(plain) == 8, f"distinct peers must get distinct buckets, got {plain}"
+
+    for header in ("x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"):
+        folded = {_key_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"}) for n in range(8)}
+        assert len(folded) == 1, (
+            f"a rotating {header} minted {len(folded)} rate-limit buckets: {folded}"
+        )
+
+
+def test_an_unauthenticated_flood_does_not_exhaust_the_authenticated_budget(
+    tmp_path: Path,
+) -> None:
+    """The coarse tier runs before authentication, so one key space was one shared budget.
+
+    At the platform ingress every operator presents the same peer address, so an
+    unauthenticated caller could hold them all at 429 for the rest of the window at roughly
+    eight requests a second. That is a materially different statement from "colleagues share a
+    bucket", and it was the direct cost of pinning the forwarded trust list.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    client = build_client(
+        config,
+        build_logger(io.StringIO()),
+        StorageProber(cache_seconds=0.0),
+        global_limiter=RateLimiter(3, 60.0),
+    )
+    flood = [client.get("/no-such-route").status_code for _ in range(10)]
+    assert 429 in flood, f"the unauthenticated flood was never refused: {flood}"
+    # And the operator, presenting the same peer address with a valid token, is unaffected.
+    assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200, (
+        "an unauthenticated flood consumed the authenticated callers' rate budget"
+    )
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:

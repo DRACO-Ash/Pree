@@ -213,10 +213,10 @@ protect, which held every attack the round ran:
   to fail on anything they cannot check rather than skip it, and all twelve fabrications are
   now caught. The rebuilt register guard immediately found two rows citing test names that had
   been renamed without the register following.
-● Production accepted a one-character team token. At 240 attempts a minute per address per
-  worker a dictionary of common choices sits well inside an hour, so production now refuses
-  anything shorter than 32 characters or built entirely from a repeated sequence, and the sheet
-  names the generation command.
+● Production accepted a single-character team token. The coarse limiter admits enough attempts
+  an hour that a dictionary of common choices sits well inside one, so production now refuses
+  any token shorter than 32 characters, or built entirely from a repeated sequence, and the
+  sheet names the generation command.
 
 Also corrected: this policy claimed every control was mutation-proven on the strength of a
 partial sample, which is the evidence inflation the surrounding paragraph apologises for.
@@ -319,3 +319,32 @@ Thirteenth security review, two majors, the first defeated live against a runnin
   `key` only as a dotted extension.
 ● The store's per-record figure was asserted equal to itself. The test now measures the largest
   record the scorer can emit and requires the published figure to be at least that.
+
+Fourteenth security review, two majors:
+
+● **A pre-auth 307 handed the team token to a caller-named host over cleartext.** Starlette
+  redirects a trailing slash before any dependency runs, so `POST /v1/assess/` answered with an
+  absolute Location built from the caller's own Host header. A 307 preserves method, body and
+  headers, so a client that follows it re-sends the token; measured with `Host: attacker.test`,
+  the Location was `http://attacker.test/v1/assess`. Pinning the forwarded trust list last round
+  removed the only thing keeping that redirect on TLS. Slash redirects are off.
+● The sweep guard was defeated with the guarded line untouched: `SHELL ["/bin/true"]` changes how
+  every later RUN executes, and `COPY --from=prep --chmod=0777 --chown=0:0 / /` ships the
+  filesystem world-writable and root-owned. SHELL is refused; the copy's every token is asserted.
+● The token-floor guard is inverted after four rewrites: in any line pairing the token with a
+  size, the enforced constant must appear and no other number may. Twenty fabrications turn it
+  red. One changelog sentence was split in two to satisfy it, which is the rule's real cost.
+● The packaging scan is now an extension allowlist AND a name denylist. It had been a denylist
+  for three rounds and shipped a real private key each time under a name one character outside
+  the list; replacing it with an allowlist alone shipped five more.
+● The coarse limiter's key space is split by whether a token was presented, so an unauthenticated
+  flood cannot consume the operators' budget at the shared platform ingress.
+● `_client_key` folds any request carrying a forwarding header into one key, so the control
+  survives a launch command the platform supplies rather than living entirely in a flag.
+● A request declaring both a Transfer-Encoding and a Content-Length is refused, connection closed.
+● Every base image is asserted pinned by digest; "the base digest is pinned" had been a comment.
+● The volume figure now searches the indicator value space, finds 1722 bytes, and the sheet
+  publishes 2048 as a ceiling with headroom. Both numbers are asserted.
+● Corrected: the previous round's rate-limit figures were measured at one worker while the
+  shipped command runs two. Restated at two workers with a third arm: 0 of 1,000 refused with
+  neither control, 615 with the shipped build.

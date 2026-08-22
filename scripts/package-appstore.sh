@@ -50,35 +50,47 @@ done
 # reads names, never bytes, so it cannot see a credential inside an archive, a document or a
 # source file. It is the last net, not the first: the pre-write hook and the secret rules are.
 #
-# The name denylist above refuses five known directory names and nothing else, which let a
-# certificate, a .netrc, an authorized_keys, a creds.txt, a nested tarball and a symlink
-# pointing at a private key all ship. Extensions are matched case-insensitively because
-# backup.ENV is the same file as backup.env, and the whole-name list covers the credential
-# files that carry no extension at all.
-#
-# .env.example is the one deliberate exception: it carries placeholders, and a test asserts so.
-# Every pattern is anchored on a PATH COMPONENT boundary, not on the end of the whole path.
-# Anchoring the extension list with `$` matched only the final component's tail, so
-# `deploy.key.txt` (a doubled extension) and `tls.pem/server.bundle` (the credential-shaped
-# part is a DIRECTORY) both shipped a real private key past a scan that reported clean.
-#
-# The word list is a word list, and it had "passwd" but not "password", and "key" only as a
-# dotted extension: `passwords.txt`, `apikey.txt`, `krb5.keytab`, `deploy_key` and
-# `service-account.json` each shipped a real key body while the script reported clean. A
-# component ending in "key" or "keys" is now refused whatever its extension.
+# An ALLOWLIST, after three rounds of losing with a denylist. Each round added words and each
+# round shipped a real private key under a name one character outside the list: `deploy_key`
+# refused while `deploy_key.txt` and `gitlab-key.pub` shipped; `.crt` was listed and `.cert`
+# was not; `.gpg` was listed and `.pgp` was not; `.kdbx` was listed and `.kdb` was not;
+# `authorized_keys` was listed and `authorized_keys2` was not. A denylist has to enumerate
+# every name a credential might have, which is not a finite set. An allowlist has to enumerate
+# what this project ships, which is a short and stable list, and anything new fails by default
+# instead of waiting for someone to add a word.
+ALLOWED_EXTENSIONS='py|md|txt|toml|in|sh|properties|example|json|yml|yaml|cfg|ini|lock'
+ALLOWED_BARE_NAMES='Dockerfile|\.dockerignore|\.gitignore|\.python-version|LICENCE|LICENSE'
 SUSPECT=$(unzip -Z1 "$OUT" \
-  | grep -vE '(^|/)\.env\.example$' \
-  | grep -iE \
-      '\.(env|pem|key|p12|pfx|jks|keystore|crt|cer|der|p8|pk8|asc|gpg|ppk|kdbx|ovpn)(/|$|\.)'\
-'|(^|/)id_(rsa|dsa|ecdsa|ed25519)'\
-'|(^|/)(\.netrc|\.pgpass|\.npmrc|\.htpasswd|authorized_keys|known_hosts|shadow)(/|$)'\
-'|token|secret|cred|passwd|password|private.?key|api.?key|keytab|kubeconfig|pypirc'\
-'|service.?account'\
-'|(^|/)[a-z0-9][a-z0-9_.-]*keys?(/|$)' \
+  | grep -v '/$' \
+  | grep -vE "(^|/)($ALLOWED_BARE_NAMES)$" \
+  | grep -vE "\.($ALLOWED_EXTENSIONS)$" \
   || true)
 if [ -n "$SUSPECT" ]; then
-  echo "package: the archive carries paths shaped like credentials:" >&2
+  echo "package: the archive carries paths whose extension is not on the allowlist." >&2
+  echo "         Allowed extensions: $ALLOWED_EXTENSIONS" >&2
+  echo "         Allowed bare names: $ALLOWED_BARE_NAMES" >&2
+  echo "         If one of these is genuinely meant to ship, add its extension deliberately." >&2
   echo "$SUSPECT" >&2
+  exit 1
+fi
+
+# BOTH nets, because neither alone is enough and the first attempt at this replaced one with
+# the other. The allowlist above bounds the EXTENSION space, so an unknown extension fails by
+# default. It says nothing about a credential wearing an allowed extension, and five of the ten
+# paths that beat the old denylist do exactly that: deploy_key.txt, deploy_key.sh, sa-key.json,
+# bearer.txt and fixture_key.json all end in an extension this project genuinely ships. So the
+# name space is bounded too, and "key" is matched as a DELIMITED WORD anywhere in a component
+# rather than only at its end, which is what let deploy_key.txt through when deploy_key did not.
+NAMED=$(unzip -Z1 "$OUT" \
+  | grep -vE '(^|/)\.env\.example$' \
+  | grep -iE '(^|/|[_.-])keys?([_.-]|$)'\
+'|(api|ssh|gpg|pgp|priv|pub|host|sign|enc|master|secret|access|auth)keys?'\
+'|token|secret|cred|passwd|password|bearer|keytab|kubeconfig|pypirc'\
+'|service.?account|authorized|private.?key|id_(rsa|dsa|ecdsa|ed25519)' \
+  || true)
+if [ -n "$NAMED" ]; then
+  echo "package: the archive carries paths whose NAME reads like a credential:" >&2
+  echo "$NAMED" >&2
   exit 1
 fi
 
@@ -115,6 +127,7 @@ if [ -n "$NONASCII" ]; then
   exit 1
 fi
 
-echo "package: archive checks passed: no banned directory, no credential-shaped path,"
-echo "         no symlink, no multiply-linked file, no non-ASCII path"
+echo "package: archive checks passed: every extension on the allowlist, no name reading like"
+echo "         a credential, no banned directory, no symlink, no multiply-linked file, no"
+echo "         non-ASCII path"
 echo "package: note: the path scan reads names only; it cannot see inside an archived file"

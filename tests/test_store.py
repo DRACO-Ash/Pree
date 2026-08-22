@@ -534,58 +534,76 @@ def test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing(tmp_path: Pa
         JsonStore(data_dir).read()
 
 
-def _measure_max_record_bytes(samples: int = 40) -> int:
+# Indicator values chosen for the LENGTH of their serialised form, not for plausibility. The
+# record's size is dominated by float repr, so 1/7 (17 significant digits) and a long integer
+# part cost more bytes than any realistic reading, and the previous version of this helper
+# measured one tidy set of values and reported 1,679 where 1,722 was reachable.
+_LONGEST_INDICATORS: dict[str, float | int | bool] = {
+    "closest_approach_km": 123456.789012345,
+    "relative_velocity_kms": 1 / 7,
+    "manoeuvres_in_window": 9999,
+    "baseline_manoeuvres": 9999.999999999,
+    "photometric_sigma": 1 / 7,
+    "rf_emissions_detected": False,
+}
+
+
+def _measure_max_record_bytes(samples: int = 12) -> int:
     """The marginal snapshot cost of the largest record THIS APP CAN PRODUCE.
 
-    Built from the real scoring path, not invented. The first version of this helper made up a
-    record with eight 40-character indicator names and measured 2,354 bytes, which is the
-    largest record the STORE could hold and not one the scorer will ever write. That is the
-    wrong bound: it would have forced the sheet to publish a figure 38% above anything real.
+    Built through the real scoring path, and searched rather than assumed. Two earlier versions
+    of this were wrong in opposite directions. The first invented a record with eight
+    40-character indicator names and measured 2,354 bytes, which is the largest the STORE could
+    hold and not one the scorer will ever write. The second used one tidy set of indicator
+    values and measured 1,679, missing 1,722: the size is dominated by float repr, so the
+    reachable maximum is a matter of which values are supplied, not which fields exist.
 
-    Maximum here means every field the app controls at its limit: 64-character identifiers, a
-    64-character actor, and every indicator supplied so no contribution is dropped from the
-    weighting and the missing-indicator list stays empty.
+    Every present-or-absent combination is tried, because an absent indicator both removes a
+    contribution and adds an entry to the missing-indicator list, and which of those costs more
+    is not obvious.
+
+    Twelve samples per combination, not forty: the figure is 1722 at 8, 12, 20 and 40, and the
+    search runs 64 combinations, so the larger sample count cost the suite forty seconds a run
+    for a number that did not move. A slow guard gets skipped.
     """
-    result = assess(
-        ThreatIndicators(
-            closest_approach_km=0.5,
-            relative_velocity_kms=0.05,
-            manoeuvres_in_window=12,
-            baseline_manoeuvres=1.0,
-            photometric_sigma=4.5,
-            rf_emissions_detected=True,
-        )
-    )
-    record = AssessResponse(
-        protected_asset_id="a" * 64,
-        candidate_id="b" * 64,
-        score=result.score,
-        confidence=str(result.confidence),
-        evidence_coverage=result.evidence_coverage,
-        missing_indicators=result.missing_indicators,
-        contributions=[
-            ContributionOut(
-                indicator=c.indicator,
-                weight=c.weight,
-                normalised=c.normalised,
-                rationale=c.rationale,
-            )
-            for c in result.contributions
-        ],
-        schema_version=store_module.SCHEMA_VERSION,
-    ).model_dump()
-
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        store = JsonStore(root)
-        store.seed()
-        snapshot = root / "assessments.json"
-        before = snapshot.stat().st_size
-        for index in range(samples):
-            store.upsert(f"{'a' * 60}{index:04d}:{'b' * 64}", record)
-        after = snapshot.stat().st_size
-    # Round up, so the published figure can never be a fraction of a byte under the real cost.
-    return -(-(after - before) // samples)
+    largest = 0
+    names = sorted(_LONGEST_INDICATORS)
+    for mask in range(1 << len(names)):
+        supplied: dict[str, Any] = {
+            name: _LONGEST_INDICATORS[name]
+            for index, name in enumerate(names)
+            if mask & (1 << index)
+        }
+        result = assess(ThreatIndicators(**supplied))
+        record = AssessResponse(
+            protected_asset_id="a" * 64,
+            candidate_id="b" * 64,
+            score=result.score,
+            confidence=str(result.confidence),
+            evidence_coverage=result.evidence_coverage,
+            missing_indicators=result.missing_indicators,
+            contributions=[
+                ContributionOut(
+                    indicator=c.indicator,
+                    weight=c.weight,
+                    normalised=c.normalised,
+                    rationale=c.rationale,
+                )
+                for c in result.contributions
+            ],
+            schema_version=store_module.SCHEMA_VERSION,
+        ).model_dump()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = JsonStore(root)
+            store.seed()
+            snapshot = root / "assessments.json"
+            before = snapshot.stat().st_size
+            for index in range(samples):
+                store.upsert(f"{'a' * 60}{index:04d}:{'b' * 64}", record)
+            # Round up, so a published figure can never sit a fraction of a byte under the cost.
+            largest = max(largest, -(-(snapshot.stat().st_size - before) // samples))
+    return largest
 
 
 def test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget() -> None:
@@ -617,11 +635,19 @@ def test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget() -> 
     # never took and any schema growth would leave the sheet, the test and the volume request
     # agreeing while all three understated reality.
     measured_bytes_per_record = _measure_max_record_bytes()
-    stated_size = re.search(r"\*\*(\d+) bytes\*\* for a maximum-length", sheet)
-    assert stated_size is not None, "the sheet publishes no maximum-length per-record figure"
-    assert int(stated_size.group(1)) >= measured_bytes_per_record, (
-        f"a maximum-length record costs {measured_bytes_per_record} bytes on this build, above "
-        f"the {stated_size.group(1)} the sheet publishes for planning"
+    planned = re.search(r"Plan on \*\*(\d+) bytes\*\* per record", sheet)
+    assert planned is not None, "the sheet publishes no per-record planning figure"
+    assert int(planned.group(1)) >= measured_bytes_per_record, (
+        f"the largest record this build can produce costs {measured_bytes_per_record} bytes, "
+        f"above the {planned.group(1)} the sheet asks operations to plan for"
+    )
+    # And the sheet's stated measurement must match what the search actually finds, so the two
+    # numbers cannot drift apart in the direction that flatters the planning figure.
+    reported = re.search(r"costs \*\*(\d+) bytes\*\*", sheet)
+    assert reported is not None, "the sheet reports no measured figure alongside its ceiling"
+    assert int(reported.group(1)) == measured_bytes_per_record, (
+        f"the sheet reports {reported.group(1)} bytes as measured; the search finds "
+        f"{measured_bytes_per_record}"
     )
     requested = re.search(r"volume of at least\s+\*\*(\d+) MiB\*\*", sheet)
     assert requested is not None, "the sheet requests no volume size, so no cap can be checked"

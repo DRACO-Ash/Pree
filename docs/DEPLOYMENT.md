@@ -85,14 +85,19 @@ Storage growth is bounded by construction: the assessment collection is capped a
 records, dropping the oldest and never the record just written, so the volume cannot fill
 through ordinary accumulation.
 
-Measured through the real scoring path on this build: about **1339 bytes** for a minimal record
-and **1705 bytes** for a maximum-length one, meaning 64-character identifiers and every
-indicator supplied so no contribution is dropped. Plan on the maximum, which is **8.1 MiB** of
-steady state. The published maximum is a planning ceiling and the suite measures the real figure
-on every run, asserting the published one is never below it.
+Plan on **2048 bytes** per record, which is **10.0 MiB** of steady state at the cap.
 
-An earlier version of this sheet published 1258 bytes as the planning figure. That was a
-best-case measurement presented as a worst case, and it understated the volume by a third.
+That is a **ceiling with headroom**, not a measurement, and the distinction has bitten this
+sheet three times. The largest record the scorer can actually produce, searched across every
+present-or-absent indicator combination and the longest-serialising values, costs **1722 bytes**
+on this build; the suite performs that search on every run and refuses to pass if the published
+figure is below what it finds. The record's size is dominated by float representation rather
+than by the schema, so it moves with a scoring change that alters no field at all, which is why
+the published number carries margin instead of tracking the measurement exactly.
+
+Two earlier figures in this sheet were wrong. 1258 bytes was a best-case measurement presented
+as a worst case and understated the volume by a third. 1705 bytes was a single tidy set of
+indicator values presented as a maximum and sat 17 bytes under the reachable one.
 
 The snapshot is rewritten whole on every upsert and a backup copy sits beside it, so the
 directory holds up to three copies at the moment of a write: request a volume of at least
