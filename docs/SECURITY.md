@@ -85,13 +85,11 @@ the assessment store.
 | A bodiless status never carries a body | `src/pree/app.py` | `test_a_bodiless_status_stays_bodiless` |
 | No pre-auth redirect hands the token to a caller-named host | `src/pree/app.py` | `test_a_trailing_slash_is_a_404_not_a_redirect` |
 | A forwarding header collapses the rate-limit key rather than steering it | `src/pree/app.py` | `test_a_forwarding_header_cannot_widen_the_rate_limit_key_space` |
-| Unauthenticated traffic cannot consume the operators' rate budget | `src/pree/app.py` | `test_an_unauthenticated_flood_does_not_exhaust_the_authenticated_budget` |
 | An ambiguously framed request is refused and the connection closed | `src/pree/app.py` | `test_a_request_declaring_both_framings_is_refused` |
 | SHELL is refused, so a RUN's text is its command | `Dockerfile` | `tests/test_boot_contract.py` |
 | The shipped COPY carries no flags that undo the hardening | `Dockerfile` | `test_the_shipped_stage_is_exactly_one_copied_layer` |
 | Every base image is pinned by digest | `Dockerfile` | `test_every_base_image_is_pinned_by_digest` |
 | The upload archive ships only allowlisted extensions | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
-| The authenticated rate space needs a valid token, not a present one | `src/pree/app.py` | `test_the_authenticated_key_space_needs_a_valid_token_not_a_present_one` |
 | An ambiguous frame is refused on every method, bodyless included | `src/pree/app.py` | `test_a_request_declaring_both_framings_is_refused_on_a_bodyless_method` |
 | Nothing writes over a binary the hardening steps name | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
 | The shipped stage declares nothing that undoes a control | `Dockerfile` | `test_the_shipped_stage_declares_no_instruction_that_undoes_a_control` |
@@ -99,8 +97,10 @@ the assessment store.
 | Every read of the assessment store is audited | `src/pree/app.py` | `test_every_read_of_the_store_is_audited` |
 | A refused CORS preflight uses one contract and is audited | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 | The framing guard is the outermost middleware | `src/pree/app.py` | `test_the_frame_guard_is_the_outermost_middleware` |
-| A guessing run cannot read the answer off the status code | `src/pree/app.py` | `test_a_guessing_run_cannot_read_the_answer_off_the_status_code` |
 | A refused preflight is metered | `src/pree/app.py` | `test_a_refused_preflight_is_metered` |
+| A guessing run is bounded by the ordinary limiter, with no oracle | `src/pree/app.py` | `test_a_guessing_run_is_bounded_by_the_ordinary_limiter` |
+| An unauthenticated flood cannot refuse a request the limit would admit | `src/pree/app.py` | `test_an_unauthenticated_flood_cannot_refuse_a_request_the_limit_would_admit` |
+| A preflight to a probe path is refused without an audit line | `src/pree/app.py` | `test_a_preflight_to_a_probe_path_is_refused_without_an_audit_line` |
 | Production refuses a cleartext allowed origin | `src/pree/config.py` | `test_production_refuses_a_cleartext_allowed_origin` |
 | The access log redacts a query string | `src/pree/audit.py` | `test_the_access_log_filter_redacts_a_query_string` |
 | A malformed store key is refused at the boundary | `src/pree/app.py` | `test_a_malformed_store_key_is_refused_at_the_boundary` |
@@ -155,6 +155,18 @@ Each of these is a decision, not an oversight. Recorded here rather than left im
    **0 refused** with neither control, **615 refused** with the shipped build, and **671
    refused** with the flag removed but the in-app fold present. The middle figure is the point:
    either control alone closes it.
+
+   There is ONE key space, and the token plays no part in choosing it. Three rounds were spent
+   splitting it and each split was worse than the last: by the header's presence, an
+   unauthenticated caller reached the operators' budget; by the token's validity, refusal became
+   a guessing oracle worth about 53,000 attempts a minute; bounding wrong guesses per peer let
+   twenty requests from anywhere on the internet deny the whole watch floor, because behind the
+   ingress every operator presents one address. The residual of one space is that an
+   unauthenticated caller at the shared ingress address consumes the same 240-per-window budget
+   the operators draw on. That is a real cost and it is accepted, on the reasoning that it is the
+   ordinary limit rather than a cheaper one, that it was accepted before any of the three splits,
+   and that every attempt to do better produced a worse defect. A per-operator budget needs
+   per-operator identity, which is the single-sign-on seam named in risk 1, not a header.
 
    An earlier version of this entry reported "0 of 300 refused before and 60 of 300 after". Both
    numbers were taken at one worker while the shipped command runs two, where the effective
@@ -713,6 +725,78 @@ control. Separating the question from the charge needed a new `spent` method on 
 that is what the code does now. And the container restarted mid-mutation-test leaving one
 mutation applied in the working tree; the snapshot discipline caught it on the next diff, which
 is the only reason it is not in this commit.
+
+Seventeenth review: four majors, and the first was a control this project introduced one round
+earlier that turned out to be an unauthenticated denial of service against every operator.
+
+Twenty wrong tokens from anywhere on the internet locked out the whole watch floor for the rest
+of the window, at about a third of a request a second, twelve times cheaper than the coarse
+limit beside it. The guessing budget keyed on the socket peer, and behind the platform ingress
+every operator presents one address, so an attacker spent a budget that was not theirs. The
+previous round's own narrative had rejected the self-inflicted version of exactly this, "a denial
+of service dressed as a control", and then shipped the attacker-driven version, which is worse.
+The test that was supposed to protect it flooded ten times against a budget of twenty and passed.
+
+The fix is a deletion, not another control. The key space is one bucket per peer and the token
+plays no part in choosing it. Three rounds were spent splitting that space and each split was
+worse than the last: by the header's presence, an unauthenticated caller reached the operators'
+budget; by validity, refusal became a guessing oracle worth about 53,000 attempts a minute;
+bounding the guesses produced this. A saturated peer is now refused identically whichever token
+it holds, which is the property the token-length floor is calculated from, and the residual is
+recorded in accepted risk 4 rather than papered over. A control that has to be repaired twice
+and is worse each time is a control that should not exist.
+
+The second major was the behavioural image check, for the second consecutive round. Last round it
+read a failed command as a pass; this round the pip assertion could not match anything at all,
+because `docker export` writes tar member names RELATIVE and `tar -tv` puts the mode first, so
+`opt/venv/bin/pip3` is never preceded by `/` or start-of-line and the anchored pattern was dead.
+The check printed its success message on every run. Proven offline: the old pattern found zero
+matches in a listing containing both `opt/venv/bin/pip3` and `site-packages/pip/__init__.py`.
+It now reads the last field, unanchored, covers the library directory as well as the entry
+points, and there are three positive controls rather than one: the listing must be long, the mode
+column must parse, and the pattern's own path prefix must be present. A check that cannot fire is
+worse than no check, because it reports a pass.
+
+The suid sweep guard fell for the SIXTH consecutive round, and this time to one redundant
+character. `//usr/bin/find`, `/usr//bin/find` and `WORKDIR /usr/./bin` with a relative
+destination all name the same file as `/usr/bin/find`, and all three walked past a prefix test on
+the raw string; `ENV TGT=/usr/bin/find` with `COPY … $TGT` walked past it too. Destinations are
+now slash-collapsed and normalised before the test, and a destination containing a variable is
+refused rather than resolved. `posixpath.normpath` alone was not enough, because POSIX makes a
+leading double slash implementation-defined and returns it unchanged.
+
+The fourth major was the preflight metering added one round earlier: it called a helper that
+returns early for the six exempt paths, so preflights on those paths were still uncounted while
+the audit line below them was written anyway. Measured: 1,200 refused preflights across
+`/healthz`, `/` and `/healthz/storage` returned 400 each with nothing counting them, and eight
+threads grew the log by 435,200 bytes in 3.18 seconds, about 8.2 MB a minute per worker, 45% of
+it on the channel the forensic trail lives in. The exemption exists so the platform's probes are
+never throttled and the platform probes with GET, so a preflight is now metered on every path,
+and a preflight to a probe path gets the contract without the audit line. Re-measured on a fresh
+server per path, 400 requests each: 240 admitted and 160 refused on `/healthz`,
+`/healthz/storage` and `/v1/assess` alike.
+
+Seven minors, and four are corrections to claims. The token guard's docstring said the inverted
+rule "needs no complete table of anything"; it needs a complete table of SIZE words, because
+`size.search` gates the whole check, and "16 random units" states a wrong floor with no size word
+in it. The number side needs no table, which is where five rounds of defeats came from, and the
+docstring now says exactly that and names the residual. The packaging script's comment claimed
+every check read the captured listing while four re-ran `unzip` inside a pipeline whose failure
+would read as a pass; they read the variable now. The setuid parse had no positive control, so a
+dead producer would have reported a pass. And the outermost-middleware assertion tested only the
+POSITION, so any layer at position 0 satisfied it, while its own comment claimed only the
+hardening headers may sit there.
+
+Three smaller ones: `RateLimiter.spent` created a table entry for every key it was merely asked
+about, so the table could grow from questions rather than traffic; it is deleted along with the
+guessing budget that needed it. A non-preflight `OPTIONS` was charged to the coarse limiter twice,
+halving its allowance. And the image listing leaked into the system temp directory on every
+failure path, because it was created outside the working directory the exit trap removes.
+
+One thing in this round was mine to notice. The middleware-position assertion I wrote to fix the
+minor did not type-check as an identity comparison, and the version that did type-check asserted
+nothing, because mypy read the branch as unreachable. It took three attempts to write an
+assertion that both compiles and fires.
 
 Each of these now has a named regression test in the control table above.
 

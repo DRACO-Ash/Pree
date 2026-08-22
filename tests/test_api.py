@@ -24,7 +24,6 @@ from pree.app import (
     create_app,
 )
 from pree.audit import build_logger
-from pree.config import Config
 from pree.health import StorageProber
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
 from pree.security import MAX_ACTOR_LENGTH, sanitise_actor
@@ -458,7 +457,7 @@ def test_a_trailing_slash_is_a_404_not_a_redirect(client: TestClient) -> None:
         )
 
 
-def _keys_for(peer: str, headers: dict[str, str], config: Config) -> tuple[str, ...]:
+def _keys_for(peer: str, headers: dict[str, str]) -> tuple[str, ...]:
     """The rate-limit keys for a fabricated request, exercising _limit_keys directly.
 
     Direct, because the test client's peer address is a constant. An earlier version of the
@@ -473,10 +472,10 @@ def _keys_for(peer: str, headers: dict[str, str], config: Config) -> tuple[str, 
         "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
         "client": (peer, 12345),
     }
-    return _limit_keys(Request(scope), config)
+    return _limit_keys(Request(scope))
 
 
-def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space(tmp_path: Path) -> None:
+def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space() -> None:
     """A forwarding header may only ever REDUCE a caller's allowance, never change bucket.
 
     Two defects, one round apart. First, the peer address both tiers key on is rewritten above
@@ -487,71 +486,21 @@ def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space(tmp_path: Pat
     measured, a throttled caller went back to 404 with any of three headers. The request is now
     charged to both keys and refused if either is over.
     """
-    config = make_config(tmp_path)
-    plain = {_keys_for(f"10.0.0.{n}", {}, config) for n in range(8)}
+    plain = {_keys_for(f"10.0.0.{n}", {}) for n in range(8)}
     assert len(plain) == 8, f"distinct peers must get distinct buckets, got {plain}"
 
     for header in ("x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"):
-        keys = [_keys_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"}, config) for n in range(8)]
+        keys = [_keys_for(f"10.0.0.{n}", {header: f"203.0.113.{n}"}) for n in range(8)]
         # The FOLDED key, which is the one a rotating header would otherwise vary. The socket
         # key still differs per peer by design: that is what stops the header being an escape.
         folded = {key[0] for key in keys}
         assert len(folded) == 1, f"a rotating {header} minted {len(folded)} buckets: {folded}"
-        assert folded == {"unauth:forwarded"}, folded
+        assert folded == {"forwarded"}, folded
         # And the peer's own key is still charged, so the header cannot be an escape hatch.
         for peer_index, key_set in enumerate(keys):
-            assert f"unauth:socket:10.0.0.{peer_index}" in key_set, (
+            assert f"socket:10.0.0.{peer_index}" in key_set, (
                 f"adding {header} dropped the peer's own bucket: {key_set}"
             )
-
-
-def test_the_authenticated_key_space_needs_a_valid_token_not_a_present_one(
-    tmp_path: Path,
-) -> None:
-    """`if headers.get(...)` let the caller choose its own bucket.
-
-    Deciding the space on the header's PRESENCE meant an unauthenticated caller reached the
-    operators' space with `X-Pree-Token: anything`. Measured against the project's own
-    fixtures: flooding the coarse limiter with a garbage token header, then presenting the real
-    token from the same peer, returned 429. That is the same anti-pattern as keying on the
-    actor header, which this function's own docstring warns about.
-    """
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    assert _keys_for("10.0.0.1", {"x-pree-token": TEST_TOKEN}, config) == ("auth:10.0.0.1",)
-    for wrong in ("", "not-the-token", TEST_TOKEN + "x", TEST_TOKEN[:-1]):
-        assert _keys_for("10.0.0.1", {"x-pree-token": wrong}, config) == ("unauth:10.0.0.1",), (
-            f"a token of {wrong!r} reached the authenticated rate-limit space"
-        )
-
-
-def test_an_unauthenticated_flood_does_not_exhaust_the_authenticated_budget(
-    tmp_path: Path,
-) -> None:
-    """The coarse tier runs before authentication, so one key space was one shared budget.
-
-    At the platform ingress every operator presents the same peer address, so an
-    unauthenticated caller could hold them all at 429 for the rest of the window at roughly
-    eight requests a second.
-
-    The flood carries a WRONG TOKEN, which is how the first version of this test was defeated.
-    It flooded with no token header at all, so it passed while the split was decided on the
-    header's presence and an unauthenticated caller reached the operators' space by sending
-    `X-Pree-Token: anything`.
-    """
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    for flood_headers in ({}, {"x-pree-token": "not-the-real-token"}, {"x-pree-token": ""}):
-        client = build_client(
-            config,
-            build_logger(io.StringIO()),
-            StorageProber(cache_seconds=0.0),
-            global_limiter=RateLimiter(3, 60.0),
-        )
-        flood = [client.get("/no-such-route", headers=flood_headers).status_code for _ in range(10)]
-        assert 429 in flood, f"the flood was never refused with {flood_headers}: {flood}"
-        # The operator, same peer address, valid token, is unaffected.
-        assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200, (
-            f"a flood carrying {flood_headers} consumed the authenticated callers' budget"
-        )
 
 
 def test_the_storage_probe_publishes_the_data_directory_only_on_failure(
@@ -658,25 +607,27 @@ def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path
     )
 
 
-def test_a_guessing_run_cannot_read_the_answer_off_the_status_code(tmp_path: Path) -> None:
-    """Choosing the rate bucket by the token's validity made refusal itself an oracle.
+def test_a_guessing_run_is_bounded_by_the_ordinary_limiter(tmp_path: Path) -> None:
+    """One bucket per peer, and the token plays no part in choosing it.
 
-    Once a peer saturated its `unauth:` bucket with wrong guesses, a wrong guess landed in the
-    saturated bucket and returned 429 while the RIGHT token landed in a fresh `auth:` bucket and
-    returned 200, so the caller kept guessing at full speed and read the answer off the status
-    code. Measured before the fix: 2,666 distinguishable guesses in three seconds, about 53,000
-    a minute, against the 240 a minute the token-length floor is calculated from.
+    Three rounds of splitting the key space made this worse each time. Splitting by the token
+    header's PRESENCE let an unauthenticated caller into the operators' budget. Splitting by its
+    VALIDITY made refusal an oracle: after saturating the unauthenticated bucket a wrong guess
+    returned 429 and the right token 200, so a guessing run read the answer off the status code
+    at about 53,000 attempts a minute. Bounding wrong guesses per peer closed that and handed an
+    unauthenticated caller a denial of service against every operator, because behind the
+    platform ingress they all present one address.
 
-    Once the guessing budget is spent, every token-bearing request from that peer is refused
-    whether the token is right or wrong, so the two are indistinguishable again.
+    With one bucket, a saturated peer is refused identically whichever token it holds, which is
+    the property the token-length floor is calculated from, and no unauthenticated request can
+    refuse an authenticated one that the ordinary limit would have admitted.
     """
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
     client = build_client(
         config,
         build_logger(io.StringIO()),
         StorageProber(cache_seconds=0.0),
-        failure_limiter=RateLimiter(4, 60.0),
-        global_limiter=RateLimiter(10_000, 60.0),
+        global_limiter=RateLimiter(6, 60.0),
     )
     for attempt in range(6):
         client.get("/no-such-route", headers={"x-pree-token": f"wrong-{attempt}"})
@@ -684,11 +635,37 @@ def test_a_guessing_run_cannot_read_the_answer_off_the_status_code(tmp_path: Pat
     wrong = client.get("/no-such-route", headers={"x-pree-token": "wrong-again"}).status_code
     right = client.get("/no-such-route", headers=AUTH).status_code
     assert wrong == right == 429, (
-        f"after the guessing budget is spent, a wrong token gave {wrong} and the right token "
-        f"gave {right}: the difference is the oracle"
+        f"a saturated peer answered {wrong} to a wrong token and {right} to the right one: the "
+        f"difference is a guessing oracle"
     )
-    # A caller presenting NO token is unaffected: the budget is spent on guesses, not traffic.
-    assert client.get("/no-such-route").status_code == 404
+
+
+def test_an_unauthenticated_flood_cannot_refuse_a_request_the_limit_would_admit(
+    tmp_path: Path,
+) -> None:
+    """The attacker-driven denial of service the guessing budget created.
+
+    Twenty wrong tokens from anywhere on the internet locked out every operator for the rest of
+    the window, at about a third of a request a second, twelve times cheaper than the coarse
+    limit beside it. The previous version of this test flooded ten times against a budget of
+    twenty, so it passed while the defect shipped: this one floods well past any per-peer
+    failure budget and asserts the authenticated caller is still served.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    client = build_client(
+        config,
+        build_logger(io.StringIO()),
+        StorageProber(cache_seconds=0.0),
+        global_limiter=RateLimiter(100_000, 60.0),
+    )
+    for attempt in range(40):
+        client.get("/no-such-route", headers={"x-pree-token": f"guess-{attempt}"})
+
+    assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200, (
+        "40 wrong tokens from one address refused an authenticated request the ordinary limit "
+        "would have admitted"
+    )
+    assert client.get("/diagnostics", headers=AUTH).status_code == 200
 
 
 def test_a_refused_preflight_is_metered(tmp_path: Path) -> None:
@@ -702,20 +679,25 @@ def test_a_refused_preflight_is_metered(tmp_path: Path) -> None:
     config = make_config(
         tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
     )
-    client = build_client(
-        config,
-        build_logger(io.StringIO()),
-        StorageProber(cache_seconds=0.0),
-        global_limiter=RateLimiter(3, 60.0),
-    )
-    codes = [
-        client.options(
-            "/v1/assess",
-            headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
-        ).status_code
-        for _ in range(8)
-    ]
-    assert 429 in codes, f"refused preflights are not metered: {codes}"
+    # EVERY path, including the six exempt from the ordinary limiter. Testing only a metered
+    # path let the defect ship twice: the metering helper returned early for the exempt paths
+    # while the audit line below was written anyway, and 1,200 refused preflights across
+    # /healthz, / and /healthz/storage returned 400 each with nothing counting them.
+    for path in ("/v1/assess", "/healthz", "/", STORAGE_PROBE_PATH):
+        metered = build_client(
+            config,
+            build_logger(io.StringIO()),
+            StorageProber(cache_seconds=0.0),
+            global_limiter=RateLimiter(3, 60.0),
+        )
+        codes = [
+            metered.options(
+                path,
+                headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
+            ).status_code
+            for _ in range(8)
+        ]
+        assert 429 in codes, f"refused preflights on {path} are not metered: {codes}"
 
 
 def test_the_frame_guard_is_the_outermost_middleware(tmp_path: Path) -> None:
@@ -753,6 +735,28 @@ def test_the_frame_guard_is_the_outermost_middleware(tmp_path: Path) -> None:
         f"FrameGuard is at position {position} of the middleware stack, so {names[:position]} "
         f"can answer a request before the framing check runs: {names}"
     )
+    # And WHAT sits above it, not merely how many. `position <= 1` passed for any layer at all
+    # at position 0, while the comment above claims only the hardening headers may precede it:
+    # a middleware that answered before calling down would keep FrameGuard at position 1 and
+    # this test green. The one permitted layer is the BaseHTTPMiddleware wrapping
+    # security_headers, which only decorates a response on the way out.
+    if position == 1:
+        outermost = app.user_middleware[0]
+        # By NAME, through getattr: Starlette types the middleware factory as a protocol, so
+        # an identity check against the class reads as non-overlapping to mypy and made the next
+        # assertion unreachable, and a direct __name__ access does not type-check either. The
+        # first version of this passed the type checker and asserted nothing.
+        assert getattr(outermost.cls, "__name__", "") == "BaseHTTPMiddleware", (
+            f"{names[0]} sits outside FrameGuard and is not the hardening-header decorator, so "
+            f"it can answer a request before the framing check runs"
+        )
+        dispatch = outermost.kwargs.get("dispatch") or (
+            outermost.args[0] if outermost.args else None
+        )
+        assert getattr(dispatch, "__name__", "") == "security_headers", (
+            f"the outermost layer dispatches {getattr(dispatch, '__name__', dispatch)!r}, not "
+            f"security_headers"
+        )
 
     # And behaviourally: an ambiguous frame is refused with the connection closed even on a
     # preflight for the ALLOWED origin, which is the case CORS would otherwise answer itself.
@@ -821,6 +825,41 @@ def test_a_well_formed_store_key_still_reaches_the_store(client: TestClient) -> 
     # refused by an off-by-one in the pattern's length bounds.
     longest = "a" * 64 + ":" + "b" * 64
     assert client.get(f"/v1/assessments/{longest}", headers=AUTH).status_code == 404
+
+
+def test_a_preflight_to_a_probe_path_is_refused_without_an_audit_line(tmp_path: Path) -> None:
+    """The contract, but not the audit line, on a path that touches nothing.
+
+    Auditing these was 45% of the bytes an unauthenticated flood wrote, on the channel the
+    forensic trail lives in, for an event that reveals nothing: a cross-origin preflight to
+    /healthz is refused whoever sends it. Those six paths are exempt so the platform's own
+    probes are never throttled, and the platform probes with GET, so the preflight is metered
+    like everything else and simply not narrated.
+    """
+    stream = io.StringIO()
+    config = make_config(
+        tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
+    )
+    client = build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0))
+    for path in ("/healthz", "/", STORAGE_PROBE_PATH):
+        response = client.options(
+            path,
+            headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
+        )
+        assert response.status_code == 400, f"{path} gave {response.status_code}"
+        assert response.json() == {"error": "request rejected"}, response.text
+    assert "cors_reject" not in stream.getvalue(), (
+        "a preflight to a probe path wrote an audit line, which is the amplification channel"
+    )
+
+    # And a preflight to a REAL path still audits, so the exemption is about the path and not
+    # about preflights in general.
+    metered = client.options(
+        "/v1/assess",
+        headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
+    )
+    assert metered.status_code == 400
+    assert "cors_reject" in stream.getvalue()
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:

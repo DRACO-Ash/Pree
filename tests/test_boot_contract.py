@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import itertools
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -489,7 +490,21 @@ def test_nothing_writes_over_a_binary_the_hardening_steps_depend_on() -> None:
         # `COPY --from=build ["/bin/true", "/usr/bin/find"]` gives `"/usr/bin/find"]`. Both
         # replaced /usr/bin/find with a no-op and left the whole suite green.
         raw = instruction.argument.split()[-1].strip("[]\"',")
-        target = raw if raw.startswith("/") else f"{instruction.workdir.rstrip('/')}/{raw}"
+        # A destination containing a variable is refused outright rather than resolved. `ENV
+        # TGT=/usr/bin/find` with `COPY --from=build /bin/true $TGT` left the whole suite green,
+        # and chasing every substitution form is the losing game this project keeps replaying.
+        assert "$" not in raw, (
+            f"a COPY destination is built from a variable, so what it writes cannot be read "
+            f"from this file: {instruction.argument[:80]}"
+        )
+        joined = raw if raw.startswith("/") else f"{instruction.workdir.rstrip('/')}/{raw}"
+        # NORMALISED. `//usr/bin/find`, `/usr//bin/find` and `WORKDIR /usr/./bin` with a
+        # relative destination all name exactly the same file as `/usr/bin/find`, and all three
+        # walked past a prefix test on the raw string. One redundant character was enough.
+        # normpath alone is not enough: POSIX makes a LEADING double slash
+        # implementation-defined, so posixpath.normpath("//usr/bin/find") returns it unchanged
+        # and the prefix test still missed it. Collapse every run of slashes first.
+        target = posixpath.normpath(re.sub(r"/{2,}", "/", joined))
         if any(target.startswith(directory) for directory in _EXECUTABLE_DIRECTORIES):
             offenders.append(f"{instruction.keyword} {instruction.argument[:80]} -> {target}")
     assert not offenders, (
@@ -702,10 +717,18 @@ def test_no_document_states_a_token_size_but_the_enforced_one() -> None:
     between the figure and the word broke adjacency.
 
     The rule is now the other way round. In any unit that mentions the token AND mentions a
-    size, the enforced constant must appear, and no OTHER number may. That needs no complete
-    table of anything: a wrong floor is wrong because it is a number that is not 32, whatever
-    words surround it. The cost is that a legitimate sentence pairing the token with any other
-    figure now fails, which is a cost worth paying for a rule that stops needing repairs.
+    size, the enforced constant must appear, and no OTHER number may.
+
+    That is NOT a rule needing no table, and an earlier version of this docstring claimed it
+    was. `size.search` gates the whole check, so the size-word set is still a table and still
+    incomplete: "Generate PREE_TEAM_TOKEN as 16 random units" states a wrong floor with no size
+    word in it and passes. What the inversion actually buys is that the NUMBER side needs no
+    table, which is where five consecutive rounds of defeats came from. The size side remains a
+    denylist, its consequence is a misled operator and a fail-closed boot refusal rather than a
+    weak token in production, and it is written down here rather than implied to be solved.
+
+    The other cost is real too: a legitimate sentence pairing the token with any other figure
+    fails, and two in this repository did.
     """
     floor = str(importlib.import_module("pree.config").MIN_PRODUCTION_TOKEN_LENGTH)
     size = re.compile(

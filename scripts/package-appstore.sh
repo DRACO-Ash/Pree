@@ -49,7 +49,8 @@ echo "--- archive root ---"
 unzip -l "$OUT" | awk 'NR>3 && $4 !~ /\// {print $4}' | head -20
 
 for banned in .env .git .venv node_modules coverage; do
-  if unzip -Z1 "$OUT" | grep -qE "^(.*/)?${banned}(/|$)"; then
+  if printf '%s
+' "$LISTING_NAMES" | grep -qE "^(.*/)?${banned}(/|$)"; then
     echo "package: banned entry $banned present in the archive" >&2
     exit 1
   fi
@@ -69,7 +70,8 @@ done
 # instead of waiting for someone to add a word.
 ALLOWED_EXTENSIONS='py|md|txt|toml|in|sh|properties|example|json|yml|yaml|cfg|ini|lock'
 ALLOWED_BARE_NAMES='Dockerfile|\.dockerignore|\.gitignore|\.python-version|LICENCE|LICENSE'
-SUSPECT=$(unzip -Z1 "$OUT" \
+SUSPECT=$(printf '%s
+' "$LISTING_NAMES" \
   | grep -v '/$' \
   | grep -vE "(^|/)($ALLOWED_BARE_NAMES)$" \
   | grep -vE "\.($ALLOWED_EXTENSIONS)$" \
@@ -98,7 +100,8 @@ fi
 # bearer.txt and fixture_key.json all end in an extension this project genuinely ships. So the
 # name space is bounded too, and "key" is matched as a DELIMITED WORD anywhere in a component
 # rather than only at its end, which is what let deploy_key.txt through when deploy_key did not.
-NAMED=$(unzip -Z1 "$OUT" \
+NAMED=$(printf '%s
+' "$LISTING_NAMES" \
   | grep -vE '^\.env\.example$' \
   | grep -iE 'keys?([_.-]|$)'\
 '|token|secret|cred|passwd|password|bearer|keytab|kubeconfig|pypirc|dotenv'\
@@ -155,7 +158,8 @@ fi
 # outside ASCII in a path is refused: this project ships no such name.
 # A POSIX bracket range, not grep -P: the -P flag is a GNU extension and its absence made this
 # net report a pass without running.
-NONASCII=$(unzip -Z1 "$OUT" | LC_ALL=C grep -n '[^ -~]' || true)
+NONASCII=$(printf '%s
+' "$LISTING_NAMES" | LC_ALL=C grep -n '[^ -~]' || true)
 if [ -n "$NONASCII" ]; then
   echo "package: the archive carries non-ASCII paths, which can render as a name they are" >&2
   echo "         not; refuse rather than guess:" >&2

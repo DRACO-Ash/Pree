@@ -46,7 +46,7 @@ from .ratelimit import (
     RateLimiter,
 )
 from .scoring import ThreatIndicators, assess
-from .security import MAX_ACTOR_LENGTH, AuthError, authorise, sanitise_actor, token_matches
+from .security import MAX_ACTOR_LENGTH, AuthError, authorise, sanitise_actor
 from .store import SCHEMA_VERSION, JsonStore, StoreError
 
 LIVENESS_PATHS = ("/", "/healthz", "/readyz", "/livez", "/ping")
@@ -97,15 +97,6 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 STORE_KEY_MAX_LENGTH = 129
 STORE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 MAX_LOGGED_PATH = 160
-# Wrong tokens a single peer may present per window before every token-bearing request from it
-# is refused, right or wrong. Twenty is generous for a human pasting a value and mistyping it,
-# and it caps a guessing run at twenty attempts a minute per address rather than the tens of
-# thousands the validity-keyed buckets allowed. AUTH_FAILURE_COST spends the budget in one
-# step per failure; it exists as a named constant so the arithmetic is visible rather than
-# implied by a limit of one. Only FAILURES are charged: an operator with the right token can
-# make as many requests as the ordinary limiters allow.
-AUTH_FAILURE_LIMIT = 20
-AUTH_FAILURE_WINDOW_SECONDS = 60.0
 # The reason string is composed server-side in both handlers that log one: AuthError carries a
 # fixed literal, and StoreError embeds a configured path, never caller input. Truncating it to
 # the actor length cut "could not acquire the store lock at /proc/.../.assessments.json" off
@@ -333,74 +324,39 @@ def _peer_key(request: Request) -> str:
     return client.host if client else "unknown"
 
 
-def _is_authenticated(request: Request, config: Config) -> bool:
-    """Constant-time check of the presented token, for bucket selection only."""
-    presented = request.headers.get(_TOKEN_HEADER)
-    return bool(config.team_token and presented and token_matches(presented, config.team_token))
-
-
-def _limit_keys(request: Request, config: Config) -> tuple[str, ...]:
+def _limit_keys(request: Request) -> tuple[str, ...]:
     """Every bucket this request must fit inside. Refused if ANY of them is over.
 
-    Returning a tuple rather than one key closes the half of this that adding a header could
-    still exploit. Folding a forwarded request onto a single shared key stopped it minting
-    fresh buckets, but the folded key was a DIFFERENT bucket from the peer's own, so a caller
-    already at its limit escaped simply by adding X-Forwarded-For. Measured: a throttled
-    caller went back to 404 by adding any of three headers. Charging both keys means a header
-    can only ever reduce a caller's allowance, never increase it.
+    ONE key space, not two, and getting back to one took three rounds of making it worse.
 
-    The space is chosen by the token's VALIDITY, not its presence, so an unauthenticated caller
-    cannot reach the operators' budget with `X-Pree-Token: anything`. That choice creates a
-    guessing oracle on its own, which is why `_guessing_budget_spent` exists below and must be
-    consulted BEFORE these keys are used.
+    The space was split by the token header's PRESENCE, so an unauthenticated caller reached
+    the operators' budget with `X-Pree-Token: anything`. Splitting by the token's VALIDITY
+    fixed that and made refusal an oracle: after a peer saturated its unauthenticated bucket, a
+    wrong guess returned 429 and the right token returned 200, so a guessing run read the answer
+    off the status code at about 53,000 attempts a minute. Bounding wrong guesses per peer
+    closed the oracle and handed an unauthenticated caller a denial of service against the whole
+    watch floor: twenty wrong tokens from anywhere on the internet locked out every operator,
+    because behind the platform ingress they all present one address. That is strictly worse
+    than what it replaced.
+
+    So there is one bucket per peer and the token plays no part in choosing it. A saturated peer
+    is refused identically whether its token is right or wrong, which removes the oracle and
+    restores the premise the token-length floor is calculated from: 240 attempts a window. The
+    residual is that operators behind a shared ingress share a bucket with everyone else at that
+    address, which is recorded in the security policy as an accepted risk and was accepted long
+    before any of this. A control that has to be repaired twice and is worse each time is a
+    control that should not exist.
+
+    A forwarded request is charged to the fold AND to the socket peer, so a header can only ever
+    reduce a caller's allowance. That part has held and stays.
     """
-    space = "auth" if _is_authenticated(request, config) else "unauth"
     peer = _peer_key(request)
-    keys = [f"{space}:{peer}"]
+    keys = [peer]
     if peer != "forwarded":
         return tuple(keys)
-    # A forwarded request is charged to the fold AND to the socket peer, so a header can only
-    # ever reduce an allowance. Both live in the same space, so switching space cannot escape
-    # either: the guessing budget below is what stops that.
     client = request.client
-    keys.append(f"{space}:socket:{client.host if client else 'unknown'}")
+    keys.append(f"socket:{client.host if client else 'unknown'}")
     return tuple(keys)
-
-
-def _guessing_budget_spent(request: Request, config: Config, failures: RateLimiter) -> bool:
-    """Has this peer spent its budget of wrong tokens? Charged before validity is used.
-
-    Deciding the rate-limit bucket by the token's validity fixed one defect and created a
-    worse one: refusal itself became a free oracle. Once a peer saturated its `unauth:` bucket
-    with wrong guesses, every wrong guess landed in the saturated bucket and returned 429 while
-    the RIGHT token landed in a fresh `auth:` bucket and returned 200, so the caller could keep
-    guessing at full speed and read the answer off the status code. Measured: 2,666
-    distinguishable guesses in three seconds, about 53,000 a minute, against the 240 a minute
-    that config.py asserts and uses to justify the token length floor.
-
-    So a peer gets a bounded number of WRONG tokens, counted separately, and once that budget
-    is spent every token-bearing request from that peer is refused whether the token is right
-    or wrong. Wrong and right become indistinguishable again, which is the property the floor
-    calculation depends on.
-
-    Charged on the socket peer, never on the fold: a caller must not be able to spend someone
-    else's guessing budget by naming a forwarding header, and must not be able to escape its
-    own by adding one.
-    """
-    if request.headers.get(_TOKEN_HEADER) is None:
-        return False
-    client = request.client
-    peer = client.host if client else "unknown"
-    key = f"guess:{peer}"
-    # ASK first, without charging. Charging every token-bearing request to the failure budget
-    # would lock out a legitimate operator who simply made more than AUTH_FAILURE_LIMIT ordinary
-    # requests in a window, which is a denial of service dressed as a control. The question and
-    # the charge have to be separable, which is why RateLimiter.spent exists.
-    if failures.spent(key):
-        return True
-    if not _is_authenticated(request, config):
-        failures.allow(key)
-    return False
 
 
 def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
@@ -593,7 +549,7 @@ def register_api_routes(
         x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
     ) -> AssessResponse:
         """Score one candidate against one protected asset, then persist and audit it."""
-        refused = _first_refused(fine, _limit_keys(request, config))
+        refused = _first_refused(fine, _limit_keys(request))
         if refused is not None:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -697,6 +653,7 @@ def register_cors(
     config: Config,
     audit_log: logging.Logger,
     refuse_over_limit: Callable[[Request], Response | None],
+    meter_preflight: Callable[[Request], Response | None],
 ) -> None:
     """Register CORS and the layer that normalises and meters what CORS answers itself.
 
@@ -731,8 +688,26 @@ def register_cors(
             worker, from an unauthenticated caller: the exact class of amplification the
             bounded audit lines exist to close, on the one path nothing counted.
             """
-            if request.method == "OPTIONS":
-                over = refuse_over_limit(request)
+            # A GENUINE preflight only: Origin and Access-Control-Request-Method both present
+            # is exactly the shape CORSMiddleware answers itself without calling down, so it is
+            # exactly the shape the coarse limiter below never sees. A bare OPTIONS with an
+            # Origin and no requested method falls through to the routes and IS metered there;
+            # metering it here as well halved its allowance, 119 of 200 admitted against a
+            # documented 240.
+            if request.method == "OPTIONS" and {
+                "origin",
+                "access-control-request-method",
+            } <= {name.lower() for name in request.headers}:
+                # EVERY preflight, on every path. `refuse_over_limit` returns None for the
+                # liveness paths and the storage probe before it meters, so preflights on those
+                # six paths stayed uncounted while the audit line below was written anyway:
+                # measured, 1,200 refused preflights across /healthz, / and /healthz/storage
+                # returned 400 each with nothing counting them, and eight threads grew the log
+                # by 435,200 bytes in 3.18 seconds, about 8.2 MB a minute per worker. The
+                # exemption exists so the platform's own probes are never throttled, and the
+                # platform probes with GET, never with a cross-origin preflight, so metering
+                # OPTIONS regardless of path costs the platform nothing.
+                over = meter_preflight(request)
                 if over is not None:
                     return over
             response = await call_next(request)
@@ -740,6 +715,15 @@ def register_cors(
                 return response
             if request.method != "OPTIONS" or "origin" not in request.headers:
                 return response
+            if request.url.path in UNMETERED_PATHS:
+                # A preflight against a path that touches nothing gets the contract but not the
+                # audit line. Auditing it was 45% of the bytes that flood wrote, on the channel
+                # the forensic trail lives in, for an event that reveals nothing: a cross-origin
+                # preflight to /healthz is refused whoever sends it.
+                return JSONResponse(
+                    {"error": GENERIC_CLIENT_ERROR},
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                )
             # There is no "leave a Connection: close response alone" branch here, and there
             # was one for a while. It was unreachable, because FrameGuard sits outside this
             # layer and answers an ambiguously framed request before it arrives, and an
@@ -774,7 +758,6 @@ def create_app(
     prober: StorageProber | None = None,
     global_limiter: RateLimiter | None = None,
     actor_limiter: RateLimiter | None = None,
-    failure_limiter: RateLimiter | None = None,
 ) -> FastAPI:
     """Build the app from injected dependencies. Does not listen."""
     audit_log = logger or build_logger()
@@ -785,7 +768,6 @@ def create_app(
     fine = actor_limiter or RateLimiter(ACTOR_LIMIT, ACTOR_WINDOW_SECONDS)
     # Wrong tokens per peer, counted separately from traffic so a legitimate operator's normal
     # request rate can never exhaust it and a guessing run cannot hide inside it.
-    auth_failures = failure_limiter or RateLimiter(AUTH_FAILURE_LIMIT, AUTH_FAILURE_WINDOW_SECONDS)
     # Holds the last observed storage state so a change of state can be logged once, rather
     # than every probe restating it. A pod the platform later kills still leaves a narrative.
     last_ready: dict[str, bool | None] = {"writable": None}
@@ -828,19 +810,9 @@ def create_app(
     # defect was: the check lived in the innermost layer and CORS answered above it. ---
     app.add_middleware(BodySizeLimit)
 
-    def _refuse_over_limit(request: Request) -> Response | None:
+    def _charge_coarse(request: Request) -> Response | None:
         """Charge the coarse limiter, and refuse if any of the request's buckets is over."""
-        if request.url.path in UNMETERED_PATHS:
-            return None
-        if _guessing_budget_spent(request, config, auth_failures):
-            # Deliberately the same 429 a rate limit gives, with no hint that the reason was a
-            # wrong token. Answering differently here would rebuild the oracle this closes.
-            return JSONResponse(
-                {"error": RATE_LIMITED_ERROR},
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                headers={"Retry-After": str(int(AUTH_FAILURE_WINDOW_SECONDS))},
-            )
-        refused = _first_refused(coarse, _limit_keys(request, config))
+        refused = _first_refused(coarse, _limit_keys(request))
         if refused is None:
             return None
         return JSONResponse(
@@ -848,6 +820,22 @@ def create_app(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             headers={"Retry-After": str(coarse.retry_after_seconds(refused))},
         )
+
+    def _refuse_over_limit(request: Request) -> Response | None:
+        """The metered-path entry point: exempt the platform's probes, then charge."""
+        if request.url.path in UNMETERED_PATHS:
+            return None
+        return _charge_coarse(request)
+
+    def _meter_preflight(request: Request) -> Response | None:
+        """A preflight is charged on EVERY path, exemption or not.
+
+        The exemption exists so the platform's own probes are never throttled, and the platform
+        probes with GET. A cross-origin OPTIONS to /healthz is not a platform probe and is
+        refused whoever sends it, so counting it costs the platform nothing and closes the last
+        uncounted unauthenticated path.
+        """
+        return _charge_coarse(request)
 
     @app.middleware("http")
     async def coarse_rate_limit(
@@ -871,7 +859,7 @@ def create_app(
     # hardening headers are registered after this and are therefore outermost. ---
     # Fail-closed by construction: only the configured origin, and load_config refuses to
     # start on a wildcard origin with a token, so by here the origin is absent or safe.
-    register_cors(app, config, audit_log, _refuse_over_limit)
+    register_cors(app, config, audit_log, _refuse_over_limit, _meter_preflight)
 
     # --- second-outermost: the framing guard. It has to be above CORS, because Starlette
     # answers a preflight inside the CORS middleware without calling down, so a preflight

@@ -412,3 +412,27 @@ Sixteenth security review, seven majors:
 ● The base digest lived in an `ARG`, so `--build-arg` could swap it past the pinning guard.
 ● Production could run with credentials against an `http://` origin. Non-https is refused.
 ● The `cors_reject` audit misstated its cause for every 400 on a preflight.
+
+Seventeenth security review, four majors:
+
+● The guessing budget added last round was an unauthenticated denial of service against every
+  operator: twenty wrong tokens from anywhere locked out the whole watch floor for the window,
+  because behind the ingress they all present one address. The fix is a deletion. There is one
+  rate-limit key space, the token plays no part in choosing it, and three rounds of splitting it
+  are recorded in accepted risk 4 along with the residual.
+● The behavioural image check failed for the second round running: the pip pattern was anchored
+  on `(^|/)opt/`, but `docker export` writes member names relative and `tar -tv` puts the mode
+  first, so it could not match a single line and printed its success message every run. It now
+  reads the last field, covers `site-packages/pip`, and has three positive controls.
+● The suid sweep guard fell for the sixth round, to one redundant character: `//usr/bin/find`,
+  `/usr//bin/find`, `WORKDIR /usr/./bin`, and `ENV`-substituted destinations. Destinations are
+  slash-collapsed and normalised, and a destination containing a variable is refused.
+● Preflight metering skipped the six exempt paths while still auditing them: 8.2 MB of log a
+  minute per worker, unauthenticated. Every preflight is metered now; probe paths get the
+  contract without the audit line.
+● The token guard's docstring claimed a property it does not have. The number side needs no
+  table; the size-word side is still a denylist, and that is now written down.
+● Four packaging checks re-ran `unzip` inside a pipeline whose failure reads as a pass.
+● The setuid parse had no positive control; `RateLimiter.spent` grew the table from questions;
+  a non-preflight `OPTIONS` was metered twice; and the image listing leaked to the system temp
+  directory on failure paths.

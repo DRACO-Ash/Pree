@@ -83,7 +83,9 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   # is trusted to report on it. Every check names the tool that must produce output, so silence
   # is a failure rather than a pass.
   CONTAINER=$(docker create pree:simulated) || { echo "image: docker create failed" >&2; exit 1; }
-  LISTING=$(mktemp)
+  # Inside $WORK, so the EXIT trap removes it on every failure path. Outside it, a full
+  # filesystem listing of the image leaked into the system temp directory on each failure.
+  LISTING="$WORK/image-listing.txt"
   if ! docker export "$CONTAINER" | tar -tv > "$LISTING"; then
     echo "image: could not export the built filesystem for inspection" >&2
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -91,14 +93,28 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   fi
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
-  # Positive control FIRST: if the listing is short, the export failed quietly and every
-  # assertion below would pass by saying nothing.
+  # Positive controls FIRST, and there are three, because the previous version proved only that
+  # the listing was long. A check whose pattern cannot match anything prints its success message
+  # unconditionally, which is exactly how the pip assertion below was dead: `docker export`
+  # writes RELATIVE member names, so a pattern anchored on `(^|/)opt/` could never fire.
   ENTRIES=$(wc -l < "$LISTING")
   if [ "$ENTRIES" -lt 1000 ]; then
     echo "image: the exported listing has only $ENTRIES entries, so it did not export" >&2
     exit 1
   fi
-  echo "image: exported $ENTRIES filesystem entries for inspection"
+  # The mode column must parse, or the setuid scan reads silence from an unparseable listing.
+  MODED=$(awk 'length($1) == 10 && $1 ~ /^[-dlbcps]/ { n++ } END { print n + 0 }' "$LISTING")
+  if [ "$MODED" -lt 1000 ]; then
+    echo "image: only $MODED of $ENTRIES lines carry a parseable mode column" >&2
+    exit 1
+  fi
+  # And the pip pattern must be able to match SOMETHING: the venv the build creates is in the
+  # listing, so if this cannot be found the pattern is wrong and its silence means nothing.
+  if ! awk '{ print $NF }' "$LISTING" | grep -q '^opt/venv/'; then
+    echo "image: the pip pattern's own path prefix is absent, so the scan below is dead" >&2
+    exit 1
+  fi
+  echo "image: exported $ENTRIES entries, $MODED with a parseable mode, venv path present"
 
   echo "--- image: no setuid or setgid bits ---"
   # tar -tv renders the mode as e.g. -rwsr-xr-x. s or S in the user or group execute position
@@ -111,11 +127,17 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   echo "image: no setuid or setgid bits"
 
   echo "--- image: the package manager does not ship ---"
-  if grep -E '(^|/)(opt/venv/bin|usr/local/bin)/pip' "$LISTING" >&2; then
-    echo "image: pip is present in the shipped filesystem (listed above)" >&2
+  # The LAST field, unanchored. tar -tv puts the mode first and docker export writes member
+  # names relative, so `opt/venv/bin/pip3` is preceded by a space and never by `/` or
+  # start-of-line: the anchored pattern this replaces could not match a single line, and the
+  # check printed its success message on every run. The library directory is covered too, not
+  # only the entry points, because site-packages/pip is what the policy scan reads.
+  if awk '{ print $NF }' "$LISTING" \
+       | grep -E '(^|/)pip[0-9.]*$|/site-packages/(pip|setuptools|pkg_resources)/' >&2; then
+    echo "image: pip or setuptools is present in the shipped filesystem (listed above)" >&2
     exit 1
   fi
-  echo "image: no pip in the shipped filesystem"
+  echo "image: no pip or setuptools in the shipped filesystem"
 
   echo "--- image: runs as the non-root numeric user ---"
   # The one check that must run INSIDE the image, because an identity is a runtime property.
@@ -131,7 +153,6 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     exit 1
   fi
   echo "image: runs as $IDENTITY"
-  rm -f "$LISTING"
 else
   # An honest non-zero skip, never a green pass. Continuous integration is the binding source
   # of truth for this leg, and it is the ONLY place the three image assertions above can run,

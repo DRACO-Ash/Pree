@@ -99,19 +99,6 @@ class RateLimiter:
             bucket.append(now)
             return self._evict_if_needed(now, key)
 
-    def spent(self, key: str) -> bool:
-        """Is this key at its limit, WITHOUT charging it?
-
-        Needed because one caller has to ask the question without answering it. The
-        authentication-failure budget must refuse a correct token from a peer that has burned
-        its guesses, or refusal becomes an oracle again; but charging every token-bearing
-        request to that budget would lock out a legitimate operator making more than the limit
-        of ordinary requests in a window. Asking and charging have to be separable.
-        """
-        with self._guard:
-            bucket = self._prune(key, self._clock())
-            return len(bucket) >= self._limit
-
     def retry_after_seconds(self, key: str) -> int:
         """Seconds until the oldest hit in the window expires, for the Retry-After header.
 
