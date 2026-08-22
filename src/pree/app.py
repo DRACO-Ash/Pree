@@ -106,14 +106,15 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 # between them), which is 145 characters, so 96 truncated a real key out of every 401 and 503
 # record and destroyed the diagnosis it exists to give.
 #
-# The bound is on CHARACTERS and the cost WAS in bytes: the path arrives percent-decoded, and
-# json.dumps rendered one astral code point as a 12-byte surrogate escape, so 160 characters could
-# cost nearly 2 KB. sanitise_log_path removes that amplification rather than bounding it: its
-# charset is re.ASCII, so nothing multi-byte survives. What is ASSERTED, in
-# test_a_long_request_path_cannot_write_an_unbounded_audit_line, is `path.isascii() and
-# path.isprintable()` per record plus a whole-line ceiling of MAX_LOGGED_PATH + 256 bytes; one
-# byte per character is the consequence of those two, not a separate assertion. An earlier
-# version of this comment claimed the test asserted the byte ratio directly, and it did not.
+# The bound is on CHARACTERS and the cost WAS in bytes: the decoded path this field used to carry
+# could hold an astral code point, which json.dumps renders as a 12-byte surrogate escape, so 160
+# characters cost nearly 2 KB. sanitise_log_path removes that amplification rather than bounding
+# it: it escapes every byte outside a permitted ASCII set, so the output is ASCII by construction.
+# What is ASSERTED, in test_a_long_request_path_cannot_write_an_unbounded_audit_line, is
+# `path.isascii() and path.isprintable()` per record plus a whole-line ceiling of
+# MAX_LOGGED_PATH + 256 bytes; one byte per character is the consequence of those two, not a
+# separate assertion. An earlier version of this comment claimed the test asserted the byte ratio
+# directly, and it did not.
 MAX_LOGGED_PATH = 160
 # The store key's shape, enforced at the boundary rather than assumed. Two identifiers of at
 # most 64 characters and the colon between them.
@@ -338,6 +339,25 @@ def _first_refused(limiter: RateLimiter, keys: tuple[str, ...]) -> str | None:
     return refused
 
 
+def _raw_target(request: Request) -> bytes:
+    """The request target as the client sent it, in bytes, for the audit `path` field.
+
+    ONE accessor for all five call sites, because five copies of the fallback are five places for
+    it to differ, and the fallback is the interesting half.
+
+    `raw_path` is an ASGI extension rather than a guaranteed key: uvicorn and Starlette's TestClient
+    both set it, and a server that does not leaves the decoded path as the only thing available.
+    Falling back to it is a loss of injectivity, not of safety, because `sanitise_log_path` escapes
+    whatever it is given; the record is then as good as the decoded path allows and no worse than
+    every version of this field before this one. Encoded UTF-8 so the fallback and the normal path
+    hand the scrub the same type.
+    """
+    raw = request.scope.get("raw_path")
+    if isinstance(raw, bytes):
+        return raw
+    return request.url.path.encode("utf-8", "surrogatepass")
+
+
 def _peer_key(request: Request) -> str:
     """The socket peer, folded to one literal when any forwarding header is present."""
     if _FORWARD_HEADERS & {name.lower() for name in request.headers}:
@@ -393,7 +413,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "auth_reject",
-                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
                     "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
@@ -418,7 +438,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "validation_reject",
-                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
                     "errors": [
                         {
                             # SCRUBBED, not merely capped: each part is a caller-supplied field
@@ -478,7 +498,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "http_reject",
-                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
                     "status": exc.status_code,
                     "reason": str(exc.detail)[:MAX_LOGGED_REASON],
                 },
@@ -503,7 +523,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
             json.dumps(
                 {
                     "kind": "store_error",
-                    "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
+                    "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
                     "reason": str(exc)[:MAX_LOGGED_REASON],
                 },
                 separators=(",", ":"),
@@ -798,7 +818,7 @@ def register_cors(
                 json.dumps(
                     {
                         "kind": "cors_reject",
-                        "path": sanitise_log_path(request.url.path, MAX_LOGGED_PATH),
+                        "path": sanitise_log_path(_raw_target(request), MAX_LOGGED_PATH),
                         # The ACTUAL reason. This field said origin_allowed=false for every 400
                         # on a preflight, including one raised for the allowed origin by a
                         # different control, so the only record of the event misstated it.

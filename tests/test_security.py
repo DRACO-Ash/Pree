@@ -10,6 +10,7 @@ import pytest
 
 from pree.security import (
     MAX_ACTOR_LENGTH,
+    UNPRINTABLE_MARKER,
     AuthError,
     authorise,
     sanitise_actor,
@@ -122,65 +123,89 @@ def test_actor_sanitisation_caps_the_length() -> None:
     assert len(sanitise_actor("a" * 500)) == MAX_ACTOR_LENGTH
 
 
-def test_the_path_scrub_maps_distinct_paths_to_distinct_records() -> None:
-    """Deleting a refused character is not injective, and the collisions landed on real routes.
+def test_the_path_scrub_is_injective_over_every_single_byte() -> None:
+    """GENERATED, not hand-picked, because the hand-picked list is what let the last one through.
 
-    Measured by the security gate: `GET /v1/,assess` was audited as `path:"/v1/assess"` and
-    `GET /v1/assessments/a:b,c` as `path:"/v1/assessments/a:bc"`. Both name a route the caller
-    never requested, needing no token, so an unauthenticated caller could put a chosen route into
-    the audit trail and an analyst reading it would be misled. Escaping restores injectivity.
+    The previous version listed the characters I happened to think of and claimed in its docstring
+    that "every refused ASCII character in the charset appears at least once". That was false: it
+    omitted eighteen of them and every control character, and one of the omissions was the defect.
+    Space was the single whitespace character the charset permitted, so it survived the escape and
+    was then removed by a `.strip()` two functions away, and `GET /v1/assessments/a:b%20` was
+    audited byte-identically to `GET /v1/assessments/a:b`. A generated probe finds that in one line.
 
-    This asserts the PROPERTY over a set of inputs that collided, not a table of expected strings:
-    a table would be satisfied by editing the table, and the defect was a mapping, not a value.
+    Every byte, in all three positions, because the defect was positional: `.strip()` removed a
+    leading or trailing space and left an embedded one alone, so an embedded-only probe would have
+    passed.
     """
-    # Each pair is a colliding input and the legitimate path it used to be recorded as. Every
-    # refused ASCII character in the charset appears at least once.
-    colliding = [
-        "/v1/,assess",
-        "/v1/assess",
-        "/v1/assessments/a:b,c",
-        "/v1/assessments/a:bc",
-        "/diagnostics;",
-        "/diagnostics",
-        "/health<z>",
-        "/healthz",
-        "/ping&",
-        "/ping",
-        "/v1/ass+ess",
-        "/v1/assess" + "\\",
-        "/v1/" + chr(0x1D400) + "assess",
-        "/v1/" + chr(0x1D401) + "assess",
-    ]
-    scrubbed = [sanitise_log_path(path, 160) for path in colliding]
-    assert len(set(scrubbed)) == len(colliding), (
-        "two distinct paths produced one audit record: "
-        f"{sorted({out for out in scrubbed if scrubbed.count(out) > 1})}"
+    generated = [b"/v1/assessments/a:b"]
+    for byte in range(256):
+        char = bytes([byte])
+        generated.append(char + b"/v1/assessments/a:b")
+        generated.append(b"/v1/assessments/a:b" + char)
+        generated.append(b"/v1/assessments/a:" + char + b"b")
+    # DEDUPED by input, because injectivity is a claim about distinct inputs and this generator
+    # produces some target twice: appending `b` and embedding `b` both give `.../a:bb`. Comparing
+    # without deduping reports that as a collision, which would be the test lying in the safe
+    # direction and would still have to be explained away by the next reader.
+    probes = sorted(set(generated))
+    scrubbed = [sanitise_log_path(probe, 160) for probe in probes]
+    collisions = sorted({out for out in scrubbed if scrubbed.count(out) > 1})
+    assert not collisions, (
+        f"distinct request targets produced one audit record, so a caller can name a route they "
+        f"never requested: {collisions}"
     )
-    for path, out in zip(colliding, scrubbed, strict=True):
-        assert out.isascii() and out.isprintable(), f"{path!r} scrubbed to {out!r}"
+    for probe, out in zip(probes, scrubbed, strict=True):
+        assert out.isascii() and out.isprintable(), f"{probe!r} scrubbed to {out!r}"
         assert len(out) <= 160
 
 
-def test_the_path_scrub_escapes_a_literal_percent_so_the_escape_is_unambiguous() -> None:
-    """`%` is the introducer, so it cannot also pass through, or the mapping is ambiguous again.
+def test_the_path_scrub_never_deletes_and_never_strips() -> None:
+    """The two mechanisms that produced the two collision rounds, asserted directly.
 
-    Starlette hands over an already-decoded path, so a literal `%` can only have arrived as `%25`
-    and is written back as exactly that. No route this app serves contains one, so nothing
-    legitimate is affected; what this closes is `/v1/%2Cassess` being indistinguishable from the
-    escape of `/v1/,assess`.
+    Deletion is not injective and `.strip()` is a deletion at the ends. Neither belongs in a field
+    whose whole job is to name what was requested, and asserting the mapping alone would leave the
+    next reader free to reintroduce either as a "tidy-up".
     """
-    assert sanitise_log_path("/v1/%2Cassess", 160) == "/v1/%252Cassess"
-    assert sanitise_log_path("/v1/,assess", 160) == "/v1/%2Cassess"
-    assert sanitise_log_path("/v1/%2Cassess", 160) != sanitise_log_path("/v1/,assess", 160)
+    assert sanitise_log_path(b"/v1/,assess", 160) == "/v1/%2Cassess"
+    assert sanitise_log_path(b"/v1/assess ", 160) == "/v1/assess%20"
+    assert sanitise_log_path(b" /v1/assess", 160) == "%20/v1/assess"
+    assert sanitise_log_path(b"\t/v1/assess\n", 160) == "%09/v1/assess%0A"
+    # And the escape introducer cannot pass through, or the mapping is ambiguous again.
+    assert sanitise_log_path(b"/v1/%assess", 160) == "/v1/%25assess"
+    assert sanitise_log_path(b"/v1/%25assess", 160) == "/v1/%2525assess"
+
+
+def test_the_path_scrub_takes_the_raw_target_so_decoding_cannot_alias() -> None:
+    """Decoding is lossy, and no scrub downstream of it can undo that.
+
+    Three collisions that survive any charset applied to the DECODED path, which is why the field
+    takes the wire bytes instead: `urllib.parse.unquote` leaves an invalid escape intact, so
+    `/v1/%assess` and `/v1/%25assess` decode identically; and `/v1/assessments/a%2Fb:c` decodes to
+    `/v1/assessments/a/b:c`, which reads as a route of a different shape. A comment in this project
+    once claimed a literal `%` "can only have arrived as `%25`", and that was false.
+    """
+    for first, second in (
+        (b"/v1/%assess", b"/v1/%25assess"),
+        (b"/v1/assessments/a%2Fb:c", b"/v1/assessments/a/b:c"),
+        (b"/v1/assessments/a:b%20", b"/v1/assessments/a:b"),
+    ):
+        assert sanitise_log_path(first, 160) != sanitise_log_path(second, 160), (
+            f"{first!r} and {second!r} share one audit record"
+        )
 
 
 def test_the_path_scrub_is_not_claimed_injective_above_its_cap() -> None:
     """The honest limit, asserted so it is not rediscovered as a surprise.
 
-    Truncation cannot be injective. Two paths agreeing on their first `limit` characters after
+    Truncation cannot be injective. Two targets agreeing on their first `limit` characters after
     escaping still produce one record, and the docstring says so rather than implying a property
     the function does not have.
     """
-    first = "/v1/" + "a" * 200 + "one"
-    second = "/v1/" + "a" * 200 + "two"
+    first = b"/v1/" + b"a" * 200 + b"one"
+    second = b"/v1/" + b"a" * 200 + b"two"
     assert sanitise_log_path(first, 160) == sanitise_log_path(second, 160)
+
+
+def test_the_path_scrub_marks_an_empty_target_rather_than_logging_nothing() -> None:
+    """An empty `path` field reads as an absent one, which is a different fact."""
+    assert sanitise_log_path(b"", 160) == UNPRINTABLE_MARKER

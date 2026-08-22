@@ -936,3 +936,31 @@ Security re-review of the round above, one major and three minors:
   the sweep cleared nothing: a symlink cannot carry a setuid bit. The argument to each `-type` is
   pinned as `["f", "d"]`. The register's claim that the property "catches a change that keeps the
   text plausible" was an over-claim about exactly this change, and is corrected where it was made.
+
+Third security review of the audit layer, one major and five minors:
+
+● The audited `path` field now takes the RAW request target off the wire, not the decoded path, and
+  escapes every byte outside a permitted ASCII set. Two earlier fixes were defeated for the same
+  underlying reason: space was the one whitespace character the charset permitted, so it survived
+  the escape and was then removed by a `.strip()` two functions away, and
+  `GET /v1/assessments/a:b%20` was audited byte-identically to `GET /v1/assessments/a:b`; and
+  decoding aliases whatever runs afterwards, so `/v1/%assess` shared a record with
+  `/v1/%25assess` and `/v1/assessments/a%2Fb:c` read as `/v1/assessments/a/b:c`. Injective by
+  construction up to the cap, with no strip anywhere and the truncation limit stated.
+● The probe set is GENERATED, every byte in three positions, because the hand-picked list is what
+  let the space through while claiming to cover every refused character. And the property is
+  asserted end to end on real records, because for three rounds the sanitiser was injective in
+  isolation while the application handed it an aliased input.
+● `VOLUME` and `STOPSIGNAL` are refused in every stage, not only the shipped one, and `USER` before
+  the shipped stage. `VOLUME /usr/bin` one line above the suid sweep left the whole suite green: the
+  classic builder mounts a VOLUME'd directory for later RUNs, so `-xdev` skips it and every setuid
+  binary in the base image survives; BuildKit makes it a no-op instead. Builder-dependent, which is
+  why the refusal belongs in the text.
+● The astral shape reaches the logged error window only because pydantic reports declared fields
+  before extras. Asserted rather than assumed, so a pydantic bump cannot silently re-open the
+  previous round's major.
+● Corrected: "all three shapes sit inside the logged window" (the tiny flood is counted, not
+  logged); the path value pin admitted a space it can no longer emit; the measured error-count
+  maximum was 4,696, not 4,402.
+● Recorded rather than fixed: the actor label and the rejected field name still alias, deliberately,
+  because both are read by a human and neither names a route.

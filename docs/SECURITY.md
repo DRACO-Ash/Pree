@@ -145,7 +145,9 @@ the assessment store.
 | Every ENV and ARG name is on an allowlist with a pinned value, so no credential and no platform default can be baked | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | The ENV allowlist cannot admit a platform-injected or credential-shaped name | `Dockerfile` | `test_the_environment_allowlist_cannot_admit_a_platform_or_credential_name` |
 | The suid sweep narrows by nothing and clears both bits, as a property | `Dockerfile` | `test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits` |
+| Two distinct request targets cannot share one audit record, below the truncation cap | `src/pree/security.py` | `test_two_distinct_unauthenticated_requests_cannot_share_one_audit_record`, `test_the_path_scrub_is_injective_over_every_single_byte` |
 | The audited path keeps its separator and carries no control character | `src/pree/app.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
+| A stage before the shipped one cannot mount over or de-privilege what the suid sweep visits | `Dockerfile` | `test_no_stage_declares_an_instruction_that_undoes_the_hardening` |
 | A refused preflight records whether the ORIGIN was allowed, by value | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 
 ## Deliberately accepted risks
@@ -1992,8 +1994,9 @@ because the pattern is now the finding.
   the test asserted: the bound held and the assertion about it did not. Split by PROVENANCE, which
   is the distinction that was missing. `_UNSAFE_LOG_CHARS` stays Unicode for the actor label,
   deliberately, because an operator's name may legitimately be non-Latin and the 64-character cap
-  bounds the cost. `_UNSAFE_ASCII_CHARS` and `_UNSAFE_PATH_CHARS` are `re.ASCII`, because that data
-  is caller-supplied. Reverting the path charset to Unicode turns
+  bounds the cost. `_UNSAFE_ASCII_CHARS` is `re.ASCII`, because that data is
+  caller-supplied, and the path charset was too (`_UNSAFE_PATH_CHARS`, since replaced entirely by
+  the byte-level escape a later review forced). Reverting the path charset to Unicode turned
   `test_a_long_request_path_cannot_write_an_unbounded_audit_line` red, and the per-record assertion
   is `path.isascii() and path.isprintable()`. **The claim that followed here, "astral inputs are in
   both bound tests", was FALSE**, and the next review found it: they were in one. The astral probe
@@ -2039,6 +2042,62 @@ is in the layer that is supposed to prove it, and most are in the previous round
 is exploitable by an internet client against the tree as it stands today. All of it lowers the cost
 of the next regression to roughly one line. Those are different statements from a pass, and the
 second is the one that should govern how much a reader trusts a green loop here.
+
+### Third security review of the audit layer: one field, defeated three ways
+
+Three rounds built the audited `path` field on the DECODED request path, and each round's fix was
+defeated by the next review. The rounds are worth reading together, because the lesson is not in any
+one of them.
+
+● **Round one deleted refused characters.** Deletion is not injective, and the collisions landed on
+  legitimate routes: `GET /v1/,assess` was audited as `path:"/v1/assess"`, and
+  `GET /v1/assessments/a:b,c` as `path:"/v1/assessments/a:bc"`. Unauthenticated, no token.
+● **Round two escaped instead of deleting, and left space in the permitted set.** Space was the one
+  whitespace character the charset allowed, so it survived the escape and was then removed by a
+  `.strip()` two functions away: `GET /v1/assessments/a:b%20` was audited byte-identically to
+  `GET /v1/assessments/a:b`. The guarantee this round wrote into the code, the tests, the changelog
+  and this register - that a path shorter than the cap cannot be made to read as a different one -
+  was false when it was written.
+● **And the decode itself aliases, whichever charset runs afterwards.** `urllib.parse.unquote`
+  leaves an invalid escape intact, so `/v1/%assess` and `/v1/%25assess` arrive identical; and
+  `/v1/assessments/a%2Fb:c` decodes to `/v1/assessments/a/b:c`, which reads as a route of a
+  different shape. A comment claimed a literal `%` "can only have arrived as `%25`". False.
+
+**The fix is upstream of all three.** The field now takes `raw_path`, the request target as bytes off
+the wire, and escapes every byte outside a permitted ASCII set. Injective by construction up to the
+truncation cap, with no `.strip()` anywhere in the path, and the honest limit stated: truncation
+cannot be injective. Where an ASGI server omits `raw_path`, one accessor falls back to the decoded
+path, which loses injectivity and not safety, and that branch is exercised.
+
+**Two changes to how this is asserted, which matter more than the fix.** The probe set is now
+GENERATED - every byte 0x00 to 0xFF in leading, trailing and embedded position - because the
+hand-picked list is what let the space through, and its docstring claimed to cover "every refused
+ASCII character" while omitting eighteen of them and every control character. And the property is
+asserted END TO END, on records from real requests, because for three rounds the sanitiser was
+injective in isolation while the application handed it an aliased input: a unit test on the
+sanitiser could not have found any of this.
+
+Four minors closed alongside:
+
+● The `VOLUME` refusal was scoped to the shipped stage while the suid sweep runs in `prep`, so
+  `VOLUME /usr/bin` one line above the sweep left all 319 tests green. Under the classic builder a
+  VOLUME'd directory is mounted for later RUNs, so writes are discarded and `-xdev` skips it, and
+  python:3.12-slim keeps `su`, `passwd`, `chfn`, `chsh`, `gpasswd`, `newgrp`, `mount` and `umount`
+  exactly there; under BuildKit it is a no-op. That builder dependence is why the refusal has to be
+  in the text: the outcome cannot be established from this repository. `VOLUME` and `STOPSIGNAL` are
+  now refused in every stage, and `USER` before the shipped one.
+● The astral shape sits in the logged error window only because pydantic reports declared-field
+  errors before extras. Stable under the hash-locked pin, and a bump could move it out and silently
+  re-open the round before this one, so the test now asserts an astral name is present rather than
+  assuming it.
+● "All three shapes sit inside the logged window" was false: the tiny flood is counted, not logged,
+  and earns its place that way. The `path` value pin still admitted a space it can no longer emit.
+  The measured error-count maximum was 4,402 and is 4,696, so the derived ceiling is loose by about
+  a sixth rather than a quarter.
+● Recorded rather than fixed: the actor label and the rejected field name still ALIAS, because both
+  are read by a human and `O%27Brien` costs that reader more than the aliasing costs anyone. Neither
+  names a route, which is what made the path's aliasing a finding and leaves these two a documented
+  limit.
 
 ## Not accepted, and why it is not a risk here
 

@@ -404,7 +404,14 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
         # THREE shapes at once, because each defeats a different bound, and body ORDER is
         # load-bearing: pydantic reports errors in body order and only the first
         # MAX_VALIDATION_ERRORS_LOGGED reach the record, so a shape appended after the tiny
-        # flood is outside the logged window and asserts nothing. All three sit inside it.
+        # flood is outside the logged window and asserts nothing.
+        #
+        # Which shapes are WHERE, measured rather than asserted in prose: the ten logged slots
+        # hold the two declared fields, the five astral names and three of the five long keys.
+        # The tiny flood is COUNTED and not logged, and it earns its place that way, by lifting
+        # `error_count` past the cap so deleting the cap logs all of them and the byte ceiling
+        # fires. A previous version of this comment said "all three sit inside it", which was
+        # false about the flood.
         #
         # Astral field NAMES are the shape this test did not have, and the omission cost a
         # major: with `sanitise_log_part` reverted to the Unicode charset in ONE line, twelve
@@ -434,6 +441,16 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
         assert record["error_count"] > MAX_VALIDATION_ERRORS_LOGGED, (
             "the request did not produce more errors than the cap, so the cap is untested"
         )
+        # The astral shape must actually BE in the logged window, or the assertion below is
+        # vacuous and nobody would know. Recorded by the security gate as a fragility rather than
+        # a defect: the astral names sit inside the window only because pydantic reports
+        # declared-field errors before extras, which is stable under the hash-locked pin today
+        # and could move under a bump, silently re-opening the hole this test exists to close.
+        # A single scrubbed astral name is one digit, the index that survives the scrub.
+        assert any(part.isdigit() for item in record["errors"] for part in item["loc"]), (
+            f"no astral field name reached the logged window, so the charset assertion below "
+            f"asserts nothing: {[item['loc'] for item in record['errors']]}"
+        )
         for item in record["errors"]:
             for part in item["loc"]:
                 assert len(part) <= MAX_ACTOR_LENGTH
@@ -445,6 +462,87 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
                 assert part.isascii() and part.isprintable(), (
                     f"a non-ASCII or control character survived into a logged field name: {part!r}"
                 )
+
+
+def test_two_distinct_unauthenticated_requests_cannot_share_one_audit_record(
+    tmp_path: Path,
+) -> None:
+    """END TO END, because the unit property held while the application still aliased.
+
+    Three rounds of this control were asserted on the sanitiser alone and defeated at the call
+    site: the sanitiser was injective and the application handed it a DECODED path, which aliases
+    before the sanitiser ever runs. `GET /v1/assessments/a:b%20` was audited byte-identically to
+    `GET /v1/assessments/a:b`, and `GET /v1/%assess` shared a record with `GET /v1/%25assess`, both
+    unauthenticated and needing no token. This drives real requests through the real handler and
+    compares the records, which is the only version of the assertion the call site cannot escape.
+    """
+    stream = io.StringIO()
+    logger = build_logger(stream)
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    targets = [
+        "/v1/assessments/a:b%20",
+        "/v1/assessments/a:b",
+        "/v1/%assess",
+        "/v1/%25assess",
+        "/v1/assessments/a%2Fb:c",
+        "/v1/assessments/a/b:c",
+        "/v1/,assess",
+        "/v1/assess",
+    ]
+    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
+        for target in targets:
+            bounded.get(target, headers={"x-pree-token": "wrong"})
+
+    logged = [
+        json.loads(line)["path"] for line in stream.getvalue().splitlines() if '"path"' in line
+    ]
+    assert len(logged) == len(targets), (
+        f"expected one audited record per request, got {len(logged)}: {logged}"
+    )
+    assert len(set(logged)) == len(targets), (
+        f"two distinct requests produced one audit record, so an unauthenticated caller can put a "
+        f"route they never requested into the trail: "
+        f"{sorted({path for path in logged if logged.count(path) > 1})}"
+    )
+    for path in logged:
+        assert path.isascii() and path.isprintable(), f"the logged path is not ASCII: {path!r}"
+
+
+def test_the_audited_path_falls_back_when_the_server_supplies_no_raw_target(
+    tmp_path: Path,
+) -> None:
+    """`raw_path` is an ASGI extension, not a guaranteed key, so the fallback is reachable code.
+
+    Asserted rather than assumed, because an unexercised fallback is where a crash waits: an
+    accessor that raises on a missing key would turn every audited rejection into a 500 under a
+    server that omits it. What the fallback loses is injectivity, not safety, and it is no worse
+    than every version of this field before the raw target was used.
+    """
+    stream = io.StringIO()
+    logger = build_logger(stream)
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+
+    class _StripRawPath:
+        def __init__(self, app: Any) -> None:
+            self._app = app
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] == "http":
+                scope.pop("raw_path", None)
+            await self._app(scope, receive, send)
+
+    store = JsonStore(config.data_dir)
+    store.seed()
+    app = create_app(config, store, logger=logger, prober=StorageProber(cache_seconds=0.0))
+    with TestClient(_StripRawPath(app)) as stripped:
+        refused = stripped.get("/diagnostics", headers={"x-pree-token": "wrong"})
+        assert refused.status_code == 401, refused.text
+
+    records = [json.loads(line) for line in stream.getvalue().splitlines() if '"path"' in line]
+    assert records, "the rejection was not audited when raw_path was absent"
+    assert records[0]["path"] == "/diagnostics", (
+        f"the fallback did not name the decoded path: {records[0]['path']!r}"
+    )
 
 
 def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path) -> None:
@@ -2463,7 +2561,7 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     # letter the scrub exists to strip and could not have caught the charset regression that
     # `test_a_long_request_path_cannot_write_an_unbounded_audit_line` did. A pin wider than what
     # the application can emit is not a pin.
-    "path": _Pattern(r"^(?a:[\w./%@:\- ]{1,160})$"),
+    "path": _Pattern(r"^(?a:[\w./%@:-]{1,160})$"),
     "reason": _Pattern(r"^[ -~]{0,512}$"),
     # Inside `validation_reject.errors`, which the flat scan never reached. `loc` echoes a
     # caller-supplied field name and the application scrubs each part, so the same derivation
@@ -2483,7 +2581,7 @@ ABSOLUTE_DURATION_CEILING_MS = 50
 # The smallest JSON a rejected field can be inside an object: `"a":1,` is six bytes, so a body
 # under MAX_BODY_BYTES cannot produce more than this many validation errors. Derived rather than
 # measured, because a measurement is a floor and a bound needs a ceiling; the honest maximum the
-# security gate could actually drive was 4,402, so this is loose by about a quarter rather than by
+# security gate could actually drive was 4,696, so this is loose by about a sixth rather than by
 # the six-fold factor MAX_BODY_BYTES gave it.
 MIN_BYTES_PER_REJECTED_FIELD = 6
 MAX_VALIDATION_ERROR_COUNT = MAX_BODY_BYTES // MIN_BYTES_PER_REJECTED_FIELD

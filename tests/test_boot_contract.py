@@ -1395,6 +1395,40 @@ def test_the_shipped_stage_declares_no_instruction_that_undoes_a_control() -> No
         assert not found, f"the shipped stage declares {unwanted} {found}"
 
 
+def test_no_stage_declares_an_instruction_that_undoes_the_hardening() -> None:
+    """The same refusal, EVERY stage, because the sweep does not run in the shipped one.
+
+    Scoping the VOLUME refusal to the final stage left a one-line neutering that the whole suite
+    passed: `VOLUME /usr/bin` immediately above the sweep. Under the classic builder a VOLUME'd
+    directory is mounted for subsequent RUNs, so writes to it are discarded and `-xdev` skips the
+    mount, and python:3.12-slim keeps its setuid binaries exactly there - `su`, `passwd`, `chfn`,
+    `chsh`, `gpasswd`, `newgrp`, `mount`, `umount`. Under BuildKit it is a no-op instead. That
+    builder dependence is precisely why the refusal has to be in the text: the outcome cannot be
+    established from this repository, and a rule that holds under one builder and not the other is
+    not a rule.
+
+    USER is refused in every stage before the shipped one for the same reason. A `USER 10001:10001`
+    above the sweep breaks the build rather than silently neutering it, so it is the cheaper
+    failure, but the sweep needs root to clear a bit it does not own and nothing said so.
+    """
+    instructions = _instructions()
+    shipped = max(i.stage for i in instructions)
+    for unwanted in ("VOLUME", "STOPSIGNAL"):
+        found = [(i.stage, i.argument) for i in instructions if i.keyword == unwanted]
+        assert not found, (
+            f"{unwanted} in ANY stage can change what a later RUN sees: under the classic builder "
+            f"a VOLUME'd directory is mounted for subsequent RUNs, so the suid sweep silently "
+            f"skips it. Found {found}"
+        )
+    early_user = [
+        (i.stage, i.argument) for i in instructions if i.keyword == "USER" and i.stage != shipped
+    ]
+    assert not early_user, (
+        f"a USER before the shipped stage drops the privilege the suid sweep needs to clear a bit "
+        f"it does not own: {early_user}"
+    )
+
+
 def test_the_pip_removal_targets_the_venv_the_build_actually_creates() -> None:
     """A removal aimed at a path that does not exist is a no-op the substring check accepted.
 
