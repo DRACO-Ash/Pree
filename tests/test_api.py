@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from fastapi import HTTPException, Request
+from fastapi import applications as fastapi_applications
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -1695,12 +1696,34 @@ EXPECTED_SERVED_ROUTES: dict[str, tuple[tuple[Any, ...], ...]] = {
 # `fastapi/applications.py` on one FastAPI version: a routine dependency bump would then print two
 # thirteen-row tuples for what may be a one-string change, and read to whoever did not write it as
 # a compromise rather than an upgrade. They are asserted STRUCTURALLY instead, below: exactly
-# `Route`, path in `EXPECTED_DOC_PATHS`, no gate. A forged documentation route must satisfy all
-# three, and what those paths actually serve is pinned by body and header at
-# `test_the_unauthenticated_paths_on_the_listener_disclose_nothing`.
+# `Route`, path in `EXPECTED_DOC_PATHS`, and an endpoint whose CODE comes from FastAPI's own file.
+# The third property is the load-bearing one: `gated` is computed only for an APIRoute, so it is
+# unconditionally False for a plain Route and asserts nothing, and `__module__` is an assignable
+# string that a forged endpoint simply set. What those paths serve is checked for the header
+# channel and for token absence at `test_the_unauthenticated_paths_on_the_listener_disclose_nothing`
+# and NOT for a body shape, because they serve HTML by design; an earlier version of this comment
+# claimed the body was pinned exactly, and it was not.
 EXPECTED_SERVED_ROUTES["production"] = EXPECTED_SERVED_ROUTES["development"]
 
 _STARLETTE_ROUTE_APP = "request_response.<locals>.app"
+
+
+def _endpoint_origin(endpoint: Any) -> str:
+    """Where an endpoint's CODE actually comes from, by code-object filename.
+
+    Not `__module__`, which is an assignable string: a forged `Route("/redoc", leak)` with
+    `leak.__module__ = "fastapi.applications"` landed in the framework branch of the inventory and
+    dumped the whole store as HTML to an unauthenticated caller with the suite green. A code
+    object's `co_filename` cannot be reassigned, and it survives a dependency bump, which is the
+    property the structural assertion needs.
+    """
+    code = getattr(endpoint, "__code__", None)
+    filename = getattr(code, "co_filename", "")
+    if filename == inspect.getsourcefile(app_module):
+        return "pree.app"
+    if filename == inspect.getsourcefile(fastapi_applications):
+        return "fastapi.applications"
+    return f"unrecognised:{filename}"
 
 
 def _served_inventory(app: Any) -> tuple[tuple[Any, ...], ...]:
@@ -1713,7 +1736,7 @@ def _served_inventory(app: Any) -> tuple[tuple[Any, ...], ...]:
                 type(route).__name__,
                 getattr(route, "path", None),
                 tuple(sorted((getattr(route, "methods", None) or set()) - {"OPTIONS"})),
-                getattr(endpoint, "__module__", None),
+                _endpoint_origin(endpoint),
                 getattr(endpoint, "__qualname__", None),
                 type(route) is APIRoute and "require_token" in _dependency_names(route),
             )
@@ -1777,6 +1800,11 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
                 )
             if env == "production":
                 assert not foreign, f"production serves routes outside pree.app: {foreign}"
+            else:
+                assert len(foreign) == len(EXPECTED_DOC_PATHS), (
+                    f"development serves {len(foreign)} framework routes, not "
+                    f"{len(EXPECTED_DOC_PATHS)}: {foreign}"
+                )
             # The EXECUTED callable, by identity. FastAPI runs `dependant.call`, and pinning the
             # endpoint's NAME let `route.dependant.call = leak` change what runs while every
             # pinned field stayed correct. A name is a string an attacker can assign; identity is
@@ -2225,6 +2253,25 @@ AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str]] = {
     "key": re.compile(STORE_KEY_PATTERN),
     "path": re.compile(r"^[!-~]{1,160}$"),
     "reason": re.compile(r"^[ -~]{0,512}$"),
+    # Inside `validation_reject.errors`, which the flat scan never reached. Both are bounded
+    # server-side to MAX_ACTOR_LENGTH and both echo caller-shaped input, so they get the tightest
+    # pattern that admits a pydantic location path and error type.
+    "loc": re.compile(r"^[A-Za-z0-9_.\[\]-]{0,64}$"),
+    "type": re.compile(r"^[a-z0-9_.]{0,64}$"),
+}
+
+
+# Every NUMERIC audit field, with a bound. An unbounded integer is a disclosure channel: the whole
+# token fits inside one, and `int.from_bytes(token.encode(), "big")` on `duration_ms` decodes back
+# to the credential exactly. The bounds are the ranges the application can legitimately produce.
+AUDIT_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
+    "duration_ms": (0, 300_000),
+    "status": (400, 599),
+    "error_count": (0, MAX_VALIDATION_ERRORS_LOGGED),
+    "score": (0.0, 100.0),
+    "evidence_coverage": (0.0, 1.0),
+    "declared_bytes": (0, 1 << 40),
+    "retry_after_seconds": (0, 3_600),
 }
 
 
@@ -2402,6 +2449,15 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
     Both halves are asserted here, and so is the requirement that every pinned kind is actually
     produced by the exercise: two of the six were not, which made their field lists literals that
     nothing compared.
+
+    ONE RESIDUAL, recorded rather than implied away. A field emitted only under a condition the
+    exercise does not create is invisible to both directions: it is absent from every emitted
+    record, so the unexpected-field check never sees it, and its record IS produced, so the surplus
+    check never fires. Measured with a field added to `auth_reject` only when an `x-pree-debug`
+    header is present. That is an inherent limit of an exercise-driven pin rather than a gap in
+    these assertions, and the countermeasure is the exercise, not the literal: it drives every
+    route, every method, three token states and six error shapes, so a condition it misses has to
+    be one no ordinary caller can reach either.
     """
     _, _, log = _exercise_every_surface(tmp_path, prober)
     emitted = [json.loads(line) for line in log.splitlines() if line.strip()]
@@ -2449,15 +2505,46 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
     # the credential in the pod log store on every write and passed. Every string-valued field is
     # now an exact set member or a bounded pattern; a number cannot encode a token.
     offending: list[str] = []
-    for found in emitted:
-        for field, value in found.items():
-            if not isinstance(value, str):
-                continue
+
+    def check(kind: str, field: str, value: Any, where: str) -> None:
+        """Every value at every depth. Strings by rule, numbers by bound, containers by recursion.
+
+        The first version skipped every non-string on the stated reasoning that "a number cannot
+        carry a base64 credential". It can carry the credential itself:
+        `duration_ms=int.from_bytes(token.encode(), "big")` emitted a 77-digit integer that decodes
+        byte for byte back to the token, on every successful write, with the suite green and the
+        substring search blind to it. Strings nested inside `validation_reject.errors` were never
+        reached either.
+        """
+        if isinstance(value, bool):
+            return
+        if isinstance(value, str):
             allowed = AUDIT_STRING_VALUES.get(field)
             if allowed is None:
-                offending.append(f"{found['kind']}.{field} is a string no rule pins: {value!r}")
+                offending.append(f"{where} is a string no rule pins: {value!r}")
             elif isinstance(allowed, re.Pattern) and not allowed.match(value):
-                offending.append(f"{found['kind']}.{field}={value!r} fails {allowed.pattern}")
+                offending.append(f"{where}={value!r} fails {allowed.pattern}")
             elif isinstance(allowed, frozenset) and value not in allowed:
-                offending.append(f"{found['kind']}.{field}={value!r} outside {sorted(allowed)}")
-    assert not offending, f"an audit record string value is unpinned: {offending}"
+                offending.append(f"{where}={value!r} outside {sorted(allowed)}")
+            return
+        if isinstance(value, (int, float)):
+            bound = AUDIT_NUMERIC_BOUNDS.get(field)
+            if bound is None:
+                offending.append(f"{where} is a number no bound pins: {value!r}")
+            elif not bound[0] <= value <= bound[1]:
+                offending.append(f"{where}={value!r} outside {bound}")
+            return
+        if isinstance(value, dict):
+            for inner, item in value.items():
+                check(kind, str(inner), item, f"{where}.{inner}")
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                check(kind, field, item, f"{where}[{index}]")
+            return
+        offending.append(f"{where} is a {type(value).__name__}, which no rule pins")
+
+    for found in emitted:
+        for field, value in found.items():
+            check(found["kind"], field, value, f"{found['kind']}.{field}")
+    assert not offending, f"an audit record value is unpinned: {offending}"

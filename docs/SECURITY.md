@@ -1579,15 +1579,68 @@ Two fragile pins were also refactored rather than kept. The four FastAPI documen
 pinned by their `FastAPI.setup.<locals>.*` closure qualnames, which is four strings from inside a
 dependency on one version: a routine bump would print two thirteen-row tuples for what might be a
 one-string change, and read to a stranger as a compromise rather than an upgrade. They are asserted
-structurally now - exactly `Route`, path on the pinned list, ungated - and what those paths serve is
-still pinned exactly by body and header. Every fabrication that beat the previous version is still
-red: a plain Route squatting `/openapi.json`, an ungated route added in the listener, and a Mount.
+structurally now - exactly `Route`, path on the pinned list, and an endpoint whose code comes from
+FastAPI's own file - and what those paths serve is checked for the header channel and for token
+absence, NOT for a body shape, because they serve HTML by design. The sentence that stood here
+claimed the body was pinned exactly, and it was not; that is the seventh false claim of mine in
+this session and the fourth to reach this file. Every fabrication that beat the previous version is
+still red: a plain Route squatting `/openapi.json`, an ungated route added in the listener, and a
+Mount. The "ungated" property was not load-bearing either, because `gated` is computed only for an
+APIRoute and is unconditionally false for a plain Route; the code-object filename is what does the
+work, and unlike `__module__` it cannot be reassigned.
 
 One process note, because it cost me the same mistake twice in one session. Restoring a file from a
 snapshot taken BEFORE a legitimate edit silently undoes that edit. It happened to a documentation
 fix earlier and to two source edits this round; both times the tree looked clean and the work was
 gone. Diffing against the snapshot is what caught it, which is why that diff is part of the routine
 rather than a flourish.
+
+### Security review of the subtraction: one blocker, two majors, two minors
+
+I asked this gate to be sceptical of the deletions specifically, because removing controls on an
+engineering-quality argument is exactly where a security regression hides. Its verdict on that
+question is worth recording precisely: two of the six deletions are strictly SOUNDER than what they
+replaced, three are neutral refactors, and two cost a fabrication that used to be red. So the
+subtraction was mostly right and not entirely, and the two that were wrong are restored.
+
+**The one I got wrong that matters.** Folding the suid sweep's two byte-identical copies into one
+constant looked like obvious tidying. It was a control. With two independent copies, neutering the
+Dockerfile's sweep needs an edit the second copy will not accept; with one, planting `-uid 4242` (an
+always-false narrowing that clears nothing) plus updating the single constant leaves the file green.
+Measured both ways. With no Docker daemon in the loop this text is the ONLY verification of a hard
+rule, so the duplication is back, with a comment saying it is deliberate. The general lesson is that
+duplication between an allowlist and an exact-match assertion is not redundancy, it is a second
+witness, and de-duplicating two witnesses leaves one.
+
+**The blocker was pre-existing and neither net saw it.** BuildKit permits a quoted key, preserves
+the quotes through parsing and strips them in `processWords`, so `ENV "PREE_ENV"=development` sets
+PREE_ENV exactly as the bare form does. The assignment pattern required the key to start at a word
+boundary, so a quoted key matched nothing, `findall` returned an empty list, and the line was read
+and asserted about nothing - the precise failure that function exists to prevent. The legacy-form
+guard was satisfied because the first word does contain an `=`. Six forms passed with the whole
+suite green, and the pre-write hook allowed all of them while blocking the unquoted equivalents. The
+consequences were each a hard rule: a baked `PREE_ENV=development` turns off the token requirement
+and admits a cleartext credentialed origin; a baked token freezes the credential into the image
+config; and a quoted `PATH` combined with a COPY into an unguarded directory execs a shim instead of
+the gunicorn the pinned command names. The pattern accepts a quoted key now, and more importantly
+the parser FAILS CLOSED when it reads fewer assignments than the line carries, which is the general
+form of the defect rather than this instance of it.
+
+The first major is the structural doc-route assertion I introduced last round. It classified rows by
+`endpoint.__module__`, and that is an assignable string: a forged `Route("/redoc", leak)` with
+`__module__` set to `"fastapi.applications"` landed in the framework branch and served the whole
+assessment store as HTML to an unauthenticated development caller. Two of the three properties it
+checked were doing nothing, because `gated` is computed only for an APIRoute and is unconditionally
+false for a plain Route. Classification is by code-object filename now, which cannot be reassigned
+and survives a dependency bump, and development is asserted to carry exactly four framework routes.
+
+The second major is a claim I wrote that was false in the same commit that made it. The value scan
+skipped every non-string on the stated reasoning that "a number cannot carry a base64 credential".
+A number carries the credential itself: `duration_ms=int.from_bytes(token.encode(), "big")` emits a
+77-digit integer that decodes byte for byte back to the token, on every successful write, with the
+substring search blind to it. Strings nested inside `validation_reject.errors` were never reached
+either. Every numeric field has a bound now and the scan recurses to any depth, which found two
+legitimate unpinned fields on its first run.
 
 ## Not accepted, and why it is not a risk here
 

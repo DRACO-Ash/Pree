@@ -754,3 +754,24 @@ deliberate subtraction:
 ● The four FastAPI documentation routes were pinned by closure qualnames from inside a dependency;
   they are asserted structurally now, and every fabrication that beat the previous form is still
   red. What those paths serve is still pinned exactly.
+
+Security review of the subtraction, one blocker, two majors and two minors:
+
+● BLOCKER, pre-existing: BuildKit permits a QUOTED ENV or ARG key and strips the quotes later, so
+  `ENV "PREE_ENV"=development` sets it exactly as the bare form does. The assignment pattern
+  required the key at a word boundary, so a quoted key matched nothing and the line was read and
+  asserted about nothing; the pre-write hook allowed the same forms. Six spellings passed with the
+  suite green, each defeating a hard rule. The pattern accepts a quoted key, both hook rules do
+  too, and the parser now fails closed when it reads fewer assignments than the line carries.
+● The structural doc-route assertion classified rows by `endpoint.__module__`, an assignable
+  string, so a forged /redoc with a spoofed module served the store as HTML to an unauthenticated
+  development caller. Classification is by code-object filename now, and development is asserted to
+  carry exactly four framework routes.
+● The audit value scan skipped every non-string, and a number carries the credential:
+  `duration_ms=int.from_bytes(token.encode(), "big")` decodes back to the token on every write.
+  Every numeric field is bounded and the scan recurses to any depth, which pinned two legitimate
+  nested fields it found on the first run.
+● A deletion was WRONG and is reverted: folding the suid sweep's two byte-identical copies into one
+  removed a second witness, so a two-edit neutered sweep passed. Both copies are back, deliberately.
+● The claim that documentation-path bodies are pinned exactly was false; they are checked for the
+  header channel and token absence only, and serve HTML by design. Corrected in place.

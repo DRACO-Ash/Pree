@@ -696,9 +696,9 @@ def test_every_hardening_step_runs_in_the_stage_that_actually_ships() -> None:
 # importable trees and the pip-removal assertion, and it is checked against the base image tag by
 # `test_the_guarded_python_version_is_the_one_the_base_image_ships`. It used to be written out
 # four times, so a base bump needed four coordinated edits for one fact.
-# The suid sweep, in ONE place. It was written out twice, byte-identically, as its own constant
-# and as the last entry of _VETTED_RUNS, so changing the sweep meant editing the same
-# eighty-character command in two places.
+# The suid sweep. Written out twice ON PURPOSE, here and as the last entry of _VETTED_RUNS: two
+# independent copies mean a one-line edit to the Dockerfile's sweep cannot satisfy both, so a
+# neutered sweep turns the file red. That redundancy is the control, not an oversight.
 SUID_SWEEP = (
     "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +"
 )
@@ -722,7 +722,13 @@ _VETTED_RUNS = (
     "/usr/bin/apt-* /usr/bin/dpkg /usr/bin/dpkg-* /usr/sbin/dpkg-* /var/lib/dpkg/info "
     "&& useradd --uid 10001 --user-group --system --no-create-home "
     "--shell /usr/sbin/nologin appuser && chown -R 10001:10001 /app",
-    SUID_SWEEP,
+    # SPELLED OUT AGAIN, not `SUID_SWEEP`. Folding the two into one literal was an engineering
+    # tidy-up and it cost a fabrication: with one copy, planting `-uid 4242` in the Dockerfile's
+    # sweep (an always-false narrowing that clears nothing) and updating the single constant left
+    # the file green, where the same two-edit mutation against two independent copies turns three
+    # tests red. With no Docker daemon in the loop this text is the only verification of a hard
+    # rule, so the file keeps one statement of the command that a single edit cannot move.
+    "/usr/bin/find / -xdev -perm /6000 \\( -type f -o -type d \\) -exec /bin/chmod a-s {} +",
 )
 # The COPY instructions allowed to write over a guarded tree, pinned by exact text the way the
 # vetted RUNs are. Every COPY in this Dockerfile is listed, which is the point rather than a
@@ -769,8 +775,14 @@ _EXECUTABLE_DIRECTORIES = (
 # Every `key=value` in an ENV argument, quotes stripped. A key is matched by EQUALITY against
 # this, never by substring: `PYTHONPATH` ends in `PATH`, and that one fact hid an unguarded
 # directory at the front of the shipped search path with the whole suite green.
+# The KEY may be QUOTED. BuildKit preserves the quotes in the parsed key and strips them later in
+# `processWords`, so `ENV "PREE_ENV"=development` sets PREE_ENV exactly as the bare form does. The
+# previous pattern required the key to start at a word boundary, so a quoted key matched NOTHING
+# and `findall` returned an empty list: the line was read and asserted about nothing, which is the
+# failure this parser exists to prevent. Measured, all with the suite green: quoted PREE_ENV,
+# PREE_TEAM_TOKEN, PORT and PATH, in both ENV and ARG, single or double quoted.
 _ENV_ASSIGNMENT = re.compile(
-    r"""([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s]*)"""
+    r"""["']?([A-Za-z_][A-Za-z0-9_]*)["']?=("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s]*)"""
 )
 
 
@@ -791,7 +803,17 @@ def _env_assignments(argument: str) -> list[tuple[str, str]]:
         f"an ENV instruction uses the legacy space-separated form, which this parser does not "
         f"read and docker honours: {argument[:80]}"
     )
-    return [(key, value.strip("\"'")) for key, value in _ENV_ASSIGNMENT.findall(argument)]
+    parsed = [(key, value.strip("\"'")) for key, value in _ENV_ASSIGNMENT.findall(argument)]
+    # FAIL CLOSED on anything the pattern could not read. Silently returning fewer assignments than
+    # the line carries is how a quoted key became invisible: every guard downstream then reported a
+    # pass for a line nobody had parsed. Counting the `=`-bearing tokens is a crude check and that
+    # is the point, because it does not need to understand a token to notice it.
+    tokens = [token for token in argument.split() if "=" in token]
+    assert len(parsed) == len(tokens), (
+        f"this parser read {len(parsed)} of {len(tokens)} assignments in {argument[:80]!r}; an "
+        f"assignment it cannot read is one every guard below silently ignores"
+    )
+    return parsed
 
 
 def test_the_guarded_python_version_is_the_one_the_base_image_ships() -> None:
