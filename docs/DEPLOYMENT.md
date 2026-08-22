@@ -40,7 +40,7 @@ what they judge dangerous, so an open gate is a disclosure, not a convenience.
 | `PREE_ALLOWED_ORIGIN` | **COPY-PASTE EXACT:** `https://pree.apps.bluestaq.com` | operator |
 | `PREE_BUILD_ID` | leave unset, or set to the release tag | release process |
 
-Generate the token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Production refuses a token shorter than 24 characters or using fewer than 12 distinct characters, so a repeated word will not start the app.
+Generate the token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Production refuses a token shorter than 32 characters, or one built entirely from a repeated sequence, so a doubled word will not start the app.
 
 All three of the operator-set values go in before the first submission. The app refuses to
 start on any unsafe combination: production with no token, a token with no origin, or a token

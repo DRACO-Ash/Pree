@@ -62,6 +62,12 @@ the assessment store.
 | Merges never shrink the stored dataset | `src/pree/store.py` | `test_merge_never_deletes_a_key_the_update_omitted` |
 | Non-root numeric user, no suid or sgid bits, one flattened layer | `Dockerfile` | `tests/test_boot_contract.py` |
 | Hash-locked dependencies, scanned for vulnerabilities | `requirements.txt` | `scripts/verify.sh` |
+| The Dockerfile contract is asserted by parsing, not by substring | `Dockerfile` | `tests/test_boot_contract.py` |
+| A rejected body cannot write an unbounded audit line | `src/pree/app.py` | `test_a_rejected_body_cannot_write_an_unbounded_audit_line` |
+| The body cap is bounded against the granted memory | `src/pree/app.py` | `test_the_body_cap_is_derived_from_the_memory_the_platform_grants` |
+| Every documented token floor matches the enforced constant | `docs/` | `test_every_documented_token_floor_matches_the_number_the_code_enforces` |
+| Sonar scans `src` only, read as a resolved property | `sonar-project.properties` | `test_the_sonar_configuration_scopes_sources_to_src` |
+| The upload archive carries no credential-shaped path | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
 
 ## Deliberately accepted risks
 
@@ -223,7 +229,36 @@ readiness. All three are rebuilt to fail on anything they cannot check rather th
 every one of those twelve fabrications is now caught. The rebuilt register guard immediately
 found real drift: two rows citing test names that had been renamed without the register
 following. One security fix came with them: production accepted a one-character team token,
-and now refuses anything shorter than 24 characters.
+and now refuses anything shorter than 32 characters or built entirely from a repeated sequence.
+
+Tenth review: two majors, both in the Dockerfile guard rather than in the image. Every
+assertion about the build was a substring search over the file text, and the reviewer defeated
+the set two ways docker itself resolves differently. A BuildKit heredoc body was read as a
+build stage, so a decoy `FROM scratch` block satisfied all six resolved-state assertions while
+the real final stage ran `USER root` and bound the loopback interface only. An exec-form
+`ENTRYPOINT` alongside the `CMD` meant docker passed the gunicorn command line as arguments to
+something else, so the server never started, and the suite stayed green through both. The file
+is now parsed into stage, keyword and argument triples, unknown keywords and heredocs are
+refused outright rather than skipped, and the launch command is read from the resolved final
+stage. Both defeats were re-applied afterwards and both now turn the suite red.
+
+Three guards were rebuilt alongside them. The Sonar check read a line rather than the resolved
+property, so appending `sonar.sources=.` below the correct line scanned the whole checkout with
+the assertion still green. The audit line for a rejected body was bounded only by the body cap,
+and five 5,000-character field names inside a 25 KiB body produced a 25,422-byte log record, so
+filling the log volume was cheaper than filling the data volume and needed no token. The
+packaging script refused five directory names and nothing by shape, so a `.pem` or a file whose
+name reads like a credential shipped to the App Store unremarked.
+
+One documentation defect is worth naming in its own right, because it was mine and not the
+reviewer's to find. The token floor was raised to 32 characters and the character-variety rule
+was deleted, and my commit message for that change claimed the wording had been narrowed "in
+the comment, the register row and the deployment sheet". Only `docs/SECURITY.md` was changed.
+`docs/DEPLOYMENT.md` still told the operator about a character-variety rule the code no longer
+has, alongside the superseded floor. Both documents now state the enforced number, and a guard reads
+`MIN_PRODUCTION_TOKEN_LENGTH` from the source and fails on any sentence about the token that
+states a different figure or names the retired rule, so the prose cannot drift from the
+constant again.
 
 Each of these now has a named regression test in the control table above.
 

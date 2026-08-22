@@ -215,7 +215,29 @@ protect, which held every attack the round ran:
   been renamed without the register following.
 ● Production accepted a one-character team token. At 240 attempts a minute per address per
   worker a dictionary of common choices sits well inside an hour, so production now refuses
-  anything shorter than 24 characters and the sheet names the generation command.
+  anything shorter than 32 characters or built entirely from a repeated sequence, and the sheet
+  names the generation command.
 
 Also corrected: this policy claimed every control was mutation-proven on the strength of a
 partial sample, which is the evidence inflation the surrounding paragraph apologises for.
+
+Tenth security review, three guards rebuilt and one document defect of my own:
+
+● Every Dockerfile assertion was a substring search. A BuildKit heredoc body read as a build
+  stage, so a decoy `FROM scratch` block satisfied all six resolved-state assertions while the
+  real stage ran `USER root` and bound the loopback interface only; an exec-form `ENTRYPOINT`
+  turned the gunicorn command line into arguments for something else. The file is now parsed
+  into stage, keyword and argument triples, heredocs and unknown keywords are refused rather
+  than skipped, and both defeats now turn the suite red.
+● The Sonar check read a line, not the resolved property, so `sonar.sources=.` appended below
+  the correct line scanned the whole checkout with the assertion green.
+● The audit line for a rejected body was bounded only by the body cap. Five 5,000-character
+  field names inside a 25 KiB body wrote a 25,422-byte log record, so filling the log volume
+  was cheaper than filling the data volume and needed no token. Field names and error counts
+  are now truncated and capped.
+● The packaging script refused five directory names and nothing by shape. It now fails on any
+  archived path ending in a key or certificate extension, or reading like a credential.
+● The token floor moved to 32 characters but only `docs/SECURITY.md` followed, while my commit
+  message claimed all three places had. `docs/DEPLOYMENT.md` still described a rule the code no
+  longer has. Both now state the enforced number, and a guard reads the constant from the
+  source so the prose cannot drift from it again.

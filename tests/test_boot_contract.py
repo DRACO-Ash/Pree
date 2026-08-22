@@ -22,6 +22,32 @@ ON_PLATFORM_RUNNER = os.environ.get("GITLAB_CI") == "true"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+# The complete OCI/BuildKit instruction set. Anything outside it is not an instruction, and a
+# parser that shrugs at an unknown line is how a heredoc body became a phantom build stage.
+_DOCKERFILE_KEYWORDS = frozenset(
+    {
+        "FROM",
+        "RUN",
+        "CMD",
+        "LABEL",
+        "MAINTAINER",
+        "EXPOSE",
+        "ENV",
+        "ADD",
+        "COPY",
+        "ENTRYPOINT",
+        "VOLUME",
+        "USER",
+        "WORKDIR",
+        "ARG",
+        "ONBUILD",
+        "STOPSIGNAL",
+        "HEALTHCHECK",
+        "SHELL",
+    }
+)
+
+
 @dataclass(frozen=True)
 class _Instruction:
     """One resolved Dockerfile instruction, with comments and continuations removed."""
@@ -48,6 +74,12 @@ def _instructions() -> list[_Instruction]:
     and the resolved final-stage state is what gets asserted.
     """
     text = _dockerfile()
+    # A heredoc body is text to `docker build` and instructions to any line-based parser, so
+    # `COPY <<DECOY` followed by a fabricated FROM/USER/CMD created a phantom final stage that
+    # satisfied every assertion below while the real stage ran as root on loopback. This
+    # project's Dockerfile has no need of heredocs, so their presence is refused rather than
+    # interpreted.
+    assert "<<" not in text, "heredocs are refused: a line-based parser cannot read them safely"
     joined: list[str] = []
     buffer = ""
     for raw in text.splitlines():
@@ -68,6 +100,10 @@ def _instructions() -> list[_Instruction]:
         parts = line.split(None, 1)
         keyword = parts[0].upper()
         argument = parts[1] if len(parts) > 1 else ""
+        assert keyword in _DOCKERFILE_KEYWORDS, (
+            f"unrecognised Dockerfile keyword {keyword!r} in {line[:60]!r}; an unknown line "
+            "may be a heredoc body or a typo, and either way it must not be classified silently"
+        )
         if keyword == "FROM":
             stage += 1
             pieces = argument.split()
@@ -125,7 +161,16 @@ def test_the_effective_launch_command_binds_every_interface_and_execs() -> None:
     Binding loopback while leaving the 0.0.0.0 string in a comment, and dropping `exec` while
     leaving "exec gunicorn" in a comment, both passed the old greps.
     """
-    commands = [i.argument for i in _final_stage() if i.keyword == "CMD"]
+    final = _final_stage()
+    entrypoints = [i.argument for i in final if i.keyword == "ENTRYPOINT"]
+    assert not entrypoints, (
+        f"an ENTRYPOINT overrides CMD, so the asserted launch command would never run and the "
+        f"CMD array would become its arguments: {entrypoints}"
+    )
+    assert not [i for i in _instructions() if i.keyword == "ONBUILD"], (
+        "ONBUILD defers an instruction to a downstream build, where none of these assertions apply"
+    )
+    commands = [i.argument for i in final if i.keyword == "CMD"]
     assert len(commands) == 1, f"expected exactly one CMD in the final stage, found {commands}"
     command = commands[0]
     assert "0.0.0.0:" in command, f"the launch command does not bind every interface: {command}"
@@ -133,7 +178,8 @@ def test_the_effective_launch_command_binds_every_interface_and_execs() -> None:
     assert "exec gunicorn" in command, (
         f"without exec, SIGTERM never reaches the server and shutdown hangs: {command}"
     )
-    assert "EXPOSE 8080" in _dockerfile()
+    exposed = [i.argument.strip() for i in final if i.keyword == "EXPOSE"]
+    assert exposed == ["8080"], f"the final stage exposes {exposed}, not the platform port"
 
 
 def test_the_suid_sweep_is_the_last_mutating_instruction_of_its_stage() -> None:
@@ -170,10 +216,71 @@ def test_the_shipped_stage_is_exactly_one_copied_layer() -> None:
     )
 
 
+def _properties(path: Path) -> dict[str, str]:
+    """Resolved key-value pairs, last value winning, as a properties reader would see them."""
+    resolved: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        resolved[key.strip()] = value.strip()
+    return resolved
+
+
 def test_the_sonar_configuration_scopes_sources_to_src() -> None:
-    body = (REPO_ROOT / "sonar-project.properties").read_text(encoding="utf-8")
-    assert "sonar.sources=src" in body
-    assert "sonar.python.coverage.reportPaths=coverage.xml" in body
+    """Read the RESOLVED value, not the presence of a line.
+
+    A substring check passes on a file where the right line is followed by a wrong one, and a
+    properties reader takes the last value. `sonar.sources=src` on line one with
+    `sonar.sources=.` on line two satisfied the old assertion and scanned the whole checkout,
+    including the tests and the virtual environment.
+    """
+    resolved = _properties(REPO_ROOT / "sonar-project.properties")
+    assert resolved.get("sonar.sources") == "src", (
+        f"sonar.sources resolves to {resolved.get('sonar.sources')!r}, not 'src'"
+    )
+    assert resolved.get("sonar.python.coverage.reportPaths") == "coverage.xml", (
+        f"the coverage report path resolves to "
+        f"{resolved.get('sonar.python.coverage.reportPaths')!r}"
+    )
+
+
+def test_every_documented_token_floor_matches_the_number_the_code_enforces() -> None:
+    """Tie the documented token rule to the constant, so it cannot drift again.
+
+    It already had. The floor was raised from 24 to 32 and the character-variety rule was
+    deleted, but two documents still stated the old numbers and the retired rule, and one of my
+    own commit messages claimed all three had been updated when only one had. Prose drifts
+    silently; a constant does not.
+    """
+    floor = importlib.import_module("pree.config").MIN_PRODUCTION_TOKEN_LENGTH
+    wrong: list[str] = []
+    retired: list[str] = []
+    checked = 0
+    for name in ("DEPLOYMENT.md", "SECURITY.md"):
+        flat = re.sub(r"\s+", " ", (REPO_ROOT / "docs" / name).read_text(encoding="utf-8"))
+        for sentence in re.split(r"(?<=[.!?])\s+", flat):
+            if "token" not in sentence.lower():
+                continue
+            if "distinct character" in sentence.lower():
+                retired.append(f"{name}: {sentence.strip()}")
+            for stated in re.findall(r"\b(\d+)\s+characters?\b", sentence):
+                checked += 1
+                if int(stated) != floor:
+                    wrong.append(f"{name}: {sentence.strip()}")
+
+    assert checked, (
+        "no document states a character floor for the team token; the operator has no way to "
+        "know what production will refuse"
+    )
+    assert not wrong, (
+        f"the code refuses a token shorter than {floor} characters, but the docs say otherwise: "
+        f"{wrong}"
+    )
+    assert not retired, (
+        f"the character-variety rule was deleted from the code but is still documented: {retired}"
+    )
 
 
 def test_git_actually_ignores_every_secret_and_local_artefact() -> None:
@@ -238,9 +345,13 @@ def test_the_launch_command_targets_the_factory_that_actually_exists() -> None:
     suite green while the container could not start at all: gunicorn exits 4 with
     "Failed to find attribute 'app'". Both halves are asserted here so they cannot drift.
     """
-    body = _dockerfile()
-    assert "pree.main:build()" in body
-    assert "pree.main:app" not in body
+    commands = [i.argument for i in _final_stage() if i.keyword == "CMD"]
+    assert len(commands) == 1
+    command = commands[0]
+    # Read from the resolved CMD, not the file: leaving the old target in a comment satisfied a
+    # whole-file substring while the container exited 4 on start.
+    assert "pree.main:build()" in command, f"the launch target is not the factory: {command}"
+    assert "pree.main:app" not in command
     module = importlib.import_module("pree.main")
     assert callable(module.build)
     assert not hasattr(module, "app")

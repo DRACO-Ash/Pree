@@ -44,7 +44,7 @@ from .ratelimit import (
     RateLimiter,
 )
 from .scoring import ThreatIndicators, assess
-from .security import AuthError, authorise, sanitise_actor
+from .security import MAX_ACTOR_LENGTH, AuthError, authorise, sanitise_actor
 from .store import SCHEMA_VERSION, JsonStore, StoreError
 
 LIVENESS_PATHS = ("/", "/healthz", "/readyz", "/livez", "/ping")
@@ -60,6 +60,10 @@ STORE_UNAVAILABLE_ERROR = "could not store the assessment"
 # Generous for this schema, which is a handful of numbers and two short identifiers, and small
 # enough that an unauthenticated caller cannot exhaust memory before the token gate runs.
 MAX_BODY_BYTES = 32 * 1024
+# The audit line for a rejected body is bounded, because the field names inside it are caller
+# controlled. A 20,000-character key produced a 20,104-byte log record, so a rejected request
+# was a cheaper way to fill the log volume than an accepted one.
+MAX_VALIDATION_ERRORS_LOGGED = 10
 # The interactive documentation paths. FastAPI serves all three by default, which made the
 # whole route table, every field range and the token header name readable by an unauthenticated
 # caller, and made /docs load a floating-tag CDN script onto the app origin: the same origin
@@ -241,11 +245,12 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
                     "path": request.url.path,
                     "errors": [
                         {
-                            "loc": [str(part) for part in item.get("loc", ())],
-                            "type": str(item.get("type")),
+                            "loc": [str(part)[:MAX_ACTOR_LENGTH] for part in item.get("loc", ())],
+                            "type": str(item.get("type"))[:MAX_ACTOR_LENGTH],
                         }
-                        for item in exc.errors()
+                        for item in exc.errors()[:MAX_VALIDATION_ERRORS_LOGGED]
                     ],
+                    "error_count": len(exc.errors()),
                 },
                 separators=(",", ":"),
                 sort_keys=True,

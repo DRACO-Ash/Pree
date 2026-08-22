@@ -6,16 +6,23 @@ import inspect
 import io
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from pree.app import LIVENESS_PATHS, MAX_BODY_BYTES, STORAGE_PROBE_PATH, create_app
+from pree.app import (
+    LIVENESS_PATHS,
+    MAX_BODY_BYTES,
+    MAX_VALIDATION_ERRORS_LOGGED,
+    STORAGE_PROBE_PATH,
+    create_app,
+)
 from pree.audit import build_logger
 from pree.health import StorageProber
-from pree.ratelimit import RateLimiter
+from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
 from pree.security import MAX_ACTOR_LENGTH, sanitise_actor
 from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, TEST_TOKEN, build_client, make_config
@@ -252,6 +259,66 @@ def test_the_validation_error_never_echoes_the_callers_input_back(client: TestCl
     )
     assert response.status_code == 422
     assert marker not in response.text
+
+
+def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) -> None:
+    """The field NAMES in a validation error are caller controlled, so the log line was too.
+
+    A single request carrying one 20,000-character key produced a 20,104-byte audit record, and
+    a body under the size cap can carry hundreds of them. Filling the log volume that way is
+    cheaper than filling the data volume, and it needs no token.
+    """
+    stream = io.StringIO()
+    logger = build_logger(stream)
+    config = make_config(tmp_path)
+    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
+        payload: dict[str, Any] = {"protected_asset_id": 1, "candidate_id": 2}
+        # Sized to sit UNDER the 32 KiB body cap, so the cap is not what stops this: five
+        # 5,000-character keys is roughly 25 KiB of body and was roughly 25 KiB of audit line.
+        payload.update({f"k{index}{'x' * 5_000}": 1 for index in range(5)})
+        assert bounded.post("/v1/assess", json=payload, headers=AUTH).status_code == 422
+
+    lines = [line for line in stream.getvalue().splitlines() if "validation_reject" in line]
+    assert lines, "the rejection was not audited at all"
+    for line in lines:
+        assert len(line) < 4096, f"audit line is {len(line)} bytes, unbounded by caller input"
+        record = json.loads(line)
+        assert len(record["errors"]) <= MAX_VALIDATION_ERRORS_LOGGED
+        assert record["error_count"] >= len(record["errors"])
+        for item in record["errors"]:
+            for part in item["loc"]:
+                assert len(part) <= MAX_ACTOR_LENGTH
+
+
+def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:
+    """The cap is only a defence if concurrent worst-case bodies fit inside the request.
+
+    32 KiB looks obviously small in isolation. What matters is the product: the coarse limiter
+    admits GLOBAL_LIMIT requests per window, each able to buffer a full body before the token
+    gate runs, so the number to bound is MAX_BODY_BYTES x GLOBAL_LIMIT against the memory the
+    deployment sheet asks for. Asserting the product ties the three numbers together, so
+    raising any one of them in isolation fails here rather than in production.
+    """
+    sheet = (Path(__file__).resolve().parent.parent / "docs" / "DEPLOYMENT.md").read_text(
+        encoding="utf-8"
+    )
+    row = next(line for line in sheet.splitlines() if line.startswith("| Memory |"))
+    stated = re.search(r"(\d+)Mi\b", row)
+    assert stated is not None, f"the memory row states no Mi figure to check against: {row!r}"
+    requested_mib = int(stated.group(1))
+
+    concurrent_worst_case = MAX_BODY_BYTES * GLOBAL_LIMIT
+    ceiling = 16 * 1024 * 1024
+    assert concurrent_worst_case <= ceiling, (
+        f"an unauthenticated caller can hold {concurrent_worst_case / 1024 / 1024:.1f} MiB of "
+        f"request bodies at once, above the {ceiling / 1024 / 1024:.0f} MiB budgeted for them"
+    )
+    # And the ceiling itself must stay a small fraction of the request, so the interpreter, the
+    # two workers and the dataset still fit alongside it.
+    assert ceiling * 8 <= requested_mib * 1024 * 1024, (
+        f"the {ceiling / 1024 / 1024:.0f} MiB body budget is not a small fraction of the "
+        f"{requested_mib}Mi memory request in the deployment sheet"
+    )
 
 
 @pytest.mark.parametrize("bad_id", ["", "a" * 65, "../etc/passwd", "has space", "-leading"])

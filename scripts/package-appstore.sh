@@ -43,4 +43,18 @@ for banned in .env .git .venv node_modules coverage; do
   fi
 done
 
-echo "package: allowlist clean"
+# A second pass over what actually landed, by shape rather than by name. The name denylist
+# above only refuses five known directory names; it says nothing about a key, a certificate or
+# a file whose name merely reads like a credential, and the archive is what leaves the building.
+# .env.example is the one deliberate exception: it carries placeholders, and a test asserts so.
+SUSPECT=$(unzip -Z1 "$OUT" \
+  | grep -vE '(^|/)\.env\.example$' \
+  | grep -iE '\.(env|pem|key|p12|pfx|jks|keystore)$|(^|/)id_(rsa|dsa|ecdsa|ed25519)|token|secret|credential' \
+  || true)
+if [ -n "$SUSPECT" ]; then
+  echo "package: the archive carries paths shaped like credentials:" >&2
+  echo "$SUSPECT" >&2
+  exit 1
+fi
+
+echo "package: archive clean: no banned directory, no credential-shaped path"
