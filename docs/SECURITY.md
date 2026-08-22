@@ -1697,10 +1697,16 @@ rather than obeyed.
 
 ### Where the verification now stands, and what a human should know
 
-The reviewer's judgement, which I share and record rather than paraphrase: after these three changes
-of shape, freeze the pins. Four consecutive rounds of adversarial attention on `src/pree/` have
-produced zero application findings, including this round's twenty-two-probe live battery and five
-control mutations, so the marginal value of another round aimed at the code is nil.
+The reviewer's recommendation was CONDITIONAL and I recorded it as an endorsement, which was wrong
+and is corrected here: it said freeze the pins IF the three shape changes hold, ahead of the review
+that would decide whether they did. They did not, so the freeze was not met. The confirming review
+found one of the three a regression.
+
+The claim that stood here, that four consecutive rounds produced "zero application findings", was
+also false, and contradicted two paragraphs of this same section: the unscrubbed `loc` field WAS an
+application finding, and the two application changes recorded above were made in answer to it. Both
+sentences are the ones a human would rely on to authorise a freeze, which is why they are corrected
+in place rather than reworded.
 
 The remaining risk is in the VERIFICATION, not in the application, and the single largest gap is
 named plainly: **the container hardening rules have never been checked against a real image.** No
@@ -1709,6 +1715,62 @@ are each a hard rule, and each is currently verified only by text that three coo
 neuter - measured, not hypothesised. `scripts/simulate-pipeline.sh` exits 2 and says so. Exit 2 is
 not a pass. The containerize leg should be a required gate on a runner with a Docker daemon before
 the first production deploy.
+
+### Thirty-fifth review: the confirmation that refused to confirm
+
+I asked for a confirmation review and said so, precisely so the reviewer could push back. It did, and
+it was right to: two of the three shape changes held, and the third was a REGRESSION that removed a
+working control.
+
+`_ScrubIdempotent` was a duck-typed stand-in for `re.Pattern`, and the dispatch tested
+`isinstance(allowed, re.Pattern)`, then `isinstance(allowed, frozenset)`, with no else. The object
+matched neither arm, so every value it governed was accepted unchecked: a forged-newline actor, a
+5,000-character actor and a control-character `loc` all passed, poisoning its `match` with a raise
+left all 311 tests green, and reverting the round's own application fix left them green too. It had
+replaced two working regexes. The lesson is not about that class: it is that a dispatch which
+enumerates rule types must FAIL CLOSED on one it does not recognise, and that a rule table is
+checked by neither of this project's gates, because mypy sees nothing wrong with an unreachable
+branch and coverage measures `src/` only. So there is now a canary: every rule is handed a value it
+must reject, and the dispatch is handed a rule type it must complain about.
+
+The identity assertion I was pleased with was also wrong, in a way worth recording because the
+heading I gave it was self-refuting. "Assert identity instead of classify provenance" substituted a
+stronger classifier for a weaker one: `co_filename` is whatever string was handed to `compile()`, so
+`compile(src, getsourcefile(fastapi.applications), "exec")` gives any function that origin, and
+because it is a plain function Starlette wraps it in its own `request_response` app, satisfying the
+every-route callable check as well. The paragraph asserting that hand-rolled recognisers lose to
+lexer tricks contained a hand-rolled recogniser. It is a code-object IDENTITY comparison now,
+against a reference app FastAPI builds for itself, which is the thing that cannot be forged.
+
+The correlation narrowed the channel rather than closing it: measured at about 7.5 bits a record
+against 18.2 before, so `duration_ms = token[i] % 128` still passed and 32 writes carried a
+32-character token. It is bounded by the SLOWEST SINGLE REQUEST now, measured by wrapping the one
+client method the others call through, which is roughly the width of a real measurement. The
+residual is stated rather than implied away: a timing field is a covert channel of its bound's
+width, and closing it entirely means not reporting a duration at all, which would cost the operator
+the one field that shows a slow store.
+
+Five smaller things closed with it. The value parser post-stripped quotes with `.strip("\"'")`,
+which removes both characters repeatedly, so `PREE_ENV="'development'"` was read as `development`
+where docker sets `'development'` - a refusal reading a value docker does not set is the failure it
+exists to prevent, one layer in. It captures the inner group now. Two forms docker honours were
+falsely refused, a quoted value containing whitespace and a bare `ARG TARGETARCH` declaration, the
+second with the wrong diagnosis; a false refusal is a real cost, because the next person who needs
+the form deletes the guard. There is an exact splitter for the first and a declaration branch for
+the second. A rejected field name that scrubbed to empty was logged as `anonymous`, the sentinel for
+"no actor supplied", so `{"*": 1}` was indistinguishable from an anonymous caller in the field that
+exists for diagnosis; log parts have their own marker now. And the pre-write hook's rules were
+anchored so that only the FIRST assignment on a line was seen, while this Dockerfile already writes
+multi-assignment ENV lines, so `ENV PYTHONUNBUFFERED=1 PREE_TEAM_TOKEN=...` was allowed with no
+quote trick and no continuation at all.
+
+One genuine finding fell out of widening that hook, and it is about the baseline rather than this
+project. `.claude/skills/release-and-deploy/SKILL.md` line 35 gives a reference Dockerfile for the
+Node template containing `ENV NODE_ENV=production HOST=0.0.0.0 PORT=8080`, and baking `ENV PORT` is
+a hard rule violation in CLAUDE.md for exactly the reason recorded there: an image-level default
+beats the code fallback chain and defeats platform injection. The hook now flags it, correctly. The
+rule stays and the example is the thing that is wrong; it is worth feeding back to the baseline
+rather than suppressed here.
 
 ## Not accepted, and why it is not a risk here
 

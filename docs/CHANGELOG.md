@@ -798,3 +798,27 @@ shape of three controls rather than widening them:
 ● My claim that both hook rules accept a quoted key was false: it was two of three, and
   `ENV "PORT"=8080` was not blocked. Fixed, with repeated quotes accepted. Widening the rules to
   catch a continuation line was tried and reverted for firing on this repository's own source.
+
+Thirty-fifth security review, one major regression, one major, and six minors:
+
+● REGRESSION of mine: `_ScrubIdempotent` was a duck-typed stand-in for `re.Pattern`, and the
+  dispatch tested two isinstance arms with no else, so every value it governed was accepted
+  UNCHECKED. It had replaced two working regexes. Poisoning its `match` left all 311 tests green.
+  One interface for every rule now, a fail-closed else, and a canary that hands each rule a value it
+  must reject and the dispatch a rule type it must complain about.
+● `co_filename` is whatever string was handed to `compile()`, so a forged endpoint compiled with
+  FastAPI's filename satisfied the origin assertion and the callable check. It is a code-object
+  IDENTITY comparison against a reference app now.
+● The correlation narrowed the timing channel to about 7.5 bits rather than closing it. It is
+  bounded by the slowest single request now, and the residual is stated in bits.
+● The value parser post-stripped quotes, so `PREE_ENV="'development'"` was read as `development`
+  where docker sets `'development'`. The inner group is captured.
+● Two forms docker honours were falsely refused, a quoted value with whitespace and a bare
+  `ARG NAME` declaration. An exact splitter and a declaration branch.
+● A rejected field name scrubbing to empty was logged as `anonymous`, the sentinel for no actor.
+  Log parts have their own marker.
+● The hook's rules saw only the first assignment on a line, while this Dockerfile writes
+  multi-assignment ENV lines. Any assignment on a keyword-anchored line now.
+● Two false claims of mine in `docs/SECURITY.md` are corrected: "zero application findings" was
+  contradicted by the same section, and a conditional recommendation to freeze the pins was recorded
+  as an unconditional endorsement ahead of the review that would decide it.

@@ -35,7 +35,7 @@ const RULES = [
   // Banned anti-pattern: a hardcoded client-side access gate (public artifact PIN).
   ['Client-side access gate',    /\b(?:ADMIN_)?PIN\s*=\s*['"][0-9A-Za-z]{4,}['"]/],
   // Banned anti-pattern: ENV PORT in a Dockerfile silently overrides the platform port 8080.
-  ['Dockerfile ENV PORT',        /^\s*ENV\s+["']*PORT["']*\s*=/im],
+  ['Dockerfile ENV PORT',        /^\s*ENV\s+[^\n]*?(?<![A-Za-z0-9_])["']*PORT["']*\s*=/im],
   // `["']*`, not `["']?`: a DOUBLED quote is a distinct evasion, and the key may carry quotes on
   // either side. A continuation line carrying an assignment with no ENV keyword still escapes
   // every rule here, because they are anchored to the keyword. Making the keyword optional was
@@ -59,12 +59,12 @@ const RULES = [
   // one did not, so `ENV DB_PASSWD=...` was allowed by both: a real shape for a UDL integration,
   // where the credential is a password. The value floor is 4, not 8, because `abc123` is a
   // credential too. Measured across every tracked file at this width: no new match.
-  ['Baked credential assignment', /^\s*(?:ENV|ARG|export)\s+["']*(?:[A-Za-z0-9]+_)*(?:TOKEN|SECRET|PASSWORD|PASSWD|PWD|PASSPHRASE|KEY|CREDENTIAL)(?:_[A-Za-z0-9]+)*["']*\s*=\s*\S{4,}/im],
+  ['Baked credential assignment', /^\s*(?:ENV|ARG|export)\s+[^\n]*?(?<![A-Za-z0-9_])["']*(?:[A-Za-z0-9]+_)*(?:TOKEN|SECRET|PASSWORD|PASSWD|PWD|PASSPHRASE|KEY|CREDENTIAL)(?:_[A-Za-z0-9]+)*["']*\s*=\s*\S{4,}/im],
   // Banned anti-pattern: any platform-injected variable given an image-level default. PREE_ENV is
   // the worst of them, because the loader defaults it to production, so baking `development`
   // turns off the token requirement, serves the docs unauthenticated and admits a cleartext
   // origin.
-  ['Dockerfile ENV platform value', /^\s*ENV\s+["']*(?:PREE_ENV|PREE_DATA_DIR|PREE_TEAM_TOKEN|PREE_ALLOWED_ORIGIN|STORAGE_MOUNT_PATH)["']*\s*[= ]/im]
+  ['Dockerfile ENV platform value', /^\s*ENV\s+[^\n]*?(?<![A-Za-z0-9_])["']*(?:PREE_ENV|PREE_DATA_DIR|PREE_TEAM_TOKEN|PREE_ALLOWED_ORIGIN|STORAGE_MOUNT_PATH)["']*\s*[= ]/im]
 ];
 
 const hits = [];

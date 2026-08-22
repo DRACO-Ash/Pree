@@ -785,7 +785,44 @@ _EXECUTABLE_DIRECTORIES = (
 # So this does not recognise what docker accepts. It refuses everything that is not a PLAIN
 # assignment, one word at a time, and this Dockerfile is written in that form throughout. A word
 # docker would honour and this cannot read is a failure, not a skip.
-_PLAIN_ASSIGNMENT = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s"']*)""")
+# The inner content is CAPTURED, not post-stripped. `.strip("\"'")` removes both quote characters
+# repeatedly from both ends, so `PREE_ENV="'development'"` was read as `development` where docker
+# sets `'development'`, and a value ending in a quoted path lost its closing quote. A refusal that
+# reads a value docker does not set is the failure it exists to prevent, one layer in.
+_PLAIN_ASSIGNMENT = re.compile(r"""([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|([^\s"']*))$""")
+
+
+def _split_outside_quotes(argument: str) -> list[str]:
+    """Words, splitting only at whitespace that is not inside a quoted run.
+
+    One rule, exactly stated, rather than a recogniser of quoting tricks: a quote character toggles
+    the current run, and whitespace outside a run ends a word. Anything the rule cannot make sense
+    of is handed to the refusal below as one word and refused there.
+    """
+    words: list[str] = []
+    current: list[str] = []
+    quote = ""
+    for character in argument:
+        if quote:
+            current.append(character)
+            if character == quote:
+                quote = ""
+            continue
+        if character in "\"'":
+            quote = character
+            current.append(character)
+            continue
+        if character.isspace():
+            if current:
+                words.append("".join(current))
+                current = []
+            continue
+        current.append(character)
+    if current:
+        words.append("".join(current))
+    # An unterminated quote is refused rather than guessed at.
+    assert not quote, f"an ENV or ARG argument has an unclosed {quote} quote: {argument[:80]}"
+    return words
 
 
 def _env_assignments(argument: str) -> list[tuple[str, str]]:
@@ -795,8 +832,17 @@ def _env_assignments(argument: str) -> list[tuple[str, str]]:
     it is refused rather than parsed: a parser that silently returns nothing for a form docker
     honours reports a pass for a line nobody read.
     """
-    words = argument.split()
+    # Split at whitespace that is not inside quotes, so a quoted value containing a space is one
+    # word. `str.split()` broke `ENV PREE_LABEL="Pree scorer"` in two and refused a form docker
+    # honours, and `shlex.split(posix=False)` splits inside a mid-token quote for the same reason.
+    # A false refusal is a real cost: the next person who needs the form deletes the guard.
+    words = _split_outside_quotes(argument)
     assert words, "an ENV or ARG instruction has no argument at all"
+    # A bare `ARG NAME` DECLARES a build argument with no default, which is the multi-arch idiom
+    # (`ARG TARGETARCH`) and bakes nothing. It carries no `=` and is not the legacy form, so it was
+    # refused with the wrong diagnosis.
+    if len(words) == 1 and "=" not in words[0]:
+        return []
     # The FIRST WORD decides the form, which is what docker inspects. Testing the whole argument
     # let `ENV PATH /opt/tools/exec=1:...` pass as an assignment while docker took the legacy form.
     assert "=" in words[0], (
@@ -811,7 +857,9 @@ def _env_assignments(argument: str) -> list[tuple[str, str]]:
             f"key all change what docker sets while leaving a permissive parser agreeing with "
             f"itself, so anything but the plain form is refused: {argument[:80]}"
         )
-        parsed.append((found.group(1), found.group(2).strip("\"'")))
+        double, single, bare = found.group(2), found.group(3), found.group(4)
+        value = double if double is not None else single if single is not None else (bare or "")
+        parsed.append((found.group(1), value))
     return parsed
 
 

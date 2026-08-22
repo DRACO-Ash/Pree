@@ -46,7 +46,13 @@ from .ratelimit import (
     RateLimiter,
 )
 from .scoring import ThreatIndicators, assess
-from .security import MAX_ACTOR_LENGTH, AuthError, authorise, sanitise_actor
+from .security import (
+    MAX_ACTOR_LENGTH,
+    AuthError,
+    authorise,
+    sanitise_actor,
+    sanitise_log_part,
+)
 from .store import SCHEMA_VERSION, JsonStore, StoreError
 
 LIVENESS_PATHS = ("/", "/healthz", "/readyz", "/livez", "/ping")
@@ -415,7 +421,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
                             # line survives today only because json.dumps escapes it, which stops
                             # holding the moment a value is unwrapped by a log viewer or `jq -r`.
                             # The actor label has been scrubbed for this reason since round eleven.
-                            "loc": [sanitise_actor(str(part)) for part in item.get("loc", ())],
+                            "loc": [sanitise_log_part(str(part)) for part in item.get("loc", ())],
                             "type": str(item.get("type"))[:MAX_ACTOR_LENGTH],
                         }
                         for item in exc.errors()[:MAX_VALIDATION_ERRORS_LOGGED]

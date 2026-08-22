@@ -11,13 +11,14 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
-from fastapi import HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi import applications as fastapi_applications
 from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
 from fastapi.routing import APIRoute
@@ -44,7 +45,12 @@ from pree.audit import build_logger
 from pree.health import StorageProber
 from pree.main import build
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
-from pree.security import MAX_ACTOR_LENGTH, AuthError, sanitise_actor
+from pree.security import (
+    MAX_ACTOR_LENGTH,
+    AuthError,
+    sanitise_actor,
+    sanitise_log_part,
+)
 from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, PRODUCTION_TOKEN, TEST_TOKEN, build_client, make_config
 
@@ -1782,6 +1788,18 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
     wire. Pinning types on the listener while asserting the gate elsewhere left the gate
     unasserted on the thing that runs.
     """
+    # A reference app FastAPI builds for itself, so the documentation endpoints can be compared by
+    # code-object identity rather than by any string an endpoint can set about itself.
+    reference = FastAPI(docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
+    reference_codes = {
+        route.path: route.endpoint.__code__
+        for route in _all_routes(reference)
+        if type(route) is Route and hasattr(route.endpoint, "__code__")
+    }
+    assert set(reference_codes) >= EXPECTED_DOC_PATHS, (
+        f"the reference app exposes {sorted(reference_codes)}, missing "
+        f"{sorted(EXPECTED_DOC_PATHS - set(reference_codes))}"
+    )
     for env in ("development", "production"):
         with _listener(env, tmp_path) as app:
             # This project's OWN routes, exactly and in order.
@@ -1794,18 +1812,27 @@ def test_the_listener_serves_exactly_the_pinned_route_inventory(tmp_path: Path) 
             # And FastAPI's documentation routes, structurally: exactly `Route`, on a pinned path,
             # ungated. Nothing else may be in the table at all.
             foreign = [row for row in _served_inventory(app) if row[3] != "pree.app"]
-            for kind, path, _methods, origin, _qualname, _gated in foreign:
-                # The ORIGIN is asserted, not merely used to partition. It was computed and then
-                # never compared, so a `Route("/redoc", leak)` defined in main.py landed in the
-                # `unrecognised:` bucket and satisfied every property that WAS checked: `gated` is
-                # computed only for an APIRoute and is unconditionally False for a plain Route, so
-                # two of the three asserted nothing at all, and the route served the whole
-                # assessment store as HTML to an unauthenticated caller.
-                assert (kind, path in EXPECTED_DOC_PATHS, origin) == (
-                    "Route",
-                    True,
-                    "fastapi.applications",
-                ), f"the {env} listener carries a route this suite cannot account for: {path!r}"
+            for kind, path, _methods, _origin, _qualname, _gated in foreign:
+                # The origin string partitions the table and is deliberately NOT the assertion:
+                # it derives from `co_filename`, which is whatever string was handed to `compile()`,
+                # so asserting it only moved the forgery one step. The identity check below is the
+                # assertion. `gated` is not asserted either, because it is derived only for an
+                # APIRoute and is unconditionally False for a plain Route, so it never said
+                # anything.
+                assert (kind, path in EXPECTED_DOC_PATHS) == ("Route", True), (
+                    f"the {env} listener carries a route this suite cannot account for: {path!r}"
+                )
+                # And the endpoint's CODE OBJECT, by identity against a reference app FastAPI
+                # builds itself. `co_filename` is not identity: it is whatever string was handed to
+                # `compile()`, so `compile(src, getsourcefile(fastapi.applications), "exec")` gives
+                # any function this origin, and because it is a plain function Starlette wraps it in
+                # its own `request_response` app, satisfying the callable check too. A code object
+                # cannot be forged into being FastAPI's.
+                assert path in reference_codes, f"no reference documentation route for {path!r}"
+                serving = next(r for r in _all_routes(app) if getattr(r, "path", None) == path)
+                assert serving.endpoint.__code__ is reference_codes[path], (
+                    f"the {env} listener's {path!r} is not FastAPI's own endpoint"
+                )
             if env == "production":
                 assert not foreign, f"production serves routes outside pree.app: {foreign}"
             else:
@@ -2238,59 +2265,90 @@ def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestCl
 # audit call wrote the shared credential into the pod log store on every write with the suite green.
 # Every string-valued audit field, by exact set or bounded pattern. A number cannot carry a base64
 # credential; a string can, which is why these and not the numeric fields.
-class _ScrubIdempotent:
-    """Matches a value only if the shipped sanitiser would leave it unchanged.
+class _ValueRule:
+    """One interface for every string rule, so the dispatch cannot fail to recognise one.
 
-    A stand-in for a pattern, so the rule is the application's own function rather than a charset
-    restated beside it. Two hand-written charsets in this table had already drifted from the code
-    they described.
+    The previous version was a duck-typed stand-in for `re.Pattern`, and the dispatch tested
+    `isinstance(allowed, re.Pattern)` then `isinstance(allowed, frozenset)` with no else, so the
+    object matched neither arm and every value it governed was accepted UNCHECKED. Poisoning its
+    `match` with a raise left the whole suite green, which is the definition of a control nothing
+    calls. It replaced two working regexes, so it was a regression rather than a gap.
     """
 
-    pattern = "sanitise_actor(value) == value and len(value) <= MAX_ACTOR_LENGTH"
+    def __init__(self, description: str) -> None:
+        self.description = description
 
-    def match(self, value: str) -> bool:
-        return sanitise_actor(value) == value and len(value) <= MAX_ACTOR_LENGTH
+    def rejects(self, value: str) -> bool:
+        raise NotImplementedError
 
 
-_SCRUB_IDEMPOTENT = _ScrubIdempotent()
+class _Pattern(_ValueRule):
+    def __init__(self, pattern: str) -> None:
+        super().__init__(pattern)
+        self._compiled = re.compile(pattern)
 
-AUDIT_STRING_VALUES: dict[str, frozenset[str] | re.Pattern[str] | _ScrubIdempotent] = {
-    "kind": frozenset(
-        {
-            "audit",
-            "auth_reject",
-            "validation_reject",
-            "http_reject",
-            "cors_reject",
-            "store_error",
-        }
+    def rejects(self, value: str) -> bool:
+        return self._compiled.match(value) is None
+
+
+class _OneOf(_ValueRule):
+    def __init__(self, *permitted: str) -> None:
+        super().__init__(f"one of {sorted(permitted)}")
+        self._permitted = frozenset(permitted)
+
+    def rejects(self, value: str) -> bool:
+        return value not in self._permitted
+
+
+class _ScrubIdempotent(_ValueRule):
+    """Rejects any value the shipped sanitiser would change, or that exceeds its cap.
+
+    The rule is the application's own function rather than a charset restated beside it, because
+    two hand-written charsets in this table had already drifted from the code they described. It is
+    the right property for log-injection safety and it admits a non-Latin operator name; it does
+    NOT carry secrecy, which is the separate substring and header checks' job.
+    """
+
+    def __init__(self, scrub: Callable[[str], str], name: str) -> None:
+        _ValueRule.__init__(self, f"unchanged by {name} and within MAX_ACTOR_LENGTH")
+        self._scrub = scrub
+
+    def rejects(self, value: str) -> bool:
+        return self._scrub(value) != value or len(value) > MAX_ACTOR_LENGTH
+
+
+_ACTOR_SCRUBBED = _ScrubIdempotent(sanitise_actor, "sanitise_actor")
+_LOG_PART_SCRUBBED = _ScrubIdempotent(sanitise_log_part, "sanitise_log_part")
+
+AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
+    "kind": _OneOf(
+        "audit",
+        "auth_reject",
+        "validation_reject",
+        "http_reject",
+        "cors_reject",
+        "store_error",
     ),
-    "action": frozenset({"assess", "read_assessment"}),
-    # DERIVED from the shipped scrub, not restated. The hand-written charset admitted ASCII only
-    # while `_UNSAFE_LOG_CHARS` uses `\w`, which admits roughly 130,000 Unicode word characters, so
-    # a legitimate operator name in any non-Latin script would have failed a pin that claimed to
-    # describe the application. Idempotence under the real function is the property that matters
-    # and it cannot drift: a value the scrub would change is a value that was never scrubbed.
-    "actor": _SCRUB_IDEMPOTENT,
-    # The five outcomes the application actually emits. "created" and "refused" were in this set
-    # and produced by nothing, which is the same standing-exemption defect as the `reason` field
-    # below, one value wide instead of one field wide.
-    "outcome": frozenset({"ok", "error", "disclosed", "not_modified", "not_found"}),
-    "confidence": frozenset({"low", "medium", "high"}),
-    # The APPLICATION's own pattern, not a hand-written charset. The charset admitted roughly 113
-    # characters of appended hex on a typical key, so 80 hex characters of the token appended to
-    # the audit key passed. STORE_KEY_PATTERN requires exactly one colon with each half at most 64
-    # characters, so an appended encoding overflows it, and importing the constant deletes a
-    # duplicated fact at the same time.
-    "key": re.compile(STORE_KEY_PATTERN),
-    "path": re.compile(r"^[!-~]{1,160}$"),
-    "reason": re.compile(r"^[ -~]{0,512}$"),
-    # Inside `validation_reject.errors`, which the flat scan never reached. Both are bounded
-    # server-side to MAX_ACTOR_LENGTH and both echo caller-shaped input, so they get the tightest
-    # pattern that admits a pydantic location path and error type.
-    # Same derivation, now that the application scrubs each part rather than only capping it.
-    "loc": _SCRUB_IDEMPOTENT,
-    "type": re.compile(r"^[a-z0-9_.]{0,64}$"),
+    "action": _OneOf("assess", "read_assessment"),
+    # DERIVED from the shipped scrub rather than restated beside it. A hand-written charset admitted
+    # ASCII only while `_UNSAFE_LOG_CHARS` uses `\w`, so a legitimate operator name in a non-Latin
+    # script would have failed a pin claiming to describe the application.
+    "actor": _ACTOR_SCRUBBED,
+    # The five outcomes the application actually emits. "created" and "refused" were here and
+    # produced by nothing, which is a standing exemption rather than a pin.
+    "outcome": _OneOf("ok", "error", "disclosed", "not_modified", "not_found"),
+    "confidence": _OneOf("low", "medium", "high"),
+    # The APPLICATION's own pattern. A hand-written charset admitted roughly 113 characters of
+    # appended hex, so the token's hex appended to the audit key passed. STORE_KEY_PATTERN requires
+    # exactly one colon with each half at most 64 characters, so an appended encoding overflows it.
+    "key": _Pattern(STORE_KEY_PATTERN),
+    "path": _Pattern(r"^[!-~]{1,160}$"),
+    "reason": _Pattern(r"^[ -~]{0,512}$"),
+    # Inside `validation_reject.errors`, which the flat scan never reached. `loc` echoes a
+    # caller-supplied field name and the application scrubs each part, so the same derivation
+    # applies; `type` is pydantic's own vocabulary.
+    "loc": _LOG_PART_SCRUBBED,
+    "type": _Pattern(r"^[a-z0-9_.]{0,64}$"),
 }
 
 
@@ -2341,7 +2399,7 @@ EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
 
 def _exercise_every_surface(
     tmp_path: Path, prober: StorageProber
-) -> tuple[list[str], list[str], str]:
+) -> tuple[list[str], list[str], str, int]:
     """Drive every response shape and every log channel once, and return what came back.
 
     A helper rather than a test, because the two controls it feeds are separate: nothing may
@@ -2373,6 +2431,23 @@ def _exercise_every_surface(
     )
     logger = build_logger(stream)
     with build_client(config, logger, prober) as probe:
+        # Every request timed, by wrapping the one method the others call through. The slowest
+        # single request is the honest ceiling for a per-request duration field: bounding it by the
+        # whole exercise's elapsed time left about 7.5 bits a record, so `token[i] % 128` still
+        # passed and 32 writes carried a 32-character token. A timing field is a covert channel of
+        # its bound's width, and only correlating it against an independent measurement narrows it
+        # to the width of a real measurement.
+        timings: list[int] = []
+        issue = probe.request
+
+        def timed(*args: Any, **kwargs: Any) -> Any:
+            began = time.monotonic()
+            try:
+                return issue(*args, **kwargs)
+            finally:
+                timings.append(int((time.monotonic() - began) * 1000))
+
+        probe.request = timed  # type: ignore[method-assign]
         bodies: list[str] = []
         leaked_headers: list[str] = []
 
@@ -2397,6 +2472,17 @@ def _exercise_every_surface(
         # echoes the rejected body, and the token in a query string, which is the documented
         # operator mistake the access-log filter redacts.
         record(probe.post("/v1/assess", headers=AUTH, json={"bad": TEST_TOKEN}), "422 assess")
+        # A HOSTILE field name, so the `loc` rule bites on the input class it exists for. Without
+        # it the rule was only ever handed `body`, `protected_asset_id` and `candidate_id`, so
+        # reverting the application's scrub back to a bare length cap left the suite green.
+        record(
+            probe.post(
+                "/v1/assess",
+                headers=AUTH,
+                json={'x"}\n{"kind":"audit","actor":"root"}\x1b[2J': 1},
+            ),
+            "422 hostile field name",
+        )
         record(probe.get(f"/healthz?token={TEST_TOKEN}"), "query string")
         # EVERY error shape, because the walk above only ever produces 401s and 422s and each of
         # these is built by a different handler. A header set on one of them would have been
@@ -2456,7 +2542,7 @@ def _exercise_every_surface(
         broken = probe.get(f"/v1/assessments/{key}", headers=AUTH)
         assert broken.status_code == 503, f"a corrupt snapshot answered {broken.status_code}"
         record(broken, "store error")
-    return bodies, leaked_headers, stream.getvalue()
+    return bodies, leaked_headers, stream.getvalue(), max(timings, default=0)
 
 
 def test_the_team_token_reaches_no_response_body_header_or_log_record(
@@ -2467,7 +2553,7 @@ def test_the_team_token_reaches_no_response_body_header_or_log_record(
     /diagnostics reports the token's LENGTH and whether it is set, deliberately, so a caller can
     confirm the deployment without learning the value.
     """
-    bodies, leaked_headers, log = _exercise_every_surface(tmp_path, prober)
+    bodies, leaked_headers, log, _slowest = _exercise_every_surface(tmp_path, prober)
     leaked = [body for body in bodies if TEST_TOKEN in body]
     assert not leaked, f"a response body carried the team token: {leaked}"
     assert not leaked_headers, (
@@ -2496,12 +2582,23 @@ def _check_audit_value(
         return
     if isinstance(value, str):
         allowed = AUDIT_STRING_VALUES.get(field)
+        # FAIL CLOSED on a rule this cannot evaluate. The chain of isinstance arms had no else, so
+        # an unrecognised rule type accepted everything it governed in silence.
         if allowed is None:
             offending.append(f"{where} is a string no rule pins: {value!r}")
-        elif isinstance(allowed, re.Pattern) and not allowed.match(value):
-            offending.append(f"{where}={value!r} fails {allowed.pattern}")
-        elif isinstance(allowed, frozenset) and value not in allowed:
-            offending.append(f"{where}={value!r} outside {sorted(allowed)}")
+        elif not isinstance(allowed, _ValueRule):
+            # mypy proves this unreachable from the dict's annotation, and that is exactly why the
+            # RUNTIME guard stays: the previous version's types said the same and the dispatch
+            # still accepted every value under a rule it did not recognise, because a duck-typed
+            # object satisfied no isinstance arm and there was no else. A type is a claim about
+            # the code as written; this is the behaviour when the claim stops holding.
+            # `test_every_audit_value_rule_can_actually_reject_something` patches an object in to
+            # exercise it.
+            offending.append(  # type: ignore[unreachable]
+                f"{where}: rule type {type(allowed).__name__} is not evaluated"
+            )
+        elif allowed.rejects(value):
+            offending.append(f"{where}={value!r} fails: {allowed.description}")
         return
     if isinstance(value, (int, float)):
         bound = bounds.get(field)
@@ -2519,6 +2616,55 @@ def _check_audit_value(
             _check_audit_value(field, item, f"{where}[{index}]", bounds, offending)
         return
     offending.append(f"{where} is a {type(value).__name__}, which no rule pins")
+
+
+# A known-bad value for every string rule, so a rule that cannot reject anything is red. This is
+# the canary the dead `_ScrubIdempotent` needed: it was never consulted, and no test noticed,
+# because mypy sees nothing wrong with an unreachable branch and coverage measures `src/` only, so
+# this table is checked by neither gate.
+AUDIT_RULE_CANARIES: dict[str, str] = {
+    "kind": "not_a_kind",
+    "action": "exfiltrate",
+    "actor": 'ops"}\n{"kind":"audit","actor":"root"}',
+    "outcome": "created",
+    "confidence": "certain",
+    "key": "no-colon-at-all",
+    "path": "/has a space",
+    "reason": "\x1b[2Jclear screen",
+    "loc": "body\r\ninjected",
+    "type": "NotLowercase",
+}
+
+
+def test_every_audit_value_rule_can_actually_reject_something() -> None:
+    """A rule nothing can fail is a rule nothing pins.
+
+    `_ScrubIdempotent` was a duck-typed stand-in for `re.Pattern`, the dispatch recognised neither
+    it nor anything else it did not expect, and there was no else, so every value it governed was
+    accepted in silence. Poisoning its `match` with a raise left all 311 tests green. This asserts
+    the property that was missing: each rule is handed a value it must reject, and the dispatch is
+    handed a rule type it does not know and must complain about.
+    """
+    assert set(AUDIT_RULE_CANARIES) == set(AUDIT_STRING_VALUES), (
+        "every string rule needs a canary: "
+        f"{sorted(set(AUDIT_STRING_VALUES) ^ set(AUDIT_RULE_CANARIES))}"
+    )
+    for field, bad in AUDIT_RULE_CANARIES.items():
+        rule = AUDIT_STRING_VALUES[field]
+        assert rule.rejects(bad), (
+            f"the rule for {field!r} accepts {bad!r}, so it pins nothing: {rule.description}"
+        )
+    # And the dispatch itself must refuse a rule it cannot evaluate, rather than passing the value.
+    complaints: list[str] = []
+    _check_audit_value("actor", "anything", "canary.actor", {}, complaints)
+    assert not complaints, complaints
+    unknown: dict[str, Any] = {"actor": object()}
+    with mock.patch.dict(AUDIT_STRING_VALUES, unknown, clear=False):
+        complaints = []
+        _check_audit_value("actor", "anything", "canary.actor", {}, complaints)
+    assert complaints and "is not evaluated" in complaints[0], (
+        f"the dispatch accepted a value under an unrecognised rule type: {complaints}"
+    )
 
 
 def test_every_audit_record_matches_its_pinned_shape_and_values(
@@ -2541,13 +2687,15 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
     route, every method, three token states and six error shapes, so a condition it misses has to
     be one no ordinary caller can reach either.
     """
-    started = time.monotonic()
-    _, _, log = _exercise_every_surface(tmp_path, prober)
-    elapsed_ms = int((time.monotonic() - started) * 1000)
+    _, _, log, slowest_ms = _exercise_every_surface(tmp_path, prober)
     emitted = [json.loads(line) for line in log.splitlines() if line.strip()]
-    # No single operation in the exercise can have taken longer than the whole exercise, so this is
-    # the tightest ceiling available without re-instrumenting the application.
-    bounds = {**AUDIT_NUMERIC_BOUNDS, "duration_ms": (0, elapsed_ms)}
+    # The SLOWEST SINGLE REQUEST, not the whole exercise. No handler can have taken longer than the
+    # request that contained it. The residual is honest and worth stating in bits rather than
+    # implying closure: a ceiling of a few milliseconds still admits a handful of bits per record,
+    # so a determined leak could spread a credential across many writes. Closing it entirely means
+    # the application not reporting a duration at all, which would cost the operator the one field
+    # that shows a slow store.
+    bounds = {**AUDIT_NUMERIC_BOUNDS, "duration_ms": (0, max(slowest_ms, 1))}
     assert emitted, "the walk produced no audit records at all, so this greps an empty stream"
     # An unknown KIND is itself a finding, not a record to skip: a new record shape is a new
     # disclosure channel, and `.get(kind, set())` on a missing key would have waved it through.

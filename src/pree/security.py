@@ -52,7 +52,22 @@ def sanitise_actor(value: str | None) -> str:
     """
     if not value:
         return "anonymous"
+    return _scrub(value, empty="anonymous")
+
+
+def sanitise_log_part(value: str) -> str:
+    """The same scrub for a field name echoed back in a rejection record.
+
+    A DISTINCT empty marker, because `anonymous` is the sentinel for "no actor supplied": a rejected
+    field name that scrubs to nothing, such as `{"*": 1}` or `{"": 1}`, was logged as `anonymous`
+    and became indistinguishable from an anonymous caller in the one field that exists for
+    diagnosis.
+    """
+    return _scrub(value, empty="[unprintable]")
+
+
+def _scrub(value: str, *, empty: str) -> str:
     cleaned = _UNSAFE_LOG_CHARS.sub("", value).strip()
     if not cleaned:
-        return "anonymous"
+        return empty
     return cleaned[:MAX_ACTOR_LENGTH]
