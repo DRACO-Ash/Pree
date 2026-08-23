@@ -4264,6 +4264,231 @@ def test_the_guard_covers_the_pre_wrap_dunder_streams(monkeypatch: pytest.Monkey
     assert emitted.count(CREDENTIAL_ALARM) == 2, f"expected two alarms: {emitted!r}"
 
 
+def test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message() -> None:
+    """`getMessage()` is not the rendered record, and the gap between the two was a live leak.
+
+    `Formatter.format` appends the exception text and then the stack text AFTER the formatted
+    message, so a scan of the message alone let `logger.error("auth failed", exc_info=...)` put the
+    credential on the emitted line with the guard armed and no alarm raised. The filter's own
+    docstring said "any log record whose rendered text contains the credential" for the whole of
+    that round, which is the failure mode this suite keeps meeting: the sentence was right and the
+    code implemented a narrower thing.
+
+    Three parts, because a formatter reaches the credential three ways: `exc_info` it renders
+    itself, `exc_text` it finds already cached by an earlier handler and reuses verbatim, and
+    `stack_info` it appends as given. Alarming `msg` closes none of them, so the guard clears all
+    three on a refusal.
+
+    Driven on a handler whose stream is NOT a wrapped `sys` stream, deliberately. That is where the
+    wrapper half cannot cover for the filter half, and it is the shape of every handler that writes
+    to a file, a socket, or a test sink.
+    """
+    secret = "Wx9-Yt2_Ur5.Ip8~Ok1Aj4Sh6Dg3FZq7"
+    sink = io.StringIO()
+    # Built BEFORE arming, so the handler walk is what attaches the filter rather than the patched
+    # constructor, and the stream is a sink no wrapper owns so no re-point can happen.
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("rendered.record.scan")
+    previous, previous_level, previous_propagate = (
+        logger.handlers,
+        logger.level,
+        logger.propagate,
+    )
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    def bare_record(**fields: Any) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name=logger.name,
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=0,
+            msg="an authentication failure",
+            args=(),
+            exc_info=None,
+        )
+        for field, value in fields.items():
+            setattr(record, field, value)
+        return record
+
+    def reject(message: str) -> None:
+        """Raise from a frame of its own, so the traceback under test is a real one."""
+        raise ValueError(message)
+
+    install_credential_guard(secret)
+    try:
+        # exc_info, rendered by the formatter from a traceback that genuinely happened.
+        try:
+            reject(f"token rejected: {secret}")
+        except ValueError:
+            logger.error("an authentication failure", exc_info=True)
+        # exc_text, the cache an earlier handler's formatter leaves behind.
+        handler.handle(bare_record(exc_text=f"ValueError: token rejected: {secret}"))
+        # stack_info, appended by the formatter exactly as given.
+        handler.handle(bare_record(stack_info=f'  File "x", line 1, in f\n    token = "{secret}"'))
+        # A traceback carrying NO credential must survive intact, or the guard is a control on
+        # diagnosability rather than on the credential.
+        try:
+            reject("token rejected")
+        except ValueError:
+            logger.error("a benign authentication failure", exc_info=True)
+        guarded = sink.getvalue()
+
+        # NON-VACUOUS by construction. With the guard disarmed, the same record on the same handler
+        # must reach the same sink in plaintext: without this half, a formatter that never emitted
+        # the traceback at all would satisfy every assertion above. It also shows what disarming
+        # does and does not undo - the filter is still attached and is inert, not removed.
+        install_credential_guard(None)
+        sink.truncate(0)
+        sink.seek(0)
+        try:
+            reject(f"token rejected: {secret}")
+        except ValueError:
+            logger.error("an authentication failure", exc_info=True)
+        unguarded = sink.getvalue()
+    finally:
+        install_credential_guard(None)
+        logger.handlers = previous
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+
+    assert secret in unguarded, (
+        "the traceback channel does not reach this sink even unguarded, so the assertions below "
+        "prove nothing about the guard"
+    )
+    assert secret not in guarded, f"the credential reached the log through a traceback: {guarded!r}"
+    assert guarded.count(CREDENTIAL_ALARM) == 3, (
+        f"expected one alarm for each of exc_info, exc_text and stack_info: {guarded!r}"
+    )
+    assert "ValueError: token rejected" in guarded, (
+        "the guard stripped a traceback that carried no credential, so it costs every diagnosis "
+        "rather than the leaking ones"
+    )
+
+
+def test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only() -> None:
+    """The re-point runs on the BOOT path, so an `AttributeError` there is CrashLoopBackOff.
+
+    `handler.stream = wrapper` assumes an assignable attribute, and a handler is free to expose
+    `stream` as a read-only property or to slot it. That handler is reached by the walk in
+    `install_credential_guard`, which runs inside `main.build()` before the app binds: the guard
+    would not have leaked the credential, it would have stopped the worker importing the app, and a
+    control that takes the process down is one an operator removes.
+
+    Both halves are asserted, because the soft failure is only acceptable if the other half holds:
+    arming completes, and the record is still alarmed by the FILTER even though the stream could not
+    be re-pointed.
+    """
+    secret = "Yt2-Ur5_Ip8.Ok1~Aj4Sh6Dg3FZq7Wx9"
+    sink = io.StringIO()
+
+    class _ReadOnlyStream(logging.Handler):
+        """A handler whose captured stream cannot be reassigned."""
+
+        def __init__(self, captured: Any) -> None:
+            self._captured = captured
+            super().__init__()
+
+        @property
+        def stream(self) -> Any:
+            return self._captured
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self._captured.write(self.format(record) + "\n")
+
+    handler = _ReadOnlyStream(sink)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("read.only.stream")
+    previous, previous_level, previous_propagate = (
+        logger.handlers,
+        logger.level,
+        logger.propagate,
+    )
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    # `sys.stdout` IS this sink, so the wrapper the guard installs owns it and the re-point
+    # branch is entered rather than skipped. Without this the test would pass on a handler the
+    # guard never tried to re-point, which measures nothing.
+    saved_stdout = sys.stdout
+    sys.stdout = sink
+    try:
+        install_credential_guard(secret)
+        try:
+            logger.error("leak past a read-only stream: %s", secret)
+            emitted = sink.getvalue()
+        finally:
+            install_credential_guard(None)
+    finally:
+        sys.stdout = saved_stdout
+        logger.handlers = previous
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+        handler.close()
+
+    assert handler.stream is sink, "the read-only stream was somehow reassigned"
+    assert secret not in emitted, (
+        f"the filter half did not cover a handler whose stream could not be re-pointed: {emitted!r}"
+    )
+    assert emitted.count(CREDENTIAL_ALARM) == 1, f"expected one alarm: {emitted!r}"
+
+
+def test_the_guard_reports_the_callers_length_when_it_refuses_a_write() -> None:
+    """The one item of a round's six findings that nothing held: reverting it left the suite green.
+
+    `write` may legally return a SHORT count, and its contract lets the caller loop on the
+    remainder. Returning the ALARM's length therefore tells a looping caller that the tail of the
+    refused text is still unwritten, and the tail of a refused text is the credential. `print` and
+    `StreamHandler` both discard the return value, which is what made this a trap rather than a
+    fault, and what made it invisible to every test that drove the guard through either.
+
+    So the caller's loop is DRIVEN here rather than described. Under `return written` it runs a
+    second time on the credential-bearing tail, which is the harm; a test that only compared two
+    numbers would report the same failure without showing it.
+    """
+    secret = "Ur5-Ip8_Ok1.Aj4~Sh6Dg3FZq7Wx9Yt2"
+    accepted: list[str] = []
+
+    class _Counting:
+        def write(self, text: str) -> int:
+            accepted.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            return None
+
+    stream = _GuardedStream(_Counting())
+    alarm = f"{CREDENTIAL_ALARM}\n"
+    prefix = (
+        "a diagnostic line long enough that the alarm is much shorter than what comes "
+        "before the credential, with room to spare: "
+    )
+    leak = f"{prefix}{secret}\n"
+    # META-ASSERTION on the fixture. The tail a short count re-submits has to carry the WHOLE
+    # credential, or this test measures a wrong number rather than a leak.
+    assert secret in leak[len(alarm) :], "the fixture does not exercise the harm"
+
+    install_credential_guard(secret)
+    try:
+        reported = stream.write(leak)
+        accepted.clear()
+        remaining, rounds = leak, 0
+        while remaining and rounds < 5:
+            rounds += 1
+            remaining = remaining[stream.write(remaining) :]
+    finally:
+        install_credential_guard(None)
+
+    assert reported == len(leak), (
+        f"the guard reported {reported} for a {len(leak)}-character refused write, so a caller "
+        f"looping until everything is written re-submits its last {len(leak) - reported} characters"
+    )
+    assert rounds == 1, f"the caller's write loop ran {rounds} times for one refused write"
+    assert accepted == [alarm], f"the refused text reached the stream on a retry: {accepted!r}"
+
+
 def test_the_runtime_guard_is_armed_by_the_boot_path_and_not_by_the_factory() -> None:
     """WHERE it is armed is part of the control, so it is asserted rather than assumed.
 
@@ -4318,8 +4543,10 @@ EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
         }
     ),
     # `sys` is here and nowhere else that serves a request: the output guard has to replace the
-    # streams, and that is the one place in the package that needs to.
-    "audit.py": frozenset({"__future__", "json", "logging", "sys", "typing"}),
+    # streams, and that is the one place in the package that needs to. `contextlib` is here for
+    # `suppress`, on the three paths where a guard that raises is worse than the leak it prevents:
+    # a record whose rendering raises, and a handler whose `stream` cannot be reassigned.
+    "audit.py": frozenset({"__future__", "contextlib", "json", "logging", "sys", "typing"}),
     "config.py": frozenset({"__future__", "dataclasses", "os", "pathlib", "re"}),
     "health.py": frozenset(
         {

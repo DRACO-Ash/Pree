@@ -6,6 +6,7 @@ errors stay generic; the detail lands here, server-side.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sys
@@ -148,6 +149,51 @@ _GUARDED_CREDENTIAL: str | None = None
 CREDENTIAL_ALARM = '{"kind":"credential_guard","outcome":"refused_a_line_carrying_the_credential"}'
 
 
+# The DEFAULT exception renderer, built once rather than per record. `Formatter.formatException` is
+# the same code path a handler's own formatter runs, so what the guard scans is what the handler
+# will emit rather than an approximation of it. A handler carrying a formatter that renders a
+# traceback DIFFERENTLY is the residual, and it is named in `install_credential_guard`.
+_EXCEPTION_RENDERER = logging.Formatter()
+
+
+def _scannable_text(record: logging.LogRecord) -> str:
+    """Everything a formatter will put on the line, not only the message.
+
+    `getMessage()` alone was the whole scan for a round, and it is not the rendered record.
+    `Formatter.format` appends the exception text and the stack text AFTER the message, so
+    `logger.error("auth failed", exc_info=ValueError(token))` put the credential on the line with
+    the guard armed and no alarm raised. Measured on a handler whose stream is not a wrapped `sys`
+    stream, which is where the wrapper half cannot cover for the filter half: a file handler, a
+    `StringIO`, a socket handler.
+
+    Each part is produced under its own `try`, and a part that cannot be rendered is skipped rather
+    than failing the whole scan. That is deliberately NOT fail-closed, for the same reason the
+    caller states: a record that cannot be rendered cannot be scanned, logging swallows an exception
+    raised in a filter and emits the line anyway, and dropping the line silently is a control whose
+    success looks like nothing happening. Skipping one part still scans the others, where scanning
+    nothing was the previous behaviour.
+    """
+    parts: list[str] = []
+    # `Exception` and not a narrower class: `getMessage()` runs `%`-formatting over caller-supplied
+    # args, so it raises whatever the argument's `__str__` or `__format__` raises. A malformed
+    # record must not take the process down.
+    with contextlib.suppress(Exception):
+        parts.append(record.getMessage())
+    if record.exc_text:
+        # Already rendered and cached by an earlier handler's formatter, so it will be reused
+        # verbatim by the next one rather than re-derived from `exc_info`.
+        parts.append(record.exc_text)
+    exc_info = record.exc_info
+    if exc_info:
+        # Same reasoning: rendering a traceback runs the exception's own `__str__`. See the
+        # docstring - one unscannable part is skipped, the rest of the record is still scanned.
+        with contextlib.suppress(Exception):
+            parts.append(_EXCEPTION_RENDERER.formatException(exc_info))
+    if record.stack_info:
+        parts.append(record.stack_info)
+    return "\n".join(parts)
+
+
 class _CredentialGuard(logging.Filter):
     """Refuse to emit any log record whose rendered text contains the credential.
 
@@ -173,19 +219,26 @@ class _CredentialGuard(logging.Filter):
     swallowed by the logging module and the line goes out anyway; returning False would drop the
     line silently, and a control whose success looks like nothing happening is one nobody notices
     has broken. The record is replaced with a fixed alarm that carries no caller input at all.
+
+    The scan is over the WHOLE rendered record, not the message: see `_scannable_text` for the
+    traceback bypass that cost a round.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         expected = _GUARDED_CREDENTIAL
         if not expected:
             return True
-        try:
-            rendered = record.getMessage()
-        except Exception:
-            return True
-        if expected in rendered:
+        if expected in _scannable_text(record):
             record.msg = CREDENTIAL_ALARM
             record.args = ()
+            # The traceback halves are CLEARED, not merely alarmed over. `Formatter.format` appends
+            # `exc_text` and `stack_info` after the formatted message, so replacing `msg` alone
+            # leaves the credential on the following lines of the same emission. `exc_text` is
+            # cleared as well as `exc_info` because a formatter caches its rendering there and the
+            # next handler reuses the cache rather than re-deriving it.
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
         return True
 
 
@@ -260,6 +313,18 @@ def _guard_handler(handler: logging.Handler) -> None:
     they already hold the PRE-WRAP `TextIOWrapper`. Measured under the shipped launch command:
     `gunicorn.error`'s handler had `guarded=False` and `filters=[]`. Replacing `sys.stdout` does
     nothing for an object that captured the old one.
+
+    ORDER-DEPENDENT, and the dependency is load-bearing rather than incidental: the re-point matches
+    a handler's captured stream against `_installed_wrappers()`, so `install_credential_guard` calls
+    `_wrap_streams()` BEFORE it walks the handlers. Reverse the two and there are no wrappers to
+    match, every handler keeps its pre-wrap stream, and the only remaining cover is the filter.
+
+    The FILTER is attached first, deliberately, and the re-point is allowed to fail. A handler is
+    free to expose `stream` as a read-only property, and this runs on the boot path: an
+    `AttributeError` here is not a missed guard but a worker that cannot import the app, which the
+    platform reports as CrashLoopBackOff. The filter half already covers every record such a handler
+    formats; what is lost is a DIRECT write to the stream it captured, which is recorded as a limit
+    rather than hidden by taking the process down.
     """
     if not any(isinstance(existing, _CredentialGuard) for existing in handler.filters):
         handler.addFilter(_CredentialGuard())
@@ -268,7 +333,10 @@ def _guard_handler(handler: logging.Handler) -> None:
         return
     for wrapper in _installed_wrappers():
         if stream is wrapper.wrapped:
-            handler.stream = wrapper  # type: ignore[attr-defined]
+            # Read-only or slotted `stream`. See the docstring: the filter is already on, and
+            # crashing the boot to re-point one stream is the worse trade.
+            with contextlib.suppress(AttributeError, TypeError):
+                handler.stream = wrapper  # type: ignore[attr-defined]
             return
 
 
@@ -277,8 +345,12 @@ def install_credential_guard(expected: str | None) -> None:
 
     WHAT IT COVERS. Every `logging.Handler` that exists when this runs or is constructed after it,
     whatever logger it is attached to and whether the record was emitted directly or propagated from
-    a descendant; and every write through the `sys.stdout` / `sys.stderr` objects, including
-    `print`. Handlers that captured the pre-wrap stream are re-pointed at the wrapper.
+    a descendant, over the record's WHOLE default rendering including its traceback and stack text;
+    and every write through the four `sys` text-stream attributes, including `print`. Handlers that
+    captured the pre-wrap stream are re-pointed at the wrapper. A handler carrying a formatter that
+    renders a traceback other than the way `logging.Formatter` does is the residual on the first
+    half, and it is a residual rather than a hole only because the second half covers the emission
+    when that handler's stream is a wrapped one.
 
     WHAT IT DOES NOT COVER, named because the previous version of this docstring said "every channel
     that leaves this process" and a review then took seven of them:
@@ -288,11 +360,22 @@ def install_credential_guard(expected: str | None) -> None:
         `open("/dev/stdout", "w")` and `os.fdopen(1)` are INSTANCES of that class, not the set:
         a new handle on the same descriptor is a new instance, and enumerating them would be the
         same mistake this module's history is made of.
-      ● **Any encoding but plaintext.** The comparison is a substring test against the credential as
-        configured, so base64, hex or a reversal passes. This is a deliberate boundary - the
-        emitting code chose the encoding, and matching every encoding is not possible - but it means
-        this guard IS an enumeration, over (channel x encoding), and both dimensions belong to the
-        same adversary who chose the acquisition route.
+      ● **Any channel that is not a log line.** The reach above is "a write through a wrapped `sys`
+        text stream, and a record passing a `logging.Handler`". A credential put in a RESPONSE BODY,
+        written to a file on the data volume, used as a FILENAME, or passed in a child process's
+        argv leaves without touching either, and none of those is an fd-level write, a re-encoding,
+        or a same-privilege disarm. A review measured all four. This bullet was missing for a round
+        while the register claimed the uncovered set was stated exactly, and the omission is the
+        same shape as everything else in this module's history: the three classes below were the
+        ones that had been ATTACKED, so they read as the ones that existed.
+      ● **Any encoding but plaintext, and any framing but one write.** The comparison is a substring
+        test against the credential as configured, so base64, hex or a reversal passes; and it is a
+        test against ONE string, so `write(token[:16])` followed by `write(token[16:])` reassembles
+        in the log with no alarm, as do two log records carrying a half each. Both are deliberate
+        boundaries - the emitting code chose the encoding and the framing, and matching every
+        combination is not possible - but they mean this guard IS an enumeration, over
+        (channel x encoding x framing), and all three dimensions belong to the same adversary who
+        chose the acquisition route.
 
       ● **An adversary with the same privilege as the code being guarded.**
         `logging.config.dictConfig` with `{".": {"filters": []}}`, a `Handler` subclass overriding
@@ -303,13 +386,22 @@ def install_credential_guard(expected: str | None) -> None:
 
     That last point is the honest correction to how this was described. It was called "the only one
     that does not depend on enumerating the adversary's alphabet". It is not: it swapped an alphabet
-    of attribute spellings for a smaller one of channels and encodings. What it is worth is that it
-    catches the two channels a leak has actually used, at the point of emission, whatever route
-    acquired the value - which is real, and less than was claimed.
+    of attribute spellings for a smaller one of channels, encodings and framings. What it is
+    worth is that it catches the two channels a leak has actually used, at the point of emission,
+    whatever route acquired the value - which is real, and less than was claimed.
 
     Called once from the boot path, where the credential is legitimately in scope. With no token
-    configured there is nothing to guard, and disarming restores the streams so the wrapper is not
-    left installed for the life of the process.
+    configured there is nothing to guard, and disarming restores the four `sys` attributes.
+
+    Disarming does NOT undo the handler side, and the previous sentence here said "so the wrapper
+    is not left installed for the life of the process": true of the streams, false of the handlers.
+    A re-pointed handler keeps the WRAPPER as its stream, every attached `_CredentialGuard` stays
+    attached, and `logging.Handler.__init__` stays patched. All three go inert, because each reads
+    `_GUARDED_CREDENTIAL` and finds it `None`, but inert is not absent: a re-pointed handler's
+    writes still pass through `_GuardedStream`, which forwards only the attributes listed on it,
+    so something asking that handler's stream for an attribute outside that list gets an
+    `AttributeError` where it previously got a value. Reached only in tests and when no token is
+    configured, so it is recorded rather than engineered away.
     """
     global _GUARDED_CREDENTIAL  # noqa: PLW0603 - one process-wide value, set at boot
     _GUARDED_CREDENTIAL = expected

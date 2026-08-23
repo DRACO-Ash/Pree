@@ -1260,3 +1260,31 @@ Continuous integration, which closes the standing container gap:
   workflow's own exit-2 branch is unexercised, because the pipeline exited 0; and `useradd` warns
   that uid 10001 exceeds SYS_UID_MAX 999, which is a warning and not a failure, since the third
   assertion measured the running identity directly.
+
+### Eighth security review: PASS, and the six minors closed on the way past
+
+The thirteenth security round returned **VERDICT: PASS** - six minors, no major, no blocker - and
+verified the guard under the shipped launch command: 5 of 5 handlers wrapped and filtered, 0
+occurrences of the token in 609 live log lines, both of the previous round's majors closed and held,
+7 of 8 mutations red. All six minors are closed here, and the two that were more than a sentence:
+
+● **The filter scanned the message, not the rendered record.** `Formatter.format` appends the
+  exception and stack text after the message, so `exc_info` carrying the credential went out with the
+  guard armed and no alarm raised, on any handler whose stream is not a wrapped `sys` stream. The scan
+  now covers `getMessage()`, `exc_text`, `exc_info` and `stack_info`, using
+  `Formatter.formatException` so what is scanned is what the handler will emit; a refusal clears all
+  three traceback fields rather than alarming over `msg` alone. A traceback carrying no credential is
+  left intact, asserted, because a guard that strips every traceback costs every diagnosis.
+● **The uncovered set had a fourth class and a fifth dimension.** A credential leaving by a response
+  body, a file on the data volume, a filename, or a child's argv touches neither half of the guard,
+  and a credential split across two writes reassembles in the log with no alarm. Both are now named
+  in the module and in the control register, which had claimed the set was stated exactly.
+
+The other four: the boot-path stream re-point can no longer crash a worker on a handler whose
+`stream` is read-only, and the ordering it depends on is written down; the claim that disarming leaves
+nothing installed is corrected to the truth, that the handler side persists inert; and the refused
+write's return value - the one item of the six that nothing held, revertible with 347 tests green -
+is now driven through the caller's own write loop, which must terminate in one round.
+
+Three new regression tests, 350 passing, coverage 99% against the gate's 80%. No version bump: V0.1
+is unreleased, so a stamp move would assert a patch to a release that never happened.

@@ -155,7 +155,10 @@ the assessment store.
 | The output guard covers handlers it was never told about, including propagated records and handlers built before arming | `src/pree/audit.py` | `test_the_runtime_guard_covers_handlers_it_was_never_told_about` |
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
-| No credential-bearing line reaches any logging handler, or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT anything reaching fd 1 or 2 without a wrapped object, NOT other encodings, NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
+| No credential-bearing line reaches any logging handler - over the record's WHOLE default rendering, traceback and stack text included - or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams`, `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
+| A traceback carrying the credential is refused, and one carrying none survives intact | `src/pree/audit.py` | `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
+| The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the filter half still covers it | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
+| A refused write reports the CALLER's length, so a caller looping until everything is written does not re-submit the credential-bearing tail | `src/pree/audit.py` | `test_the_guard_reports_the_callers_length_when_it_refuses_a_write` |
 | A handler that captured a stream before arming is re-pointed at the wrapper | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming` |
 | A handler the private registry has forgotten is still found | `src/pree/audit.py` | `test_the_guard_finds_a_handler_the_private_registry_has_forgotten` |
 | No representation of a `Config` can print the credential | `src/pree/config.py` | `test_the_config_never_prints_the_credential_in_any_representation` |
@@ -2752,6 +2755,64 @@ One minor with them: on a refused line the wrapper returned the alarm's length r
 caller's, so a caller looping until everything is written - which `write`'s contract permits - would
 re-submit the tail of the refused text. Not reachable through `print` or `StreamHandler`, both of
 which discard the return, so a trap rather than a fault.
+
+### The rendered record is not the message, and the fourth class nobody had attacked
+
+The thirteenth security round returned **PASS** with six minors and no major. Every one of the six
+was in the guard from the round before, and the two that matter are worth reading as a pair, because
+they are the same mistake at two scales.
+
+**The filter scanned `record.getMessage()` and its own docstring said "rendered text".**
+`Formatter.format` appends the exception text and then the stack text AFTER the formatted message, so
+`logger.error("auth failed", exc_info=ValueError(token))` put the credential on the emitted line with
+the guard armed and no alarm raised. Measured on a handler whose stream is not a wrapped `sys` stream,
+which is exactly where the wrapper half cannot cover for the filter half: a file handler, a socket
+handler, a test sink. A formatter reaches the credential three ways - `exc_info` it renders itself,
+`exc_text` it finds already cached by an earlier handler and reuses verbatim, and `stack_info` it
+appends as given - so all three are scanned, and a refusal now CLEARS all three rather than alarming
+over `msg` and leaving the traceback on the following lines. `Formatter.formatException` is reused as
+the renderer deliberately: it is the same code path the handler will run, so what is scanned is what
+will be emitted rather than an approximation of it.
+
+**And the uncovered set had a fourth class: a channel that is not the log.** The guard's reach is "a
+write through a wrapped `sys` text stream, and a record passing a `logging.Handler`". A credential put
+in a response body, written to a file on the data volume, used as a FILENAME, or passed in a child
+process's argv leaves without touching either, and none of those is an fd-level write, a re-encoding,
+or a same-privilege disarm - the three limits the module named while the register said its covered set
+was stated exactly. The omission has the same shape as everything else in this module's history: the
+three classes listed were the ones that had been ATTACKED, so they read as the ones that existed. A
+fifth dimension came with it. The comparison is a test against ONE string, so `write(token[:16])`
+followed by `write(token[16:])` reassembles in the log with no alarm, as do two records carrying a
+half each. The guard is an enumeration over (channel x encoding x framing), and all three dimensions
+belong to the adversary who chose the acquisition route.
+
+Three smaller things, each a sentence that was false or a line nothing held:
+
+● **`handler.stream = wrapper` runs on the boot path.** A handler is free to expose `stream` as a
+  read-only property, and an `AttributeError` there would not have leaked the credential - it would
+  have stopped the worker importing the app, which the platform reports as CrashLoopBackOff. The
+  re-point is now allowed to fail, with the filter attached FIRST so the half that covers every
+  record such a handler formats is already on. The ordering that makes the re-point work at all -
+  `_wrap_streams()` before the handler walk, or there are no wrappers to match against - was
+  load-bearing and undocumented, and is now stated where it is depended on.
+● **"disarming restores the streams so the wrapper is not left installed for the life of the
+  process"** was true of the streams and false of the handlers. A re-pointed handler keeps the
+  wrapper, every attached filter stays attached, and the `Handler.__init__` patch stays patched. All
+  three go inert because each reads a `None` credential, and inert is not absent: the wrapper
+  forwards only the attributes listed on it, so a caller asking that handler's stream for anything
+  else now gets an `AttributeError` where it previously got a value. Reached only in tests and when
+  no token is configured, so it is recorded rather than engineered away.
+● **The refused-write return value was the one item of the six that nothing held.** Reverting
+  `return len(text) if refused else written` to `return written` left all 347 tests green. The
+  caller's loop is now DRIVEN rather than described: it must terminate in one round, where under the
+  regression it runs a second time on the credential-bearing tail.
+
+The pattern across the round is worth naming once more, because it is now unmistakable. The
+application's boundaries held again. Every finding was in the layer built to prove they hold, and
+four of the six were in a SENTENCE rather than in code - a docstring asserting a property the code
+beside it implemented more narrowly. The countermeasure that keeps working is the one applied to all
+three new tests here: assert the property on synthetic input with a known outcome, prove the channel
+is real by driving it with the control disarmed, and canary the rule by reverting the fix.
 
 ## Not accepted, and why it is not a risk here
 
