@@ -4594,11 +4594,44 @@ class _DoubleCallStr:
         return f"token={self._secret}"
 
 
+# The credential `_HostileAdd.__add__` reveals. A module constant because the dunder takes no
+# arguments and the test that drives it asserts on this exact value.
+_ADD_SECRET = "3FZ-q7W_x9Y.t2U~r5Ip8Ok1Aj4Sh6Dg3"
+
+
 class _LyingStr(str):
     """A `str` subclass that answers False for a substring it holds."""
 
     def __contains__(self, item: object) -> bool:
         return False
+
+
+class _LyingStrValue(str):
+    """Real characters hold the credential; every dunder a scanner might reach for lies.
+
+    `__contains__` defeats `x in text`. `__str__` defeats `str(text)`, which is the one that
+    mattered: a coercion written as `str(text)` reads THIS method, so it scanned "harmless"
+    while the characters held the credential. Only `str.__str__(text)` reads the object.
+    characters held the credential. Only `str.__str__(text)` reads the underlying object.
+    """
+
+    def __contains__(self, item: object) -> bool:
+        return False
+
+    def __str__(self) -> str:
+        return "harmless"
+
+
+class _HostileAdd(str):
+    """Clean characters, credential-bearing `__add__`.
+
+    `StreamHandler.emit` writes `msg + self.terminator`, so what is emitted is the result of `+` and
+    not the value that was scanned. A scanner that hands the caller's object back after scanning a
+    coerced copy is defeated by this without any dunder it inspected ever lying.
+    """
+
+    def __add__(self, other: str) -> str:
+        return f"a concatenation holding {_ADD_SECRET}"
 
 
 class _Enricher(logging.Filter):
@@ -4721,63 +4754,76 @@ def test_the_finished_line_is_scanned_whatever_produced_it() -> None:
         assert CREDENTIAL_ALARM in guarded, f"{label}: refused without an alarm: {guarded!r}"
 
 
-def test_a_lying_str_subclass_is_coerced_at_all_three_layers() -> None:
-    """`in` dispatches to `type(text).__contains__`, so a `str` subclass can deny what it holds.
+def test_the_value_that_is_emitted_is_the_value_that_was_scanned() -> None:
+    """Scanning a coerced copy and emitting the caller's object is two findings, not one.
 
-    Three separate places compare against the credential, and each one needed the same coercion.
-    A canary found that only one of the three was held. The existing case put the lying subclass in
-    a record ATTRIBUTE, where the finished-line scan catches it whatever the other two layers do,
-    so reverting either of those coercions left the suite green.
+    Three comparison points each coerce, and each must USE the coerced value. A canary found all
+    three unheld after they were written, because the test class overrode `__contains__` and not
+    `__str__` - so it exercised the wrong dunder and the mutations stayed green. The attacks below
+    are the measured ones.
 
-    So each layer is driven where it is the only one that can act:
-
-    ● The finished-line scan, with a FORMATTER that returns the lying subclass. Nothing downstream
-      of it in the log channel sees the text, so `str(text)` there is the only coercion that helps.
-    ● The stream wrapper, by writing the subclass straight to a wrapped `sys.stdout`. That is the
-      `print` channel and it never passes a formatter at all.
-    ● The record walk, by the DIAGNOSTIC it produces. `type(value) is str` versus `isinstance` does
-      not change containment - the finished-line scan refuses either way - it changes whether the
-      filter identified the offending field, so the emitted line carries the redaction marker beside
-      the alarm rather than the alarm alone. That is redaction fidelity, which is the walk's whole
-      remaining job.
+    ● `str(text)` reads `type(text).__str__`, which a subclass owns. It scanned "harmless" while the
+      object's characters held the credential. Held by asserting the ALARM is emitted, not merely
+      that the credential is absent: the defeated version emits "harmless" and leaks nothing, so
+      absence alone passes under the defect.
+    ● `StreamHandler.emit` writes `msg + self.terminator`. A subclass with CLEAN characters and a
+      credential-bearing `__add__` needs no lying inspection at all: the scan reads the object and
+      finds nothing, hands the object back, and `+` produces the credential afterwards. Held by
+      asserting the credential is absent from the sink.
+    ● The stream wrapper passes its payload to the underlying stream. On the non-refused path that
+      payload must be the coerced value, and a test asserting "the credential is not in what was
+      written" cannot see the difference - because the thing written is the object whose
+      `__contains__` lies. Held by asserting the TYPE: what reaches the stream is an exact `str`.
     """
-    secret = "5Ip-8Ok_1Aj.4Sh~6Dg3FZq7Wx9Yt2Ur"
+    secret = "5Ip-8Ok_1Aj.4Sh~6Dg3FZq7Wx9Yt2U5"
 
     class LyingFormatter(logging.Formatter):
-        """Returns a `str` subclass that denies holding the credential."""
+        """Returns a subclass whose characters hold the credential and whose `__str__` denies it."""
 
         def format(self, record: logging.LogRecord) -> str:
-            return _LyingStr(f"a line holding {secret}")
+            return _LyingStrValue(f"a line holding {secret}")
 
-    # Layer one: the finished line, where the formatter itself lies.
-    sink = io.StringIO()
-    handler = logging.StreamHandler(sink)
-    handler.setFormatter(LyingFormatter())
-    install_credential_guard(secret)
-    try:
-        handler.handle(
-            logging.LogRecord(
-                name="lying.formatter",
-                level=logging.ERROR,
-                pathname=__file__,
-                lineno=0,
-                msg="a clean message",
-                args=(),
-                exc_info=None,
+    class ConcatenatingFormatter(logging.Formatter):
+        """Returns a subclass with clean characters and a credential-bearing `__add__`."""
+
+        def format(self, record: logging.LogRecord) -> str:
+            return _HostileAdd("a clean line")
+
+    def emit_through(formatter: logging.Formatter, guarded_secret: str) -> str:
+        sink = io.StringIO()
+        handler = logging.StreamHandler(sink)
+        handler.setFormatter(formatter)
+        install_credential_guard(guarded_secret)
+        try:
+            handler.handle(
+                logging.LogRecord(
+                    name="scanned.equals.emitted",
+                    level=logging.ERROR,
+                    pathname=__file__,
+                    lineno=0,
+                    msg="a clean message",
+                    args=(),
+                    exc_info=None,
+                )
             )
-        )
-        from_formatter = sink.getvalue()
-    finally:
-        install_credential_guard(None)
-        handler.close()
+        finally:
+            install_credential_guard(None)
+            handler.close()
+        return sink.getvalue()
 
-    assert secret not in from_formatter, (
-        f"a formatter returning a lying `str` subclass put the credential on the line: "
-        f"{from_formatter!r}"
+    lied = emit_through(LyingFormatter(), secret)
+    assert secret not in lied, f"a lying `__str__` put the credential on the line: {lied!r}"
+    assert CREDENTIAL_ALARM in lied, (
+        f"the scan read the subclass's `__str__` rather than its characters, so it found nothing "
+        f"to refuse and emitted that method's return instead: {lied!r}"
     )
-    assert CREDENTIAL_ALARM in from_formatter, f"refused without an alarm: {from_formatter!r}"
 
-    # Layer two: the stream wrapper, which is `print` and never sees a formatter.
+    concatenated = emit_through(ConcatenatingFormatter(), _ADD_SECRET)
+    assert _ADD_SECRET not in concatenated, (
+        f"the scan handed the caller's object back and `msg + terminator` produced the credential "
+        f"after it: {concatenated!r}"
+    )
+
     written: list[str] = []
 
     class Recording:
@@ -4791,29 +4837,63 @@ def test_a_lying_str_subclass_is_coerced_at_all_three_layers() -> None:
     stream = _GuardedStream(Recording())
     install_credential_guard(secret)
     try:
-        stream.write(_LyingStr(f"a direct write holding {secret}\n"))
+        stream.write(_LyingStr("a clean direct write\n"))
     finally:
         install_credential_guard(None)
 
-    assert not any(secret in line for line in written), (
-        f"a lying `str` subclass written straight to a wrapped stream reached it: {written!r}"
+    assert [type(line) for line in written] == [str], (
+        f"the wrapper passed the caller's object to the stream rather than the value it scanned, "
+        f"so what reaches the stream is not what was checked: "
+        f"{[type(x).__name__ for x in written]}"
     )
-    assert written == [f"{CREDENTIAL_ALARM}\n"], f"refused without an alarm: {written!r}"
 
-    # Layer three: the walk, measured by whether the offending FIELD was identified.
-    identified = _emit_one(
+
+def test_arming_calls_no_caller_code_the_disarmed_process_would_not() -> None:
+    """The mechanism behind the invariant, asserted directly rather than through an outcome.
+
+    The walk used to render every non-`str` attribute, including attributes no format string names,
+    so an attribute's `__str__` ran ZERO times in the disarmed process and once in the armed one. A
+    review measured one whose `__str__` wrote to a raw file descriptor: the credential was emitted
+    only when the guard was on. That is the invariant violated at its root, and the outcome-level
+    test could not see it, because the amplified emission left through a channel the guard does not
+    watch.
+
+    So the assertion is on the CALL COUNT. The guard must not invoke caller code at all, which is
+    the property that makes "arming is never worse" true rather than merely observed.
+    """
+    secret = "8Ok-1Aj_4Sh.6Dg~3FZq7Wx9Yt2Ur5I8"
+    side_channel: list[str] = []
+
+    class Counting:
+        """Records every rendering, and leaks through a channel the guard does not cover."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            side_channel.append(f"rendered with {secret}")
+            return "rendered"
+
+    counter = Counting()
+    # A format string that does NOT name the attribute, so the formatter never renders it either.
+    emitted = _emit_one(
         secret,
-        fmt="%(message)s v=%(v)s",
-        msg="an authentication failure",
-        extra={"v": _LyingStr(secret)},
+        fmt="%(message)s",
+        msg="a clean line",
+        extra={"obj": counter},
         armed=True,
     )
-    assert secret not in identified, f"the attribute reached the line: {identified!r}"
-    assert REDACTED_ATTRIBUTE in identified, (
-        f"the filter did not identify which field carried the credential, so the whole line was "
-        f"replaced rather than the one attribute redacted. Containment held either way; what is "
-        f"lost is the diagnosis a refused record exists to give: {identified!r}"
+
+    assert counter.calls == 0, (
+        f"the guard rendered an attribute {counter.calls} time(s) that nothing else would have "
+        f"rendered at all. Arming is then observably different from not arming, and the difference "
+        f"runs caller code: {side_channel!r}"
     )
+    assert side_channel == [], (
+        f"arming the guard emitted through an uncovered channel: {side_channel!r}"
+    )
+    assert "a clean line" in emitted, f"the clean line did not survive: {emitted!r}"
 
 
 def test_the_armed_guard_never_emits_what_the_disarmed_process_would_not() -> None:

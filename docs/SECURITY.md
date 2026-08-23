@@ -164,7 +164,8 @@ the assessment store.
 | The SHIPPED rate limits are the ones a deployed pod enforces, driven with no limiter injected | `src/pree/ratelimit.py` | `test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces` |
 | The finished line is scanned whatever produced it: `%(args)s` the message never consumed, a `repr` conversion, a formatter default, a lying `str` subclass, a filter running after the guard's | `src/pree/audit.py` | `test_the_finished_line_is_scanned_whatever_produced_it` |
 | ARMING THE GUARD NEVER EMITS WHAT THE DISARMED PROCESS WOULD NOT | `src/pree/audit.py` | `test_the_armed_guard_never_emits_what_the_disarmed_process_would_not` |
-| A lying `str` subclass is coerced at all three comparison points, each driven where it is the only layer that can act | `src/pree/audit.py` | `test_a_lying_str_subclass_is_coerced_at_all_three_layers` |
+| The value EMITTED is the value that was scanned, at all three comparison points: a lying `__str__`, a credential-bearing `__add__`, and the type the stream wrapper passes on | `src/pree/audit.py` | `test_the_value_that_is_emitted_is_the_value_that_was_scanned` |
+| Arming calls no caller code the disarmed process would not, so the invariant holds by mechanism and not by observation | `src/pree/audit.py` | `test_arming_calls_no_caller_code_the_disarmed_process_would_not` |
 | Every record ATTRIBUTE a formatter can name is scanned, `msg` and `args` included, and each one carrying the credential is redacted individually | `src/pree/audit.py` | `test_the_guard_scans_every_record_attribute_a_formatter_can_render` |
 | An attribute named `message` cannot shadow the rendered message and take it out of the scan | `src/pree/audit.py` | `test_an_attribute_named_message_cannot_shadow_the_rendered_message` |
 | `vars()` on a record cannot raise, because `LogRecord` declares no `__slots__` | `src/pree/audit.py` | `test_no_log_record_can_be_built_without_the_dictionary_the_scan_reads` |
