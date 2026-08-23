@@ -155,6 +155,7 @@ the assessment store.
 | Every caller-influenced audit value is recomputed from the request, not shape-checked | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
 | Every boolean audit field names the test that correlates its value | `tests/test_api.py` | `test_every_boolean_audit_field_names_a_test_that_correlates_it` |
 | No truncated audit path can read as a route this app serves | `src/pree/security.py` | `test_no_truncated_path_record_can_read_as_a_route_this_app_serves` |
+| The BUILT image carries no setuid or setgid bit, no pip, and runs as 10001:10001 | `Dockerfile` | `scripts/simulate-pipeline.sh` containerize stage, executed by `.github/workflows/verify.yml` |
 | The audited path keeps its separator and carries no control character | `src/pree/app.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
 | A stage before the shipped one cannot mount over or de-privilege what the suid sweep visits | `Dockerfile` | `test_no_stage_declares_an_instruction_that_undoes_the_hardening` |
 | A refused preflight records whether the ORIGIN was allowed, by value | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
@@ -1723,15 +1724,14 @@ application finding, and the two application changes recorded above were made in
 sentences are the ones a human would rely on to authorise a freeze, which is why they are corrected
 in place rather than reworded.
 
-The remaining risk is in the VERIFICATION, not in the application, and the single largest gap is
-named plainly: **the container hardening rules have never been checked against a real image.** No
-setuid or setgid bits, the non-root numeric user, the absence of pip and the single flattened layer
-are each a hard rule, and each is currently verified only by reading the Dockerfile TEXT. No number
-of text assertions is evidence about a built image, and the cost of neutering one varies by rule
-rather than being the single figure this paragraph used to quote. `scripts/simulate-pipeline.sh`
-exits 2 and says so. Exit 2 is
-not a pass. The containerize leg should be a required gate on a runner with a Docker daemon before
-the first production deploy.
+The remaining risk is in the VERIFICATION, not in the application, and the single largest gap was
+named plainly here for many rounds: the container hardening rules had never been checked against a
+real image, because `scripts/simulate-pipeline.sh` exits 2 for want of a Docker daemon and exit 2 is
+not a pass. No number of text assertions is evidence about a built image.
+
+**That gap is now CLOSED, and the closure is dated and cited rather than asserted.** See "The
+container gap, and the gate that finally executes it" below: CI run 32630383551 built the image and
+the three assertions reported real measurements, not a silent zero.
 
 ### Thirty-fifth review: the confirmation that refused to confirm
 
@@ -2363,10 +2363,42 @@ runner that has a daemon, and treats a deferral as a failure. Three things about
   `.dockerignore` excludes it from the build context. The App Store generates its own pipeline,
   which this never touches.
 
-**What this does NOT do.** It does not make the three rules verified today. It makes them verified
-on the next push to this branch, and a red run there is the first real evidence about the image this
-project has ever had. Until that run is green, the honest statement is unchanged: the container
-rules are asserted in text and unverified in fact.
+**And the run happened.** CI run 32630383551, on commit `fbefd3f`, built the image and executed all
+three assertions. The output is the evidence, not the exit code:
+
+```
+image: exported 5618 entries, 5618 with a parseable mode, venv path present
+--- image: no setuid or setgid bits ---
+image: no setuid or setgid bits
+--- image: the package manager does not ship ---
+image: no pip or setuptools in the shipped filesystem
+--- image: runs as the non-root numeric user ---
+image: runs as 10001:10001
+=== simulation green ===
+```
+
+The entry-count line is the part that matters and is why the script was written this way. **5,618
+entries exported and 5,618 with a parseable mode** proves the sweep read real modes rather than
+silently reading nothing: an earlier version of these checks treated empty output as a pass, which
+made a no-op binary copied over `/usr/bin/find` produce "no setuid or setgid bits" and pass. Every
+check names the tool that must produce output, so silence is a failure.
+
+**So the standing gap of this whole project is closed.** For the first time, the three container hard
+rules are verified in FACT and not only in text. They now run on every push, and a deferral on a
+runner with a working daemon is a failure.
+
+**Three residuals, recorded rather than implied away.**
+
+● The **single flattened layer** is asserted by the Dockerfile's `FROM scratch` plus a single
+  `COPY --from=prep / /`, both verified in text, and the run confirms the build succeeds that way.
+  The image-policy scan reading no history is a platform-side property this run does not measure.
+● The workflow's **exit-2 branch is itself untested**, because the pipeline exited 0. That branch
+  exists to refuse a deferral on a daemon-bearing runner, and nothing has exercised it. It is three
+  lines of shell, and the honest statement is that it is unexercised rather than proven.
+● `useradd` emits `appuser's uid 10001 is greater than SYS_UID_MAX 999`. A **warning, not a
+  failure**: the account is created and the image runs as `10001:10001`, which the third assertion
+  measured directly. Recorded so it is not mistaken for a finding later, and not silenced, because
+  silencing a warning is how a real one gets lost.
 
 ## Not accepted, and why it is not a risk here
 

@@ -1107,3 +1107,15 @@ Continuous integration, which closes the standing container gap:
   nothing.
 ● The workflow is not in the upload archive. `package-appstore.sh` builds from an allowlist, so
   `.github` is absent by construction, and `.dockerignore` keeps it out of the build context.
+● **The run happened and it is green.** CI run 32630383551 on `fbefd3f` built the image and executed
+  all three assertions: `no setuid or setgid bits`, `no pip or setuptools in the shipped filesystem`,
+  `runs as 10001:10001`. The evidence is the output, not the exit code, and the load-bearing line is
+  `exported 5618 entries, 5618 with a parseable mode` - proof the sweep read real modes rather than
+  silently reading nothing, which is the failure mode an earlier version of these checks had.
+  **The standing gap of this whole project is closed: the container hard rules are verified in fact
+  and no longer only in text.**
+● Three residuals recorded rather than implied away: the single flattened layer is still a text
+  assertion plus a successful build, and the platform-side history scan is not measured here; the
+  workflow's own exit-2 branch is unexercised, because the pipeline exited 0; and `useradd` warns
+  that uid 10001 exceeds SYS_UID_MAX 999, which is a warning and not a failure, since the third
+  assertion measured the running identity directly.
