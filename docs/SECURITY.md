@@ -3110,6 +3110,13 @@ to ZERO exemptions: the one it carried existed solely because the record scan ne
 and it left with the layer that needed it. Needing no exemption is strictly better than having a
 well-argued one.
 
+**One more test defect, found by canarying the reduced module.** Seventeen mutations, and one came
+back green: the stream wrapper's coercion. The case driving it wrote a `str` subclass that overrides
+`__contains__` only, and `str()` on such an object returns an exact `str` of the real characters - so
+it agreed with `str.__str__` and reverting the coercion changed nothing. The third time in this file
+that a test has exercised the wrong input while looking correct, and the third time only a canary
+found it. A subclass whose `__str__` lies now drives that path, and all seventeen are red.
+
 **The general lesson, which is the part worth keeping.** Seventeen rounds of findings landed almost
 entirely in a defence-in-depth layer rather than in the application's boundaries, and the layer that
 produced them was the one that reasoned about what output WOULD contain instead of reading what it

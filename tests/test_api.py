@@ -4587,11 +4587,24 @@ def test_the_value_that_is_emitted_is_the_value_that_was_scanned() -> None:
     stream = _GuardedStream(Recording())
     install_credential_guard(secret)
     try:
+        # A subclass whose `__str__` LIES, so the wrapper's own coercion is the only thing that can
+        # read the real characters. A canary found the earlier case here used a subclass that
+        # overrides `__contains__` only, and `str()` on such an object returns an exact `str` of the
+        # real characters - so it agreed with `str.__str__` and the mutation stayed green. Third
+        # time a test in this file has exercised the wrong input while looking correct.
+        stream.write(_LyingStrValue(f"a direct write holding {secret}\n"))
         stream.write(_LyingStr("a clean direct write\n"))
     finally:
         install_credential_guard(None)
 
-    assert [type(line) for line in written] == [str], (
+    assert written[0] == f"{CREDENTIAL_ALARM}\n", (
+        f"the wrapper read the subclass's `__str__` rather than its characters, so it found "
+        f"nothing to refuse and passed the lie on: {written[0]!r}"
+    )
+    assert not any(secret in str.__str__(line) for line in written), (
+        f"the credential's real characters reached the stream: {written!r}"
+    )
+    assert [type(line) for line in written[1:]] == [str], (
         f"the wrapper passed the caller's object to the stream rather than the value it scanned, "
         f"so what reaches the stream is not what was checked: "
         f"{[type(x).__name__ for x in written]}"
