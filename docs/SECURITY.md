@@ -155,24 +155,15 @@ the assessment store.
 | The output guard covers handlers it was never told about, including propagated records and handlers built before arming | `src/pree/audit.py` | `test_the_runtime_guard_covers_handlers_it_was_never_told_about` |
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
-| No credential-bearing line reaches any logging handler - scanned as the FINISHED LINE at `logging.Handler.format`, so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant - or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that does not emit `Handler.format`'s return value - `HTTPHandler` urlencodes `record.__dict__`, `SocketHandler` and `DatagramHandler` pickle it, and no subclassing is needed; for those the record scan is the only layer, covering `str` attributes and not what a later filter adds - NOT a refusal whose redaction then breaks the formatter (nothing leaks, but no alarm is emitted either), NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams`, `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
-| A traceback carrying the credential is refused, and one carrying none survives intact | `src/pree/audit.py` | `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
-| A refusal mints no attribute whose name the scan uses as a key, so refusing a record once does not take its message out of the scan | `src/pree/audit.py` | `test_a_refusal_mints_no_attribute_the_parts_dictionary_uses_as_a_key` |
-| A refusal that cannot write to the record faults no caller, and the finished-line scan still contains it | `src/pree/audit.py` | `test_a_refusal_that_cannot_write_to_the_record_does_not_fault_the_caller` |
 | Arming twice does not stack either stdlib patch | `src/pree/audit.py` | `test_arming_twice_does_not_stack_the_stdlib_patches` |
-| A handler built after arming carries the guard filter, which is the only layer for a handler that never calls `Handler.format` | `src/pree/audit.py` | `test_a_handler_built_after_arming_carries_the_guard_filter` |
 | The SHIPPED rate limits are the ones a deployed pod enforces, driven with no limiter injected | `src/pree/ratelimit.py` | `test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces` |
 | The finished line is scanned whatever produced it: `%(args)s` the message never consumed, a `repr` conversion, a formatter default, a lying `str` subclass, a filter running after the guard's | `src/pree/audit.py` | `test_the_finished_line_is_scanned_whatever_produced_it` |
 | ARMING THE GUARD NEVER EMITS WHAT THE DISARMED PROCESS WOULD NOT | `src/pree/audit.py` | `test_the_armed_guard_never_emits_what_the_disarmed_process_would_not` |
 | The value EMITTED is the value that was scanned, at all three comparison points: a lying `__str__`, a credential-bearing `__add__`, and the type the stream wrapper passes on | `src/pree/audit.py` | `test_the_value_that_is_emitted_is_the_value_that_was_scanned` |
 | Arming calls no caller code the disarmed process would not, so the invariant holds by mechanism and not by observation | `src/pree/audit.py` | `test_arming_calls_no_caller_code_the_disarmed_process_would_not` |
-| Every record ATTRIBUTE a formatter can name is scanned, `msg` and `args` included, and each one carrying the credential is redacted individually | `src/pree/audit.py` | `test_the_guard_scans_every_record_attribute_a_formatter_can_render` |
-| An attribute named `message` cannot shadow the rendered message and take it out of the scan | `src/pree/audit.py` | `test_an_attribute_named_message_cannot_shadow_the_rendered_message` |
-| `vars()` on a record cannot raise, because `LogRecord` declares no `__slots__` | `src/pree/audit.py` | `test_no_log_record_can_be_built_without_the_dictionary_the_scan_reads` |
-| A non-`str` `exc_text` or `stack_info` is scanned and cleared rather than raising into the caller | `src/pree/audit.py` | `test_a_non_string_traceback_field_is_scanned_and_cleared_rather_than_raising` |
-| An attribute the guard cannot stringify does NOT alarm a clean line, so the scan is not a denial of service on the log | `src/pree/audit.py` | `test_an_attribute_the_guard_cannot_stringify_does_not_alarm_a_clean_line` |
-| The introspection guard's one exemption is a single function reading its own `logging.LogRecord` parameter | `tests/test_api.py` | `test_the_introspection_exemption_is_exactly_one_function_on_a_log_record` |
 | The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the filter half still covers it | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
+| No credential-bearing line reaches any logging handler, scanned as the FINISHED LINE at `logging.Handler.format` so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant; nor a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that does not emit `Handler.format`'s return value (`HTTPHandler` urlencodes `record.__dict__`; `SocketHandler` and `DatagramHandler` pickle it; no subclassing needed and since the record-scanning layer was removed these are WHOLLY uncovered, which is acceptable only because this app builds nothing but `StreamHandler`s on stdout), NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_finished_line_is_scanned_whatever_produced_it`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
+| The introspection guard has NO exemptions, the one it carried having left with the layer that needed it | `tests/test_api.py` | `test_the_introspection_guard_has_no_exemptions` |
 | A refused write reports the CALLER's length, so a caller looping until everything is written does not re-submit the credential-bearing tail | `src/pree/audit.py` | `test_the_guard_reports_the_callers_length_when_it_refuses_a_write` |
 | A handler that captured a stream before arming is re-pointed at the wrapper, WHERE `stream` is assignable; where it is not, the filter half alone covers it and a direct write to its captured stream is uncovered | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming`, `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
 | A handler the private registry has forgotten is still found | `src/pree/audit.py` | `test_the_guard_finds_a_handler_the_private_registry_has_forgotten` |
@@ -1902,8 +1893,10 @@ What it wants a human to see, in its order, recorded here because it is the shor
    asserts it; this confirms the boundary that matters at the cost of one curl.
 4. **A decision on `duration_ms`.** It is a covert channel of its bound's width, so who may read the
    audit stream is part of the control rather than incidental to it.
-5. **`securityContext.fsGroup=10001` on the deployment.** Without it every write to the FILE_STORAGE
-   mount returns EACCES, which is a deployment parameter rather than a code defect.
+5. **`securityContext.fsGroup=10001` on the deployment. CONFIRMED by the owner** and recorded in
+   `docs/DEPLOYMENT.md` as a required parameter rather than an open question. Without it every write
+   to the FILE_STORAGE mount returns EACCES, which is a deployment parameter rather than a code
+   defect. The operations request still has to be raised; the decision no longer blocks it.
 
 ### Thirty-seventh review: PASS, with five minors closed on the way past
 
@@ -3077,6 +3070,52 @@ unauthenticated edge - every one needs a formatter, a filter, or a handler choic
 The application's boundaries have held in all sixteen rounds. What keeps failing is this
 defence-in-depth layer, and specifically its claims about itself: five of the ten were a sentence
 asserting more than the code beside it did.
+
+### The layer that was removed, and why removing it was the fix
+
+The owner's call, on the evidence of three rounds. The credential output guard had three layers; the
+one that scanned the RECORD at filter time is gone. What is left scans text that is actually leaving:
+the finished line at `logging.Handler.format`, and writes through the four `sys` text streams.
+
+**Why it went rather than being hardened again.** It was never a guarantee and could not be made into
+one. It scanned a model of the emitted line, and seven rounds of widening that model each ended with
+a measured bypass - a traceback, then `%(args)s` the message never consumed, then a `repr`
+conversion, then a formatter default that never touched the record, then a filter running after it,
+then an unstable `__str__` that rendered one thing for the guard and another for the formatter. Once
+the finished line itself was scanned, the model added nothing to containment.
+
+And it generated most of the defects. Every one of these lived in that layer: the side-effect
+amplification that made ARMING the guard emit what disarming would not; a redaction that minted an
+attribute the scan used as a key, so refusing a record once took its message out of the next scan; an
+unguarded write that faulted the caller that logged it; a two-name scan gap from one constant doing
+two jobs; and a fail-closed branch that destroyed clean operational lines for no containment. None
+was reachable from the unauthenticated edge. All were self-inflicted.
+
+**What it cost, stated plainly rather than in a footnote.** Two things.
+
+● **Field-level redaction.** A refused line now reads as one alarm instead of naming the field that
+  carried the credential, so diagnosing a refusal is coarser than it was.
+● **Three stock handlers lose their only layer.** `HTTPHandler` urlencodes `record.__dict__`;
+  `SocketHandler` and `DatagramHandler` pickle it. None emits `Handler.format`'s return value, so the
+  removed filter was the only thing covering them, and they are now WHOLLY uncovered. This was not in
+  the options put to the owner and is recorded because it should have been. It is acceptable here for
+  one reason and it is a narrow one: this application constructs `StreamHandler`s on `sys.stdout` and
+  nothing else. In a service that ships logs over a socket the same trade would be wrong.
+
+**What removing it bought, measured.** `audit.py` fell from 212 statements to 152, a 28% reduction.
+The suite went from 366 tests to 356 and from 37 seconds to 27. The guard's per-line cost is now the
+finished-line scan alone, which a review measured at 0.00 microseconds against a 8.76 microsecond
+baseline - the removed layer was the whole of the armed overhead. And the introspection guard is back
+to ZERO exemptions: the one it carried existed solely because the record scan needed `vars(record)`,
+and it left with the layer that needed it. Needing no exemption is strictly better than having a
+well-argued one.
+
+**The general lesson, which is the part worth keeping.** Seventeen rounds of findings landed almost
+entirely in a defence-in-depth layer rather than in the application's boundaries, and the layer that
+produced them was the one that reasoned about what output WOULD contain instead of reading what it
+did. A control that models its subject accumulates the model's gaps. Two controls in this codebase
+now read the actual artefact - the finished log line, and the bytes going to a stream - and neither
+has been defeated. The right response to a control that keeps failing is not always a better model.
 
 ## Not accepted, and why it is not a risk here
 

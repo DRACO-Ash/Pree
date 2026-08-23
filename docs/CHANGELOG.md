@@ -1401,3 +1401,29 @@ choice inside the process.
   rate limits, which every rate-limit test had bypassed by injecting its own limiter.
 
 Six new regression tests, 365 passing, coverage 99% against the gate's 80%, no missed statements.
+
+### The record-scanning layer removed, on the owner's decision
+
+The credential output guard had three layers. The one that scanned the RECORD at filter time is gone;
+what remains scans text that is actually leaving - the finished line at `logging.Handler.format`, and
+writes through the four `sys` text streams.
+
+● **Why.** It scanned a model of the emitted line and could not be made into a guarantee: seven
+  rounds of widening the model each ended in a measured bypass. It also produced most of the recent
+  defects, all self-inflicted and none reachable from the unauthenticated edge - the side-effect
+  amplification that made arming worse than not arming, a redaction that minted a key the scan used,
+  an unguarded write that faulted its caller, a two-name scan gap, and a fail-closed branch that
+  destroyed clean lines.
+● **What it cost.** Field-level redaction: a refused line reads as one alarm rather than naming the
+  field. And `HTTPHandler`, `SocketHandler` and `DatagramHandler` lose their only layer, since none
+  emits `Handler.format`'s return - acceptable here only because this app builds nothing but
+  `StreamHandler`s on stdout.
+● **What it bought.** `audit.py` from 212 statements to 152; the suite from 366 tests to 356 and from
+  37 seconds to 27; the guard's per-line overhead reduced to the finished-line scan, measured at zero
+  against the baseline. And the introspection guard is back to NO exemptions, the one it carried
+  having existed only for the removed layer's `vars(record)`.
+
+`securityContext.fsGroup=10001` is CONFIRMED by the owner and recorded in `docs/DEPLOYMENT.md` as a
+required deployment parameter rather than an open decision.
+
+356 passing, coverage 99% against the gate's 80%, no missed statements.

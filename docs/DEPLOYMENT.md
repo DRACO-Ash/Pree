@@ -66,6 +66,11 @@ command directly above it.
 
 ## Operations request required
 
+**CONFIRMED BY THE OWNER.** `securityContext.fsGroup=10001` is agreed and is a required deployment
+parameter, not an open question. Raise the operations request with the value below before the first
+deploy; the deploy gate treats an unset `fsGroup` as a blocker rather than a warning, because the
+failure mode is every write refused.
+
 Pree runs as user `10001` and mounts the FILE_STORAGE volume. The mount arrives root-owned, so
 **`securityContext.fsGroup` must be set to `10001`** or every write returns `EACCES`. This needs
 an operations request; it is not settable from the console. Until it is set, `/healthz/storage`
