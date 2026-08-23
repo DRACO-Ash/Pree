@@ -63,9 +63,12 @@ def authorise(config: Config, presented: str | None) -> None:
     With no token configured the app is in single-user local mode and the gate is open by
     design. With a token configured every gated route requires it.
 
-    This function and `token_verifier` below are the ONLY readers of `config.team_token` in the
-    whole application, which is a property `test_the_credential_has_exactly_one_reader` asserts
-    across every module rather than a convention.
+    One of FOUR permitted readers of `config.team_token` in the package, the others being
+    `token_verifier` below and `Config.auth_enabled` and `Config.for_service`, which derive the
+    token-free facts the service layer receives. That set is asserted across every module by
+    `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package`. An earlier
+    version of this docstring said "this function and `token_verifier` are the ONLY readers" and
+    cited a test name that does not exist; both were wrong, and no guard covers a source docstring.
     """
     if not config.auth_enabled:
         return
@@ -81,14 +84,31 @@ def token_verifier(config: Config) -> Callable[[str | None], None]:
     it was a static rule about how the name `config` was spelt inside an audit expression, and the
     attacker picks the names: a helper called as `helper(config, exc)` in another module, and a
     helper whose parameter was named `cfg`, each recovered the deployed token verbatim from the pod
-    log on an unauthenticated 401.
+    log on an unauthenticated 401. So the HTTP layer is handed this closure and a `ServiceConfig`
+    that has no token field, and no ATTRIBUTE the module can name reaches the credential.
 
-    So the HTTP layer is handed this closure and a `ServiceConfig` that has no token field. The
-    credential is then reachable only from inside this function's cell, which no expression in
-    `app.py` can name, and the class of attack closes by construction rather than by a walk that
-    has to be right about every spelling.
+    What that does NOT do, stated here because the previous version of this docstring claimed an
+    absolute it did not have: the cell is still nameable from `app.py` as
+    `verify_token.__closure__[0].cell_contents`, and `os.environ` is readable from the same scope.
+    The next review took both in four lines each and put the whole credential in the pod log with
+    the suite green. Introspection and a direct environment read are refused by
+    `test_no_module_reaches_the_credential_by_introspection_or_the_environment`, not by this
+    function, and that division is the honest statement of what each part buys.
+
+    Two things narrow the cell itself. It closes over the EXPECTED STRING rather than the whole
+    `Config`, so introspecting it yields one value instead of every setting beside it; and
+    `Config.team_token` is `repr=False`, so no `repr`, f-string or format of a `Config` anywhere can
+    print the credential, which closes that whole class in one keyword.
     """
-    return lambda presented: authorise(config, presented)
+    expected = config.team_token
+
+    def verify(presented: str | None) -> None:
+        if expected is None:
+            return
+        if not token_matches(presented, expected):
+            raise AuthError("token rejected")
+
+    return verify
 
 
 def sanitise_actor(value: str | None) -> str:

@@ -3741,7 +3741,7 @@ def test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package(
     """
     source_root = Path(app_module.__file__ or "").resolve().parent
     offenders: list[str] = []
-    for module_path in sorted(source_root.glob("*.py")):
+    for module_path in sorted(source_root.rglob("*.py")):
         tree = ast.parse(module_path.read_text(encoding="utf-8"))
         # Which function each line belongs to, so a read can be attributed to its enclosing name.
         owner: dict[int, str] = {}
@@ -3765,6 +3765,135 @@ def test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package(
         f"{sorted(CREDENTIAL_READERS)}: {offenders}. A reader anywhere else can pass the value to "
         f"anything, including an audit record, and no rule about how a name is spelt will catch it"
     )
+
+
+# Introspection attributes that reach past a name into an object's guts, and the one place the
+# process environment may be read. An ALLOWLIST of one reader and a denylist of LANGUAGE features,
+# which is the distinction that matters: the alphabet here is Python's and fixed, not the author's
+# and chosen, so unlike a list of variable spellings it cannot be one short.
+_INTROSPECTION_ATTRIBUTES = frozenset(
+    {
+        "__closure__",
+        "cell_contents",
+        "__globals__",
+        "__wrapped__",
+        "__dict__",
+        "__self__",
+        "__func__",
+        "__code__",
+        "__defaults__",
+        "__kwdefaults__",
+    }
+)
+_INTROSPECTION_CALLS = frozenset({"globals", "vars", "locals", "eval", "exec", "compile"})
+# `load_config` is the only function that may read the process environment. Anywhere else, an
+# `os.environ` read is a second source of truth for the credential that bypasses every boundary.
+ENVIRONMENT_READERS = frozenset({"load_config"})
+
+
+def _attribute_complaint(node: ast.Attribute, owner: dict[int, str]) -> str | None:
+    """What is wrong with one attribute access, or None."""
+    if node.attr in _INTROSPECTION_ATTRIBUTES:
+        return f"introspects {node.attr}"
+    if node.attr == "environ" and owner.get(node.lineno) not in ENVIRONMENT_READERS:
+        return (
+            f"reads os.environ in {owner.get(node.lineno)}(), outside {sorted(ENVIRONMENT_READERS)}"
+        )
+    return None
+
+
+def _call_complaint(node: ast.Call) -> str | None:
+    """What is wrong with one call, or None."""
+    if not isinstance(node.func, ast.Name):
+        return None
+    if node.func.id in _INTROSPECTION_CALLS:
+        return f"calls {node.func.id}()"
+    # A COMPUTED attribute name is the whole point: `getattr(x, "team" + "_token")` reaches an
+    # attribute no static rule about attribute NAMES can see.
+    if node.func.id == "getattr" and len(node.args) >= 2:
+        name = node.args[1]
+        if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+            return "calls getattr with a computed name"
+    return None
+
+
+def _introspection_complaint(node: ast.AST, owner: dict[int, str]) -> str | None:
+    """What is wrong with one node, or None. Split so each half stays inside the branch limit."""
+    if isinstance(node, ast.Attribute):
+        return _attribute_complaint(node, owner)
+    if isinstance(node, ast.Call):
+        return _call_complaint(node)
+    return None
+
+
+def test_no_module_reaches_the_credential_by_introspection_or_the_environment() -> None:
+    """The route past the boundary, and the reason the previous claim was an overclaim.
+
+    The structural fix took the credential out of the HTTP layer's object graph, and the register
+    then claimed that "no helper, parameter name, module, or encoding in `app.py` can reach it".
+    **That was false**, and a review took it in four lines, twice:
+
+        cell = verify_token.__closure__[0].cell_contents
+        return b32encode((getattr(cell, "team" + "_token", None) or "").encode()).decode()
+
+    and
+
+        return b32encode(os.environ.get("PREE_TEAM_TOKEN", "").encode()).decode()
+
+    Either, appended to a `print` in this module, wrote the whole credential to the pod log the
+    platform aggregates, with 337 tests green and all four scope tests passing. The reader allowlist
+    matches `ast.Attribute` whose `attr` is `team_token`, and neither a computed `getattr` name nor
+    a `repr` of a closure cell ever spells it.
+
+    So this refuses the LANGUAGE FEATURES that reach past a name, rather than more spellings of a
+    name. Two other narrowings landed with it and are recorded where they live: the cell now closes
+    over the expected string rather than the whole `Config`, and `Config.team_token` is
+    `repr=False`, which closes the `repr`/f-string/format class in one keyword.
+
+    `rglob`, not `glob`. The reader allowlist walked only the top level while its docstring said
+    "every module", so the first subpackage would have been outside it silently.
+    """
+    source_root = Path(app_module.__file__ or "").resolve().parent
+    offenders: list[str] = []
+    for module_path in sorted(source_root.rglob("*.py")):
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        owner: dict[int, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                for inner in ast.walk(node):
+                    line = getattr(inner, "lineno", None)
+                    if line is not None:
+                        owner.setdefault(line, node.name)
+        for node in ast.walk(tree):
+            complaint = _introspection_complaint(node, owner)
+            if complaint:
+                offenders.append(f"{module_path.name}:{getattr(node, 'lineno', 0)} {complaint}")
+    assert not offenders, (
+        f"a module reaches past a name into an object's guts, or reads the process environment "
+        f"outside {sorted(ENVIRONMENT_READERS)}: {offenders}. Either route reaches the credential "
+        f"without ever spelling a token-shaped attribute, which is what the reader allowlist "
+        f"cannot see"
+    )
+
+
+def test_the_config_never_prints_the_credential_in_any_representation(tmp_path: Path) -> None:
+    """`repr=False` on the field, asserted rather than assumed.
+
+    A review found that `repr()` of a `Config` printed `team_token='Zq7-Wx9_...'` verbatim, so any
+    f-string, `print`, `format` or exception carrying a Config disclosed the credential without
+    spelling a token-shaped attribute. One dataclass keyword closes the class; this is what keeps
+    it closed, and it drives the real renderings rather than inspecting the field metadata, because
+    the metadata is what would be edited alongside the field.
+    """
+    secret = "Zq7-Wx9_Yt2.Ur5~Ip8Ok1Aj4Sh6Dg3F"
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=secret)
+    assert config.team_token == secret, "the fixture did not carry the token at all"
+    for rendering in (repr(config), str(config), f"{config}", format(config), f"{config!r}"):
+        assert secret not in rendering, (
+            f"a Config rendering discloses the credential: {rendering[:120]}"
+        )
+    # And the token-free view must be clean too, which it is by not having the field.
+    assert secret not in repr(config.for_service())
 
 
 def test_the_service_config_the_http_layer_receives_carries_no_credential() -> None:

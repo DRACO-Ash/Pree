@@ -151,7 +151,9 @@ the assessment store.
 | The audited path EQUALS the recomputed scrub of the target, so nothing can be appended to it | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
 | Every boolean audit field is value-pinned on every kind that emits it, across the token axis | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it`, `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 | Every closed-set value pin equals what the application can emit, in both directions, and a closed-set field is emitted as a literal | `tests/test_api.py` | `test_every_closed_set_pin_is_exactly_what_the_application_can_emit`, `test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit` |
-| The credential is read in exactly three functions in the whole package, under any spelling | `src/pree/security.py` | `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` |
+| The credential is read in exactly four permitted functions in the whole package, under any spelling, in every subpackage | `src/pree/security.py` | `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` |
+| No module reaches past a name by introspection, nor reads the environment outside `load_config` | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
+| No representation of a `Config` can print the credential | `src/pree/config.py` | `test_the_config_never_prints_the_credential_in_any_representation` |
 | The HTTP layer is handed a config with no token field and a callable, so the secret is not in its object graph | `src/pree/app.py` | `test_the_service_config_the_http_layer_receives_carries_no_credential` |
 | No audit expression can read the deployment's configuration, so none can encode the credential | `src/pree/app.py` | `test_no_audit_expression_can_reach_the_deployed_credential`, `test_the_http_layer_never_reads_the_deployed_token_at_all` |
 | Every caller-influenced audit value is recomputed from the request, not shape-checked | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
@@ -2486,6 +2488,59 @@ Two minors closed with them:
 diagnosis of the class was right, and a sampled axis genuinely cannot close it. What did not survive
 was the *implementation* of the closure, because both rules tested the spelling of a name rather than
 the flow of a value. The structural change is the one that stops needing a walk to be right.
+
+### The absolute I claimed and did not have
+
+**The commit that made the structural change also asserted, in four places, that "no helper,
+parameter name, module, or encoding in `app.py` can reach it". That was FALSE**, and the next review
+took it in four lines, twice:
+
+```python
+cell = verify_token.__closure__[0].cell_contents
+return b32encode((getattr(cell, "team" + "_token", None) or "").encode()).decode()
+```
+```python
+return b32encode(os.environ.get("PREE_TEAM_TOKEN", "").encode()).decode()
+```
+
+Either, appended to a `print` in `app.py`, wrote the whole credential to the pod log the platform
+aggregates, with 337 tests green **and all four scope tests passing**. The reader allowlist matches
+an attribute named `team_token`; a computed `getattr` name never spells it, and neither does a `repr`
+of a closure cell. The credential was two hops from a parameter `create_app` receives.
+
+No unauthenticated client or malformed body reaches this: it needs a source change. So it is a
+durability-of-guard and claim-accuracy failure rather than a live vulnerability. **But the claim is
+what a reviewer would rely on to stop looking**, which is precisely why this project treats a false
+claim as a finding in its own right, and this one was on the same channel and with the same
+consequence as the blocker that failed the round before.
+
+Four fixes, all cheap, and the division of labour between them stated rather than blurred:
+
+● **The claims are corrected** where they were made, in `docs/SECURITY.md`, `config.py`,
+  `security.py` and `main.py`. The honest form is that no ATTRIBUTE the module can name and no
+  ordinary refactor reaches the credential, while closure introspection and a direct environment
+  read did until the guard below existed.
+● **A guard over LANGUAGE FEATURES rather than more spellings of a name.** `__closure__`,
+  `cell_contents`, `__globals__`, `__wrapped__`, `__dict__`, `__code__` and their neighbours;
+  `globals()`, `vars()`, `locals()`, `eval`, `exec`, `compile`; `getattr` with a computed name; and
+  an `os.environ` read outside `load_config`. That alphabet is Python's and fixed, not the author's
+  and chosen, which is the whole difference from the denylist that failed last round: it cannot be
+  one short.
+● **`Config.team_token` is `field(repr=False)`.** `repr()` of a `Config` printed
+  `team_token='Zq7-Wx9_...'` verbatim, so any f-string, `print`, `format` or exception carrying one
+  disclosed the credential without spelling a token-shaped attribute. One dataclass keyword closes
+  that entire class, and a test drives all five real renderings rather than inspecting the metadata,
+  because the metadata is what would be edited beside the field.
+● **`token_verifier` closes over the expected STRING, not the whole `Config`.** Introspecting the
+  cell now yields one value instead of every setting beside it. Measured: the cell holds a `str`, no
+  `Config`, and the gate still accepts the right token and refuses a wrong one.
+
+Two minors with them. The reader allowlist walked `glob("*.py")` while its docstring said "every
+module in `src/pree/`", so the first subpackage would have been outside it silently; it is `rglob`
+now. And three citations in source docstrings did not resolve - a test name that never existed, a
+count of readers that said two where the allowlist names four, and a method called `split()` that is
+`for_service()`. The register-row guard covers the control table, not source docstrings, so all
+three drifted unnoticed.
 
 ## Not accepted, and why it is not a risk here
 

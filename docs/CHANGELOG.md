@@ -1118,6 +1118,32 @@ Eighth security review: a blocker, a major and two minors, and the architecture 
   It resolves the argument actually passed, through one level of binding, and counts what it cannot
   follow.
 
+Ninth security review: one major, two minors, and a claim of mine that was the finding:
+
+● The commit that took the credential out of the HTTP layer also asserted in FOUR places that "no
+  helper, parameter name, module, or encoding in `app.py` can reach it". False. The review took it
+  in four lines twice: `verify_token.__closure__[0].cell_contents` with a computed
+  `getattr("team" + "_token")`, and a direct `os.environ` read. Either wrote the whole credential to
+  the pod log with 337 tests green and all four scope tests passing. Needs a source change, so it is
+  a durability and claim-accuracy failure rather than a live vulnerability, but the claim is what a
+  reviewer relies on to stop looking, on the same channel as the previous blocker.
+● The claims are corrected where they were made, and a guard now refuses LANGUAGE FEATURES rather
+  than more spellings of a name: `__closure__`, `cell_contents`, `__globals__`, `__wrapped__`,
+  `__dict__`, `__code__` and neighbours; `globals()`, `vars()`, `locals()`, `eval`, `exec`,
+  `compile`; `getattr` with a computed name; and an `os.environ` read outside `load_config`. That
+  alphabet is Python's and fixed rather than the author's and chosen, which is why it cannot be one
+  short the way the previous denylist was.
+● `Config.team_token` is `field(repr=False)`. `repr()` of a Config printed the token verbatim, so any
+  f-string, print, format or exception carrying one disclosed it without spelling a token-shaped
+  attribute. One keyword closes the class; a test drives all five real renderings.
+● `token_verifier` closes over the expected string rather than the whole Config, so introspecting the
+  cell yields one value instead of every setting beside it.
+● Minors: the reader allowlist walked `glob` while claiming "every module", so a subpackage would
+  have been outside it silently, and is `rglob` now; and three citations in source docstrings did not
+  resolve - a test name that never existed, "two readers" where the allowlist names four, and a
+  `split()` that is `for_service()`. The register-row guard covers the control table, not source
+  docstrings.
+
 Continuous integration, which closes the standing container gap:
 
 ● `.github/workflows/verify.yml` runs the verification loop and the pipeline simulation on a runner

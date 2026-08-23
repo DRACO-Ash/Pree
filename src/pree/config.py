@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # The shortest string that can be a quoted value: the two quotes themselves.
@@ -84,13 +84,18 @@ class ServiceConfig:
 class Config:
     """The resolved runtime contract, including the credential. Immutable once boot validated it.
 
-    Held by the boot path only. `split()` is the boundary: past it, the credential exists solely
-    inside one closure and the HTTP layer holds a callable instead of a secret.
+    Held by the boot path only. `for_service()` is the boundary: past it, the credential exists
+    solely inside one closure and the HTTP layer holds a callable instead of a secret. An earlier
+    version of this docstring called that method `split()`, which never existed.
     """
 
     port: int
     data_dir: Path
-    team_token: str | None
+    # `repr=False` closes a whole class of disclosure in one keyword, and it was found by a review
+    # taking it: `repr()` of a `Config` printed `team_token='Zq7-Wx9_...'` verbatim, so any
+    # f-string, `print`, `format` or log of a Config anywhere disclosed the credential without ever
+    # spelling a token-shaped attribute, which is exactly what a name-based guard cannot see.
+    team_token: str | None = field(repr=False)
     allowed_origin: str | None
     environment: str
     build_id: str
