@@ -155,9 +155,15 @@ the assessment store.
 | The output guard covers handlers it was never told about, including propagated records and handlers built before arming | `src/pree/audit.py` | `test_the_runtime_guard_covers_handlers_it_was_never_told_about` |
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
-| No credential-bearing line reaches any logging handler - over the record's WHOLE default rendering, traceback and stack text included - or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a formatter that OVERRIDES `format` or `formatException` to synthesise text neither the attribute nor its `str()` reveals, NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams`, `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
+| No credential-bearing line reaches any logging handler - scanned as the FINISHED LINE at `logging.Handler.format`, so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant - or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a `Handler` subclass that overrides `format` or emits without calling it, NOT a refusal whose redaction then breaks the formatter (nothing leaks, but no alarm is emitted either), NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams`, `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
 | A traceback carrying the credential is refused, and one carrying none survives intact | `src/pree/audit.py` | `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
-| Every record ATTRIBUTE a formatter can name is scanned, as itself or through `str()`, and each one carrying the credential is redacted individually | `src/pree/audit.py` | `test_the_guard_scans_every_record_attribute_a_formatter_can_render` |
+| The finished line is scanned whatever produced it: `%(args)s` the message never consumed, a `repr` conversion, a formatter default, a lying `str` subclass, a filter running after the guard's | `src/pree/audit.py` | `test_the_finished_line_is_scanned_whatever_produced_it` |
+| ARMING THE GUARD NEVER EMITS WHAT THE DISARMED PROCESS WOULD NOT | `src/pree/audit.py` | `test_the_armed_guard_never_emits_what_the_disarmed_process_would_not` |
+| A lying `str` subclass is coerced at all three comparison points, each driven where it is the only layer that can act | `src/pree/audit.py` | `test_a_lying_str_subclass_is_coerced_at_all_three_layers` |
+| Every record ATTRIBUTE a formatter can name is scanned, `msg` and `args` included, and each one carrying the credential is redacted individually | `src/pree/audit.py` | `test_the_guard_scans_every_record_attribute_a_formatter_can_render` |
+| An attribute named `message` cannot shadow the rendered message and take it out of the scan | `src/pree/audit.py` | `test_an_attribute_named_message_cannot_shadow_the_rendered_message` |
+| `vars()` on a record cannot raise, because `LogRecord` declares no `__slots__` | `src/pree/audit.py` | `test_no_log_record_can_be_built_without_the_dictionary_the_scan_reads` |
+| A non-`str` `exc_text` or `stack_info` is scanned and cleared rather than raising into the caller | `src/pree/audit.py` | `test_a_non_string_traceback_field_is_scanned_and_cleared_rather_than_raising` |
 | A part of the default rendering the guard could not read is refused with a distinct alarm, not emitted unscanned | `src/pree/audit.py` | `test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete` |
 | An attribute the guard cannot stringify does NOT alarm a clean line, so the scan is not a denial of service on the log | `src/pree/audit.py` | `test_an_attribute_the_guard_cannot_stringify_does_not_alarm_a_clean_line` |
 | The introspection guard's one exemption is a single function reading its own `logging.LogRecord` parameter | `tests/test_api.py` | `test_the_introspection_exemption_is_exactly_one_function_on_a_log_record` |
@@ -2922,6 +2928,79 @@ guard, whose test used an input the standard library renders defensively instead
 `exc_text` half of a two-field fix where only `stack_info` had been driven. Both were fixed and both
 are red now, and neither would have been found by reading the diff - the reasoning in both cases was
 sound and the input was wrong.
+
+### The BLOCKER: the guard emitted what its own absence would have contained
+
+Both gates returned FAIL on the same commit. The security round found a BLOCKER and three majors; the
+engineering round found three majors, one of them the security round's, reached independently. Six of
+the seven reported channels reproduced here before anything was changed, and so did the BLOCKER.
+
+**The guard had become the cause of the leak.** An attribute whose `__str__` raises on the first call
+and returns the credential on the second: DISARMED, the formatter's first call raises,
+`handleError` discards the emission, and nothing is written at all. ARMED, the record scan absorbed
+the raising call under its own suppression, so the formatter's second call succeeded and the
+credential went to the log. Measured both ways, twice. A control that leaks what its absence would
+have contained is worse than no control, and there is no severity below blocker for that.
+
+It was not a bug in the walk. It was the design. Four rounds had each widened a MODEL of the emitted
+line - the message, then the traceback, then every attribute - and each lost to a part of the real
+line the model did not have:
+
+● `%(args)s` where the `%` substitution never consumes the argument, by a mapping key the message
+  does not name or a `%.4s` that truncates it. Both reviews found this one independently, and it came
+  from a single constant doing two jobs: `_REPLACED_ATTRIBUTES` meant "not redacted" AND "not
+  scanned", so `msg` and `args` were excluded from the scan as a side effect of protecting them from
+  the redaction. The axis the previous round existed to close stayed open two names short.
+● `%(obj)r`, `{obj!r}`, `{obj!a}`. A format string chooses the CONVERSION, and `repr` is not `str`.
+● `Formatter(defaults={...})`, where the value never touches the record, so no record scan however
+  complete can see it.
+● A `str` subclass whose `__contains__` returns False for a substring it holds.
+● A filter added after the guard's own - the ordinary context-enricher pattern, since the patched
+  constructor makes the guard the FIRST filter and everything later runs after it.
+
+So the guard stopped predicting. `logging.Handler.format` is where every stock handler turns a record
+into the string it emits, and its return value is now scanned. That is indifferent to which
+attribute, conversion, formatter default, filter or `__str__` produced the text, and it is the same
+principle `_GuardedStream` had applied to the byte channel all along: check what is leaving, not a
+model of what is leaving. All seven channels refuse now, and arming is no longer worse than not
+arming - which is asserted as an INVARIANT rather than as a case, so the next value with an unstable
+rendering meets the same test.
+
+The record scan is kept, and its job changed rather than went. It refuses early and redacts the
+individual field that carried the credential, so a refused record stays diagnosable instead of
+collapsing to one alarm. Its gaps now cost redaction fidelity rather than containment, which is what
+lets it stay simple - and it is also what made the third layer of the coercion fix testable at all,
+because the only observable difference between `type(value) is str` and `isinstance` is whether the
+emitted line names the field it redacted.
+
+Two smaller things went the other way, and both are about deleting rather than adding:
+
+● `_refuse`'s stated reason for skipping the rendered keys was false. It claimed the skip was what
+  kept `args` a tuple; `_NOT_REDACTABLE` does that, and deleting the conditional left the suite
+  green. The real reason is collision avoidance - an attribute literally named `message` would
+  otherwise overwrite the rendered message's entry in the parts dictionary and take the message out
+  of the scan - and that is what holds it now.
+● A `try/except TypeError` around `vars()` was dead code. `logging.LogRecord` declares no
+  `__slots__`, so every instance has a `__dict__` and a subclass declaring slots ADDS to it rather
+  than removing it. Coverage reported the branch as never taken, and the test written to drive it
+  could not: a slotted subclass still has a readable dictionary. Removed, with the mechanism asserted
+  instead, so a future Python that gives `LogRecord` slots turns a test red rather than a logging
+  filter into a fault in its caller. This is the second speculative catch removed on the same
+  argument in three commits.
+
+**And the fourth and fifth copies of the inverted mechanism claim.** The commit that corrected "a
+raise inside a logging filter is swallowed" said it had corrected the claim everywhere. It had found
+three of five: two in the module, one in a test docstring, and two more in these documents. Both are
+corrected in place. "Everywhere" is a claim of its own and needs the same evidence as any other.
+
+**What the canary caught this time.** Seventeen mutations. Four came back green on the first attempt
+and three were real: the lying-`str` coercion was held at only ONE of its three comparison points,
+because the existing case put the subclass where the finished-line scan covered for the other two.
+Each is now driven where it is the only layer that can act. The fourth green is not a defect and is
+recorded because the distinction matters: ADDING dead code back cannot be detected by mutation
+testing, because dead code has no observable behaviour by definition. Coverage is the instrument for
+that, and coverage is what found it. The two techniques answer different questions and neither
+substitutes for the other.
 
 ## Not accepted, and why it is not a risk here
 

@@ -4710,6 +4710,101 @@ def test_the_finished_line_is_scanned_whatever_produced_it() -> None:
         assert CREDENTIAL_ALARM in guarded, f"{label}: refused without an alarm: {guarded!r}"
 
 
+def test_a_lying_str_subclass_is_coerced_at_all_three_layers() -> None:
+    """`in` dispatches to `type(text).__contains__`, so a `str` subclass can deny what it holds.
+
+    Three separate places compare against the credential, and each one needed the same coercion.
+    A canary found that only one of the three was held. The existing case put the lying subclass in
+    a record ATTRIBUTE, where the finished-line scan catches it whatever the other two layers do,
+    so reverting either of those coercions left the suite green.
+
+    So each layer is driven where it is the only one that can act:
+
+    ● The finished-line scan, with a FORMATTER that returns the lying subclass. Nothing downstream
+      of it in the log channel sees the text, so `str(text)` there is the only coercion that helps.
+    ● The stream wrapper, by writing the subclass straight to a wrapped `sys.stdout`. That is the
+      `print` channel and it never passes a formatter at all.
+    ● The record walk, by the DIAGNOSTIC it produces. `type(value) is str` versus `isinstance` does
+      not change containment - the finished-line scan refuses either way - it changes whether the
+      filter identified the offending field, so the emitted line carries the redaction marker beside
+      the alarm rather than the alarm alone. That is redaction fidelity, which is the walk's whole
+      remaining job.
+    """
+    secret = "5Ip-8Ok_1Aj.4Sh~6Dg3FZq7Wx9Yt2Ur"
+
+    class LyingFormatter(logging.Formatter):
+        """Returns a `str` subclass that denies holding the credential."""
+
+        def format(self, record: logging.LogRecord) -> str:
+            return _LyingStr(f"a line holding {secret}")
+
+    # Layer one: the finished line, where the formatter itself lies.
+    sink = io.StringIO()
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(LyingFormatter())
+    install_credential_guard(secret)
+    try:
+        handler.handle(
+            logging.LogRecord(
+                name="lying.formatter",
+                level=logging.ERROR,
+                pathname=__file__,
+                lineno=0,
+                msg="a clean message",
+                args=(),
+                exc_info=None,
+            )
+        )
+        from_formatter = sink.getvalue()
+    finally:
+        install_credential_guard(None)
+        handler.close()
+
+    assert secret not in from_formatter, (
+        f"a formatter returning a lying `str` subclass put the credential on the line: "
+        f"{from_formatter!r}"
+    )
+    assert CREDENTIAL_ALARM in from_formatter, f"refused without an alarm: {from_formatter!r}"
+
+    # Layer two: the stream wrapper, which is `print` and never sees a formatter.
+    written: list[str] = []
+
+    class Recording:
+        def write(self, text: str) -> int:
+            written.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            return None
+
+    stream = _GuardedStream(Recording())
+    install_credential_guard(secret)
+    try:
+        stream.write(_LyingStr(f"a direct write holding {secret}\n"))
+    finally:
+        install_credential_guard(None)
+
+    assert not any(secret in line for line in written), (
+        f"a lying `str` subclass written straight to a wrapped stream reached it: {written!r}"
+    )
+    assert written == [f"{CREDENTIAL_ALARM}\n"], f"refused without an alarm: {written!r}"
+
+    # Layer three: the walk, measured by whether the offending FIELD was identified.
+    identified = _emit_one(
+        secret,
+        fmt="%(message)s v=%(v)s",
+        msg="an authentication failure",
+        extra={"v": _LyingStr(secret)},
+        armed=True,
+    )
+    assert secret not in identified, f"the attribute reached the line: {identified!r}"
+    assert REDACTED_ATTRIBUTE in identified, (
+        f"the filter did not identify which field carried the credential, so the whole line was "
+        f"replaced rather than the one attribute redacted. Containment held either way; what is "
+        f"lost is the diagnosis a refused record exists to give: {identified!r}"
+    )
+
+
 def test_the_armed_guard_never_emits_what_the_disarmed_process_would_not() -> None:
     """The invariant a BLOCKER violated: arming must never make the leak worse.
 

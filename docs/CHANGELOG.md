@@ -1336,3 +1336,34 @@ argument for running them: the test holding the `formatException` guard used an 
 library renders defensively rather than raising, and a two-field fix had only one field driven. Both
 are red now.
 
+### Both gates FAIL: the guard emitted what its own absence would have contained
+
+The security round found a BLOCKER and three majors; the engineering round found three majors on the
+same commit, one of them the same finding reached independently. Six of the seven reported channels
+reproduced before anything changed, and so did the BLOCKER.
+
+● **The BLOCKER.** An attribute whose `__str__` raises on the first call and returns the credential
+  on the second. Disarmed, the formatter's first call raises and `handleError` discards the emission,
+  so nothing is written; armed, the record scan absorbed the raising call and the formatter's second
+  call succeeded. Arming the control was what put the credential in the log.
+● **The cause, and the fix.** Four rounds had widened a MODEL of the emitted line and each lost to a
+  part of the real one: `%(args)s` the message never consumed, a `repr` conversion, a formatter
+  default that never touches the record, a lying `str` subclass, a filter running after the guard's.
+  The guarantee moved to `logging.Handler.format`, where a stock handler turns a record into the
+  string it emits, so what is scanned is the line rather than a prediction of it. All seven channels
+  refuse, and "arming never emits what the disarmed process would not" is asserted as an invariant.
+● The record scan is kept for early refusal and field-level redaction. `msg` and `args` are scanned
+  now: one constant had meant both "not redacted" and "not scanned", which is where the two-name gap
+  both reviewers found came from.
+● Two deletions. `_refuse`'s stated reason for its key-prefix skip was false and the line pinned
+  nothing; the real reason is collision avoidance and an attribute named `message` holds it. And a
+  `try/except TypeError` around `vars()` was dead code, because `LogRecord` declares no `__slots__`
+  and a subclass cannot shed the dictionary; the mechanism is asserted instead.
+● The fourth and fifth copies of the inverted filter-raise claim, in this file and in the security
+  policy. The commit that said it had corrected that claim everywhere had found three of five.
+
+Seven new regression tests, 360 passing, coverage 99% against the gate's 80%, no missed statements.
+Seventeen mutations run: sixteen red. Four were green first time and three were real gaps, all in the
+lying-`str` coercion, which was held at only one of its three comparison points. The fourth green is
+recorded rather than fixed: adding dead code back cannot be caught by mutation testing, because dead
+code has no observable behaviour, which is why coverage is a separate gate.
