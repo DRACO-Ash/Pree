@@ -23,12 +23,20 @@ def build() -> FastAPI:
     so a misconfiguration surfaces as a start-up error rather than a silent runtime fault.
     """
     config = load_config()
-    # ARMED FIRST, before anything can write a line. Every static guard before this one was an
-    # enumeration the adversary could step outside: sampled tokens, then name spellings, then
-    # language features, each defeated in a handful of lines. This one checks the bytes leaving the
-    # process against the actual secret, so it does not care how a leak obtained the value, and it
-    # covers routes nobody enumerated. It is defence in depth, not a replacement for the boundary
-    # below: the boundary is what stops the credential being in reach at all.
+    # Armed at the FIRST POINT THE CREDENTIAL EXISTS, which is not the same as first. This comment
+    # said "ARMED FIRST, before anything can write a line", and that cannot be true of the one
+    # function that necessarily precedes it: the guard needs the value, so `load_config` runs before
+    # the guard exists and there is a window it does not cover. What closes the window is
+    # `config.py` rather than the guard - every raise path there renders the token's LENGTH and its
+    # repetition count, never its value - so the property holds by construction at the only place
+    # that could break it. Stated here because "armed first" invited a reader to stop looking.
+    #
+    # Every static guard before this one was an enumeration the adversary could step outside:
+    # sampled tokens, then name spellings, then language features, each defeated in a handful of
+    # lines. This one checks the bytes leaving the process against the actual secret, so it does not
+    # care how a leak obtained the value, and it covers routes nobody enumerated. It is defence in
+    # depth, not a replacement for the boundary below: the boundary is what stops the credential
+    # being in reach at all.
     arm_output_guard(config)
     store = JsonStore(config.data_dir)
     try:

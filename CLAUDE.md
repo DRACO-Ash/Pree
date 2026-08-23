@@ -67,7 +67,7 @@ is spent discovering which one holds.
 
 ## Naming and versioning
 
-- Releases are `V0.1` style, held in `pyproject.toml` and `src/pree/__init__.py`, which must agree. Bump the version stamp and add one changelog row on every change.
+- Releases are `V0.1` style, held in `pyproject.toml` and `src/pree/__init__.py`, which must agree. Add one changelog row on every change. Bump the version stamp on every change AFTER the first release; before it, the stamp holds at the unreleased version and only the changelog moves, because a bump would assert a patch to a release that never happened. This clause once said "bump on every change" flat, and every commit in the project's history contradicted it, which is a convention that trains a reader to ignore conventions.
 - Delivery copies of the upload archive follow `Bluestaq_Limited_-_Pree_-_V0_1_-_<date>.zip`; these are the rollback source.
 - The App Store slug is `pree`: lowercase, alphanumeric at both ends, no double hyphen (a double hyphen breaks platform naming and fails with zero pipeline stages run).
 

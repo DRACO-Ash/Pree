@@ -52,6 +52,8 @@ from pree.app import (
 )
 from pree.audit import (
     CREDENTIAL_ALARM,
+    REDACTED_ATTRIBUTE,
+    UNSCANNABLE_ALARM,
     _GuardedStream,
     audit,
     build_logger,
@@ -3805,6 +3807,22 @@ _INTROSPECTION_ATTRIBUTES = frozenset(
     }
 )
 _INTROSPECTION_CALLS = frozenset({"globals", "vars", "locals", "eval", "exec", "compile"})
+# The ONE named exemption, keyed on (module, function) exactly as the reader and environment
+# allowlists are, and it exists because this guard refused a fix the security gate required.
+#
+# A `logging.Formatter` format string may name ANY record attribute, so `extra={"token": ...}` with
+# `%(token)s` put the credential on the line with the output guard armed. The renderable set IS
+# `record.__dict__` - the stdlib does `self._fmt % record.__dict__` - so there is no non-
+# introspective way to obtain it, and enumerating attribute names cannot work when `extra` supplies
+# arbitrary ones. Enumeration is the mistake this whole guard exists to prevent.
+#
+# What makes this an exemption and not a hole: it is one function, one spelling, and the object is a
+# `logging.LogRecord` the function was handed rather than anything holding the credential. The
+# CONVERSE of the usual danger: this call exists to FIND the credential in order to refuse it. It
+# is pinned by `test_the_introspection_exemption_is_exactly_one_function_on_a_log_record`, which
+# asserts the set has one member and that the member's `vars()` argument is its own record
+# parameter.
+INTROSPECTION_EXEMPTIONS = frozenset({("audit.py", "_scannable_parts", "vars")})
 # `load_config` is the only function that may read the process environment. Anywhere else, an
 # `os.environ` read is a second source of truth for the credential that bypasses every boundary.
 # Also keyed on (MODULE, FUNCTION), for the same measured reason.
@@ -3846,11 +3864,13 @@ def _format_field_complaint(node: ast.Constant) -> str | None:
     return None
 
 
-def _call_complaint(node: ast.Call) -> str | None:
+def _call_complaint(node: ast.Call, owner: dict[int, str], module: str) -> str | None:
     """What is wrong with one call, or None."""
     if not isinstance(node.func, ast.Name):
         return None
     if node.func.id in _INTROSPECTION_CALLS:
+        if (module, owner.get(node.lineno), node.func.id) in INTROSPECTION_EXEMPTIONS:
+            return None
         return f"calls {node.func.id}()"
     # A COMPUTED attribute name is the whole point: `getattr(x, "team" + "_token")` reaches an
     # attribute no static rule about attribute NAMES can see.
@@ -3866,7 +3886,7 @@ def _introspection_complaint(node: ast.AST, owner: dict[int, str], module: str) 
     if isinstance(node, ast.Attribute):
         return _attribute_complaint(node, owner, module)
     if isinstance(node, ast.Call):
-        return _call_complaint(node)
+        return _call_complaint(node, owner, module)
     if isinstance(node, ast.Constant):
         return _format_field_complaint(node)
     return None
@@ -3972,9 +3992,13 @@ def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
     silent pass waits. So each is driven.
 
     A record whose `%`-formatting raises (wrong argument count) must not become an emitted secret
-    and must not take the process down: the filter lets it through unscrubbed, because a record that
-    cannot be rendered cannot be scanned, and logging would otherwise swallow the exception and emit
-    it anyway. The `isatty` and `encoding` fallbacks exist because the wrapper forwards only what a
+    and must not take the process down. Both halves of that used to be described wrongly here: the
+    filter was said to let such a record "through unscrubbed" because "logging would otherwise
+    swallow the exception and emit it anyway". It now REFUSES the record instead, with a distinct
+    alarm, because a part of the default rendering that the guard could not read is a line going out
+    unscanned; and a raise inside a filter is not swallowed at all - it propagates to the `logger.*`
+    call site and the record is emitted nowhere, which is why the guard substitutes rather than
+    raises. The `isatty` and `encoding` fallbacks exist because the wrapper forwards only what a
     stream user actually touches, and something asking a wrapped stream for either must not get an
     AttributeError.
     """
@@ -4353,6 +4377,9 @@ def test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message() ->
         logger.handlers = previous
         logger.setLevel(previous_level)
         logger.propagate = previous_propagate
+        # CLOSED, like its sibling below. An unclosed handler stays in `logging._handlerList` until
+        # its weakref clears, so every later arming in the session walks it.
+        handler.close()
 
     assert secret in unguarded, (
         "the traceback channel does not reach this sink even unguarded, so the assertions below "
@@ -4365,6 +4392,329 @@ def test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message() ->
     assert "ValueError: token rejected" in guarded, (
         "the guard stripped a traceback that carried no credential, so it costs every diagnosis "
         "rather than the leaking ones"
+    )
+
+
+def test_the_introspection_exemption_is_exactly_one_function_on_a_log_record() -> None:
+    """The exemption in the introspection guard, pinned so it cannot widen into a hole.
+
+    `_scannable_parts` calls `vars()`, which this project's own guard refuses, and the refusal was
+    correct in general: a computed or wholesale read of an object's attributes is how the credential
+    was reached nine ways. It is wrong in this one place, because the renderable set of a log record
+    IS `record.__dict__` - the stdlib formats with `self._fmt % record.__dict__` - so there is no
+    non-introspective way to get it, and `extra` supplies arbitrary names so no enumeration covers
+    it. Refusing here would have left the measured `%(token)s` leak open.
+
+    The precedent this follows is the one the reader allowlist set: an exemption is acceptable
+    when it is keyed on (module, function) and pinned, and a blanket exemption for a MODULE is not,
+    because a control that exempts the module implementing it is not a control.
+
+    So four things are asserted, and the third is the one that matters: the exemption has exactly
+    one member, it names a function that exists, that function's `vars()` argument is its own
+    rather than anything else, and that parameter is annotated `logging.LogRecord`. An edit that
+    pointed this call at a `Config` would fail here.
+    """
+    assert len(INTROSPECTION_EXEMPTIONS) == 1, (
+        f"the introspection exemption has grown to {sorted(INTROSPECTION_EXEMPTIONS)}. Each member "
+        f"is a place a wholesale attribute read is permitted, which is the route this guard exists "
+        f"to refuse; a second one needs its own argument, not this one's"
+    )
+    module_name, function_name, call_name = next(iter(INTROSPECTION_EXEMPTIONS))
+    assert (module_name, call_name) == ("audit.py", "vars")
+
+    source = Path(audit_module.__file__ or "").resolve().read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == function_name
+        ),
+        None,
+    )
+    assert function is not None, (
+        f"the exemption names {function_name}() in {module_name}, which does not exist. A dead "
+        f"exemption is worse than none: it reads as a considered decision and pins nothing"
+    )
+    parameters = {argument.arg for argument in function.args.args}
+    calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "vars"
+    ]
+    assert len(calls) == 1, (
+        f"expected exactly one vars() call in {function_name}(), got {len(calls)}"
+    )
+    argument = calls[0].args[0] if calls[0].args else None
+    assert isinstance(argument, ast.Name) and argument.id in parameters, (
+        f"the exempted vars() call reads "
+        f"{ast.dump(argument) if argument else 'nothing'} rather than one of {function_name}()'s "
+        f"own parameters {sorted(parameters)}. The exemption is only safe because the object is a "
+        f"log record handed in, not something holding the credential"
+    )
+    annotation = next(
+        argument_node.annotation
+        for argument_node in function.args.args
+        if argument_node.arg == argument.id
+    )
+    assert (
+        isinstance(annotation, ast.Attribute)
+        and annotation.attr == "LogRecord"
+        and isinstance(annotation.value, ast.Name)
+        and annotation.value.id == "logging"
+    ), (
+        f"the exempted vars() call reads a parameter annotated "
+        f"{ast.unparse(annotation) if annotation else 'nothing'}, not `logging.LogRecord`. The "
+        f"type is the whole argument for the exemption"
+    )
+
+
+def test_the_guard_scans_every_record_attribute_a_formatter_can_render() -> None:
+    """The axis the previous round missed: WHICH PART of the record the formatter renders.
+
+    Scanning the four strings `Formatter.format` concatenates closed the traceback bypass and left a
+    whole dimension open, because a format string may name ANY record attribute. Three routes were
+    measured reaching the line in plaintext with the guard armed: `extra={"token": ...}` rendered by
+    `%(token)s`, the credential in the LOGGER NAME rendered by `%(name)s`, and `funcName` rendered
+    by `%(funcName)s`. None is an fd-level write, a re-encoding, a split write, or a same-privilege
+    disarm, so each sat outside every limit the module named.
+
+    A non-`str` attribute is scanned through `str()`, because that is exactly the call a `%`-style
+    format string makes on it.
+
+    Each route is driven with the guard DISARMED first, so the channel is proved real before the
+    guard is credited with closing it. And each is driven on a handler whose stream is not a wrapped
+    `sys` stream, which is where the filter half stands alone.
+    """
+    secret = "Ok1-Aj4_Sh6.Dg3~FZq7Wx9Yt2Ur5Ip8"
+
+    class Carrier:
+        """A non-`str` attribute whose rendering carries the credential, as `%(obj)s` would."""
+
+        def __str__(self) -> str:
+            return f"carrier holding {secret}"
+
+    routes: tuple[tuple[str, str, str, dict[str, Any]], ...] = (
+        ("extra", "%(message)s tok=%(token)s", "clean.logger", {"extra": {"token": secret}}),
+        ("logger name", "%(name)s %(message)s", f"leak.{secret}", {}),
+        (
+            "non-str extra",
+            "%(message)s obj=%(obj)s",
+            "clean.logger.two",
+            {"extra": {"obj": Carrier()}},
+        ),
+    )
+    for label, fmt, logger_name, kwargs in routes:
+        sink = io.StringIO()
+        handler = logging.StreamHandler(sink)
+        handler.setFormatter(logging.Formatter(fmt))
+        logger = logging.getLogger(logger_name)
+        previous, previous_level, previous_propagate = (
+            logger.handlers,
+            logger.level,
+            logger.propagate,
+        )
+        logger.handlers = [handler]
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            # DISARMED first: prove the channel reaches the line at all.
+            logger.info("an authentication failure", **kwargs)
+            unguarded = sink.getvalue()
+            sink.truncate(0)
+            sink.seek(0)
+            install_credential_guard(secret)
+            try:
+                logger.info("an authentication failure", **kwargs)
+                logger.info("a benign line", **kwargs)
+            finally:
+                install_credential_guard(None)
+            guarded = sink.getvalue()
+        finally:
+            logger.handlers = previous
+            logger.setLevel(previous_level)
+            logger.propagate = previous_propagate
+            handler.close()
+
+        assert secret in unguarded, f"{label}: the channel does not reach the line even unguarded"
+        assert secret not in guarded, f"{label}: the credential reached the log: {guarded!r}"
+        # TWO alarms, not one. The benign line carries the same credential-bearing attribute, so it
+        # is refused too, which is correct: the attribute is what the formatter renders.
+        assert guarded.count(CREDENTIAL_ALARM) == 2, f"{label}: expected two alarms: {guarded!r}"
+        assert REDACTED_ATTRIBUTE in guarded or "%(name)s" in fmt, (
+            f"{label}: the offending attribute was not redacted, so only `msg` was replaced "
+            f"and the formatter rendered the attribute beside the alarm"
+        )
+
+
+def test_an_attribute_the_guard_cannot_stringify_does_not_alarm_a_clean_line() -> None:
+    """The deliberate ASYMMETRY between the two halves of the scan, which is easy to get wrong.
+
+    A part of the default rendering that cannot be produced means the line goes out unscanned, so
+    the guard fails closed on it. An ATTRIBUTE that cannot be stringified means nothing of the kind:
+    a formatter naming it would raise too, and `handleError` then writes the traceback and
+    `record.msg` to stderr rather than the attribute. Failing closed there would replace a
+    legitimate line whose rendering never touched the thing that failed, which is a denial of
+    service on the log rather than a control on it.
+
+    So this asserts the guard does NOT alarm, which is the assertion that stops a future round
+    "hardening" the attribute walk into an outage.
+    """
+    secret = "Aj4-Sh6_Dg3.FZq~7Wx9Yt2Ur5Ip8Ok1"
+
+    class Hostile:
+        def __str__(self) -> str:
+            raise RuntimeError("this attribute cannot be rendered")
+
+    sink = io.StringIO()
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("unstringifiable.attribute")
+    previous, previous_level, previous_propagate = (
+        logger.handlers,
+        logger.level,
+        logger.propagate,
+    )
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    install_credential_guard(secret)
+    try:
+        logger.info("a line whose rendering is fine", extra={"hostile": Hostile()})
+        emitted = sink.getvalue()
+    finally:
+        install_credential_guard(None)
+        logger.handlers = previous
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+        handler.close()
+
+    assert "a line whose rendering is fine" in emitted, (
+        f"an attribute the formatter never rendered cost a legitimate line: {emitted!r}"
+    )
+    assert CREDENTIAL_ALARM not in emitted, f"a clean line was alarmed: {emitted!r}"
+    assert UNSCANNABLE_ALARM not in emitted, f"a clean line was refused as unscannable: {emitted!r}"
+
+
+def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> None:
+    """Fail CLOSED on a part of the default rendering the guard could not read.
+
+    The scan used to skip an unrenderable part and fall through to "no match", and a review defeated
+    it in four lines: a `msg` whose `__str__` raises on the FIRST call and returns the credential on
+    the second. One call for the guard, the next for the formatter, and the line went out unscanned
+    with the guard armed. A distinct alarm is used rather than the credential one, because "this
+    could not be checked" and "a leak was refused" are different facts and a single marker would
+    make a storm of the first indistinguishable from the second.
+
+    Three shapes, each holding a line nothing else holds:
+
+    ● The double-call `__str__`, which is the measured bypass.
+    ● An `exc_info` whose exception raises while being rendered, with the credential in `msg`. This
+      is the only thing holding the guard around `formatException`: deleting that guard turns this
+      red, where the whole suite stayed green before this test existed.
+    ● A truthy NON-`str` `stack_info`. The docstring claimed every part was produced under its own
+      guard while two were appended raw, so this input made the join raise `TypeError` out of the
+      filter and into the `logger.*` call site - where logging itself had previously contained it.
+    """
+    secret = "Sh6-Dg3_FZq.7Wx~9Yt2Ur5Ip8Ok1Aj4"
+
+    class DoubleCall:
+        """Raises once, then yields the credential: one call for the guard, one for the format."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError("not yet")
+            return f"token={secret}"
+
+    class UnrenderableError(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("this exception cannot be rendered")
+
+    def fail_unrenderably() -> None:
+        """Raise from a frame of its own, so the traceback under test is a real one."""
+        raise UnrenderableError
+
+    class NotAString:
+        """A truthy non-`str` `stack_info`, carrying the credential through `str()`."""
+
+        def __str__(self) -> str:
+            return f"stack info that is not a str, holding {secret}"
+
+    sink = io.StringIO()
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("unrenderable.record")
+    previous, previous_level, previous_propagate = (
+        logger.handlers,
+        logger.level,
+        logger.propagate,
+    )
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    install_credential_guard(secret)
+    try:
+        logger.info(DoubleCall())
+        double_call = sink.getvalue()
+        sink.truncate(0)
+        sink.seek(0)
+        # The credential is in `msg`, so the refusal must happen even though the exception render
+        # failed. Without the guard around `formatException` this raises out of `logger.error`.
+        try:
+            fail_unrenderably()
+        except UnrenderableError:
+            logger.error("token rejected: %s", secret, exc_info=True)
+        exception_render = sink.getvalue()
+        sink.truncate(0)
+        sink.seek(0)
+        # A truthy non-`str` `stack_info`, set directly because no public call produces one.
+        record = logging.LogRecord(
+            name=logger.name,
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=0,
+            msg="a clean message",
+            args=(),
+            exc_info=None,
+        )
+        record.stack_info = NotAString()  # type: ignore[assignment]
+        # Reaching the next line at all is half the assertion: without `str()` around this field the
+        # join raises `TypeError` out of the filter, out of `handle`, and into this frame.
+        handler.handle(record)
+        non_string_stack = sink.getvalue()
+    finally:
+        install_credential_guard(None)
+        logger.handlers = previous
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+        handler.close()
+
+    assert secret not in double_call, f"the double-call bypass still leaks: {double_call!r}"
+    assert UNSCANNABLE_ALARM in double_call, (
+        f"a record the guard could not read went out unscanned rather than refused: {double_call!r}"
+    )
+    assert secret not in exception_render, (
+        f"an unrenderable exception took the whole scan with it: {exception_render!r}"
+    )
+    assert CREDENTIAL_ALARM in exception_render, (
+        f"the credential in `msg` was not refused when the exception render failed: "
+        f"{exception_render!r}"
+    )
+    # The other half. The field is SCANNED through `str()`, so the record is refused; and it is
+    # CLEARED by the refusal, which is what lets the formatter emit at all - `Formatter.format`
+    # concatenates `stack_info` onto the line, so a surviving non-`str` there would raise inside
+    # `format` and `handleError` would swallow the whole emission. An alarm in the sink therefore
+    # proves both halves at once.
+    assert secret not in non_string_stack, (
+        f"a non-str stack_info carried the credential past the scan: {non_string_stack!r}"
+    )
+    assert CREDENTIAL_ALARM in non_string_stack, (
+        f"a non-str stack_info was not scanned, or was not cleared by the refusal: "
+        f"{non_string_stack!r}"
     )
 
 
@@ -4486,7 +4836,12 @@ def test_the_guard_reports_the_callers_length_when_it_refuses_a_write() -> None:
         f"looping until everything is written re-submits its last {len(leak) - reported} characters"
     )
     assert rounds == 1, f"the caller's write loop ran {rounds} times for one refused write"
-    assert accepted == [alarm], f"the refused text reached the stream on a retry: {accepted!r}"
+    assert accepted == [alarm], (
+        f"the refused write was re-submitted, so the caller's loop did not terminate in one round: "
+        f"{accepted!r}. What reaches the stream on the retry is a SECOND alarm, not the refused "
+        f"text - the wrapper refuses it again - so the harm this fixture shows is the loop, and an "
+        f"earlier version of this message claimed the text itself got through"
+    )
 
 
 def test_the_runtime_guard_is_armed_by_the_boot_path_and_not_by_the_factory() -> None:
@@ -4546,7 +4901,9 @@ EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
     # streams, and that is the one place in the package that needs to. `contextlib` is here for
     # `suppress`, on the three paths where a guard that raises is worse than the leak it prevents:
     # a record whose rendering raises, and a handler whose `stream` cannot be reassigned.
-    "audit.py": frozenset({"__future__", "contextlib", "json", "logging", "sys", "typing"}),
+    "audit.py": frozenset(
+        {"__future__", "collections", "contextlib", "json", "logging", "sys", "typing"}
+    ),
     "config.py": frozenset({"__future__", "dataclasses", "os", "pathlib", "re"}),
     "health.py": frozenset(
         {

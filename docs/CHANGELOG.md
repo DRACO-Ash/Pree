@@ -1264,9 +1264,12 @@ Continuous integration, which closes the standing container gap:
 ### Eighth security review: PASS, and the six minors closed on the way past
 
 The thirteenth security round returned **VERDICT: PASS** - six minors, no major, no blocker - and
-verified the guard under the shipped launch command: 5 of 5 handlers wrapped and filtered, 0
-occurrences of the token in 609 live log lines, both of the previous round's majors closed and held,
-7 of 8 mutations red. All six minors are closed here, and the two that were more than a sentence:
+verified the guard under the shipped launch command. Its figures are quoted as the REVIEWER's
+measurements, not as project facts, because nothing in the repository evidences them and an
+engineering review rightly asked which they were: 5 of 5 handlers wrapped and filtered, 0 occurrences
+of the token in 609 live log lines, both of the previous round's majors closed and held, 7 of 8
+mutations red. What is reproducible here is the suite and the loop. All six minors are closed in this
+release, and the two that were more than a sentence:
 
 ● **The filter scanned the message, not the rendered record.** `Formatter.format` appends the
   exception and stack text after the message, so `exc_info` carrying the credential went out with the
@@ -1288,3 +1291,40 @@ is now driven through the caller's own write loop, which must terminate in one r
 
 Three new regression tests, 350 passing, coverage 99% against the gate's 80%. No version bump: V0.1
 is unreleased, so a stamp move would assert a patch to a release that never happened.
+
+### Ninth security review and the engineering round on the same commit: one finding, reached twice
+
+The security round returned PASS with five minors; the engineering round on the same commit returned
+FAIL with three majors. Their top finding was the same, reached independently, and it was not a leak:
+**the guard's own design rationale asserted a mechanism the runtime does not have.** For three rounds
+the module said a raise inside a logging filter is swallowed and the line goes out anyway, and used
+that to justify failing closed by substitution. `Handler.handle` calls the filter outside any `try`,
+so it propagates to the `logger.*` call site and the record is emitted nowhere. The decision was
+right and the reason was wrong, which is worse: an engineer trusting the stated reason removes the
+suppressions and turns a malformed log record into a 500 in the handler that logged it.
+
+Everything else closed in this round:
+
+● **A whole axis of the scan.** A format string may name any record attribute, so `extra={"token":
+  ...}` with `%(token)s`, the credential in the logger name, and `funcName` all reached the line in
+  plaintext with the guard armed. Every attribute is now scanned, as itself or through `str()`, and
+  each one carrying the credential is redacted individually so the rest of the record stays
+  diagnosable.
+● **The scan failed open.** A `msg` whose `__str__` raised once then returned the credential went out
+  unscanned. A part of the default rendering the guard cannot read is now refused with a distinct
+  alarm. The attribute walk deliberately does NOT fail closed, because an attribute the formatter
+  never renders is not an unscanned emission and alarming on it would cost a legitimate line; the
+  asymmetry has its own test.
+● **This project's introspection guard refused the fix**, since the renderable set is
+  `record.__dict__`. Resolved by one exemption keyed on (module, function, call) and pinned by a test
+  asserting it has exactly one member reading its own `logging.LogRecord` parameter - not by
+  exempting the module, which would be a control exempting its own implementation.
+● **"Each part is produced under its own `try`"** was false for two of four: a truthy non-`str`
+  `exc_text` or `stack_info` made the join raise out of the filter. **The suppression around
+  `formatException` was unheld.** **A `TypeError` in the re-point's catch was speculative and
+  unheld**, and is gone; `AttributeError` covers all three real shapes. **"ARMED FIRST" preceded
+  itself**, since the guard needs the credential `load_config` resolves; the window is closed by
+  `config.py` and is now in the uncovered set.
+
+Four new regression tests, 354 passing, coverage 99% against the gate's 80%. Still no version bump:
+V0.1 is unreleased.
