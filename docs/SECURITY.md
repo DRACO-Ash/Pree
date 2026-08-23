@@ -155,8 +155,13 @@ the assessment store.
 | The output guard covers handlers it was never told about, including propagated records and handlers built before arming | `src/pree/audit.py` | `test_the_runtime_guard_covers_handlers_it_was_never_told_about` |
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
-| No credential-bearing line reaches any logging handler - scanned as the FINISHED LINE at `logging.Handler.format`, so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant - or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a `Handler` subclass that overrides `format` or emits without calling it, NOT a refusal whose redaction then breaks the formatter (nothing leaks, but no alarm is emitted either), NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams`, `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
+| No credential-bearing line reaches any logging handler - scanned as the FINISHED LINE at `logging.Handler.format`, so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant - or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that does not emit `Handler.format`'s return value - `HTTPHandler` urlencodes `record.__dict__`, `SocketHandler` and `DatagramHandler` pickle it, and no subclassing is needed; for those the record scan is the only layer, covering `str` attributes and not what a later filter adds - NOT a refusal whose redaction then breaks the formatter (nothing leaks, but no alarm is emitted either), NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams`, `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
 | A traceback carrying the credential is refused, and one carrying none survives intact | `src/pree/audit.py` | `test_the_guard_scans_the_whole_rendered_record_and_not_only_the_message` |
+| A refusal mints no attribute whose name the scan uses as a key, so refusing a record once does not take its message out of the scan | `src/pree/audit.py` | `test_a_refusal_mints_no_attribute_the_parts_dictionary_uses_as_a_key` |
+| A refusal that cannot write to the record faults no caller, and the finished-line scan still contains it | `src/pree/audit.py` | `test_a_refusal_that_cannot_write_to_the_record_does_not_fault_the_caller` |
+| Arming twice does not stack either stdlib patch | `src/pree/audit.py` | `test_arming_twice_does_not_stack_the_stdlib_patches` |
+| A handler built after arming carries the guard filter, which is the only layer for a handler that never calls `Handler.format` | `src/pree/audit.py` | `test_a_handler_built_after_arming_carries_the_guard_filter` |
+| The SHIPPED rate limits are the ones a deployed pod enforces, driven with no limiter injected | `src/pree/ratelimit.py` | `test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces` |
 | The finished line is scanned whatever produced it: `%(args)s` the message never consumed, a `repr` conversion, a formatter default, a lying `str` subclass, a filter running after the guard's | `src/pree/audit.py` | `test_the_finished_line_is_scanned_whatever_produced_it` |
 | ARMING THE GUARD NEVER EMITS WHAT THE DISARMED PROCESS WOULD NOT | `src/pree/audit.py` | `test_the_armed_guard_never_emits_what_the_disarmed_process_would_not` |
 | A lying `str` subclass is coerced at all three comparison points, each driven where it is the only layer that can act | `src/pree/audit.py` | `test_a_lying_str_subclass_is_coerced_at_all_three_layers` |
@@ -164,7 +169,6 @@ the assessment store.
 | An attribute named `message` cannot shadow the rendered message and take it out of the scan | `src/pree/audit.py` | `test_an_attribute_named_message_cannot_shadow_the_rendered_message` |
 | `vars()` on a record cannot raise, because `LogRecord` declares no `__slots__` | `src/pree/audit.py` | `test_no_log_record_can_be_built_without_the_dictionary_the_scan_reads` |
 | A non-`str` `exc_text` or `stack_info` is scanned and cleared rather than raising into the caller | `src/pree/audit.py` | `test_a_non_string_traceback_field_is_scanned_and_cleared_rather_than_raising` |
-| A part of the default rendering the guard could not read is refused with a distinct alarm, not emitted unscanned | `src/pree/audit.py` | `test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete` |
 | An attribute the guard cannot stringify does NOT alarm a clean line, so the scan is not a denial of service on the log | `src/pree/audit.py` | `test_an_attribute_the_guard_cannot_stringify_does_not_alarm_a_clean_line` |
 | The introspection guard's one exemption is a single function reading its own `logging.LogRecord` parameter | `tests/test_api.py` | `test_the_introspection_exemption_is_exactly_one_function_on_a_log_record` |
 | The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the filter half still covers it | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
@@ -3001,6 +3005,77 @@ recorded because the distinction matters: ADDING dead code back cannot be detect
 testing, because dead code has no observable behaviour by definition. Coverage is the instrument for
 that, and coverage is what found it. The two techniques answer different questions and neither
 substitutes for the other.
+
+### Ten majors, and the two that were answered by deleting code
+
+Both gates failed again: five majors from the security round, five from the engineering round, on the
+same commit. Every one was real. Two shapes recurred from earlier rounds and two were answered by
+removing code rather than adding it, which is the more useful result.
+
+**The coercion was applied to a copy and the original was emitted.** `str(text)` dispatches to
+`type(text).__str__`, so a `str` subclass can return "harmless line" while its characters hold the
+credential - the lying-`__contains__` trick one dunder over. And `StreamHandler.emit` writes
+`msg + self.terminator`, so a subclass with clean characters and a hostile `__add__` produced the
+credential after passing the scan. Both are the same mistake: SCANNING a coerced copy and then
+handing on the caller's object. `str.__str__(value)` reads the underlying object and cannot be
+intercepted, and the coerced value is now what is written and returned. What is scanned has to be
+what is emitted.
+
+**`Handler.format` is not the universal chokepoint the last round claimed.** Three STOCK handlers do
+not emit its return value: `HTTPHandler` urlencodes `record.__dict__`, and `SocketHandler` and
+`DatagramHandler` pickle it, calling `format` only for its `exc_text` side effect. A review put the
+credential on the wire from both with no subclassing at all - a 675-byte pickle and a 533-byte POST
+body - and the previous docstring named `HTTPHandler` among the covered. The residual had also been
+described as needing a `Handler` subclass, which understated it. For those three the record scan is
+the only layer and its reach is their reach. This project's handlers are `StreamHandler`s on
+`sys.stdout`, so none of it is live here, and that is now what the uncovered set says.
+
+**The invariant was false, and the fix was to stop running caller code.** The walk called `str()` on
+every non-`str` attribute, including attributes no format string names, so a `__str__` with a side
+effect ran zero times in the disarmed process and once in the armed one. A review measured one
+writing to a raw file descriptor: the credential was emitted only when the guard was on. The walk now
+reads `str` attributes only and renders nothing. Nothing is lost that matters - the finished-line scan
+catches a non-`str` attribute's rendering when the formatter produces it - and what the walk gives up
+is naming that field in the redaction. It also halves the guard's cost, which a review measured as
+the whole of the armed overhead.
+
+**Two things were deleted, and both deletions were the finding.**
+
+● **The fail-closed refusal.** A round refused any record whose rendering the guard could not read,
+  reasoning that an unreadable part means an unchecked line. The finished-line scan made that false,
+  and the refusal then only destroyed clean records: a formatter that renders tracebacks defensively
+  is an ordinary thing to write, and arming the guard replaced its operational lines with an alarm.
+  Measured. The branch, its second alarm, and the counter that fed it are gone. It was also the same
+  trade this module already rejected for the attribute half of the same function, so keeping it was
+  doctrine applied in one half and not the other.
+● **A third dead defensive branch.** `_exact_text` had a non-`str` path that nothing could reach.
+  Coverage said so, as it did for the `vars()` guard and the speculative `TypeError` before it. Three
+  in three commits is no longer an incident; it is the rule that a defensive line needs a named
+  reachable input or it goes.
+
+**And two reasons that were wrong twice.** `_refuse` skips the rendered keys, and the first
+explanation said that kept `args` a tuple (false), the second called the loss "junk attributes"
+(cosmetic). It is neither: writing those keys back mints an attribute named `<message>`, which a
+later scan of the same record finds shadowing the rendered message - the guard building its own
+bypass. The other was the suppression around the redaction, justified by a read-only property that
+can never reach that line, while the shape that CAN raise faulted on the first unguarded assignment
+five lines above the guard. Both are corrected and both are now held.
+
+**What was unpinned.** Four load-bearing lines had no test: the idempotence guard on the
+`Handler.format` patch (deleting it stacked wrappers 1, 11, 61 deep as arming repeated, and this
+suite arms about thirty times), the construction patch (whose behavioural assertions the
+finished-line scan had quietly taken over), the rendered-key skip, and the redaction's suppression.
+Each has a test now, and each is asserted on the mechanism where a behavioural assertion would be
+satisfied by a different layer. The shipped rate limits were unpinned in the same way: every
+rate-limit test injects its own limiter, so the deployed 20-per-minute and 240-per-minute numbers
+could have changed without a single test noticing. One test now drives the fine tier with nothing
+injected.
+
+**Where the count stands, honestly.** Ten majors in one round, all real, none reachable from the
+unauthenticated edge - every one needs a formatter, a filter, or a handler choice inside the process.
+The application's boundaries have held in all sixteen rounds. What keeps failing is this
+defence-in-depth layer, and specifically its claims about itself: five of the ten were a sentence
+asserting more than the code beside it did.
 
 ## Not accepted, and why it is not a risk here
 

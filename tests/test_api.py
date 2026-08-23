@@ -53,7 +53,6 @@ from pree.app import (
 from pree.audit import (
     CREDENTIAL_ALARM,
     REDACTED_ATTRIBUTE,
-    UNSCANNABLE_ALARM,
     _CredentialGuard,
     _GuardedStream,
     audit,
@@ -63,7 +62,13 @@ from pree.audit import (
 from pree.config import ServiceConfig
 from pree.health import StorageProber
 from pree.main import build
-from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
+from pree.ratelimit import (
+    ACTOR_LIMIT,
+    ACTOR_WINDOW_SECONDS,
+    GLOBAL_LIMIT,
+    GLOBAL_WINDOW_SECONDS,
+    RateLimiter,
+)
 from pree.scoring import ConfidenceTier
 from pree.security import (
     MAX_ACTOR_LENGTH,
@@ -4498,17 +4503,22 @@ def test_the_guard_scans_every_record_attribute_a_formatter_can_render() -> None
         def __str__(self) -> str:
             return f"carrier holding {secret}"
 
-    routes: tuple[tuple[str, str, str, dict[str, Any]], ...] = (
-        ("extra", "%(message)s tok=%(token)s", "clean.logger", {"extra": {"token": secret}}),
-        ("logger name", "%(name)s %(message)s", f"leak.{secret}", {}),
+    # The fourth element says whether the offending field should be NAMED in the redaction. Field
+    # redaction covers `str` attributes; a non-`str` one is not rendered by the walk at all, because
+    # rendering it would run caller code the disarmed process never runs, so its line is refused
+    # whole by the finished-line scan instead. Containment is identical; the diagnosis differs.
+    routes: tuple[tuple[str, str, str, dict[str, Any], bool], ...] = (
+        ("extra", "%(message)s tok=%(token)s", "clean.logger", {"extra": {"token": secret}}, True),
+        ("logger name", "%(name)s %(message)s", f"leak.{secret}", {}, True),
         (
             "non-str extra",
             "%(message)s obj=%(obj)s",
             "clean.logger.two",
             {"extra": {"obj": Carrier()}},
+            False,
         ),
     )
-    for label, fmt, logger_name, kwargs in routes:
+    for label, fmt, logger_name, kwargs, names_the_field in routes:
         sink = io.StringIO()
         handler = logging.StreamHandler(sink)
         handler.setFormatter(logging.Formatter(fmt))
@@ -4545,10 +4555,11 @@ def test_the_guard_scans_every_record_attribute_a_formatter_can_render() -> None
         # TWO alarms, not one. The benign line carries the same credential-bearing attribute, so it
         # is refused too, which is correct: the attribute is what the formatter renders.
         assert guarded.count(CREDENTIAL_ALARM) == 2, f"{label}: expected two alarms: {guarded!r}"
-        assert REDACTED_ATTRIBUTE in guarded or "%(name)s" in fmt, (
-            f"{label}: the offending attribute was not redacted, so only `msg` was replaced "
-            f"and the formatter rendered the attribute beside the alarm"
-        )
+        if names_the_field:
+            assert REDACTED_ATTRIBUTE in guarded or "%(name)s" in fmt, (
+                f"{label}: a `str` attribute carried the credential and the refusal did not name "
+                f"it, so the whole line was replaced where one field would have done: {guarded!r}"
+            )
 
 
 class _HidesInStr:
@@ -4887,6 +4898,225 @@ def test_no_log_record_can_be_built_without_the_dictionary_the_scan_reads() -> N
     )
 
 
+def test_a_refusal_mints_no_attribute_the_parts_dictionary_uses_as_a_key() -> None:
+    """A refusal must not write back a key the scan uses, or the guard builds its own bypass.
+
+    The parts dictionary holds the four rendered strings under `<...>` keys alongside every record
+    attribute, and `_refuse` writes the redaction marker onto each ATTRIBUTE that carried the
+    credential. If it wrote the rendered keys back too, the record would gain an attribute literally
+    named `<message>`, and the next scan of that record would find it shadowing the rendered
+    message - so a record refused once would have its message unscanned the second time.
+
+    A review measured exactly that: with the skip removed, refusing twice leaves
+    `parts["<message>"]` holding the redaction marker instead of the message. Two earlier versions
+    of the comment on that line got its reason wrong, and the line itself was held by nothing.
+
+    So this refuses the SAME record twice and asserts both halves: no minted key, and the second
+    refusal still sees the message.
+    """
+    secret = "8Ok-1Aj_4Sh.6Dg~3FZq7Wx9Yt2Ur5Ip8"
+    record = logging.LogRecord(
+        name="minted.key",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=0,
+        msg=f"token rejected: {secret}",
+        args=(),
+        exc_info=None,
+    )
+    install_credential_guard(secret)
+    try:
+        _CredentialGuard().filter(record)
+        minted = [name for name in vars(record) if name.startswith("<")]
+        # Put the credential back in the message and refuse again. If the first refusal minted a
+        # `<message>` attribute, the walk overwrites the rendered part with it and this misses.
+        record.msg = f"token rejected again: {secret}"
+        _CredentialGuard().filter(record)
+        second = record.msg
+    finally:
+        install_credential_guard(None)
+
+    assert minted == [], (
+        f"the refusal minted {minted}, whose names the scan uses as its own keys. A later scan of "
+        f"this record finds the minted attribute shadowing the rendered part and skips it"
+    )
+    assert second == CREDENTIAL_ALARM, (
+        f"the second refusal did not see the message, so refusing a record once took its message "
+        f"out of the scan: msg={second!r}"
+    )
+
+
+def test_a_refusal_that_cannot_write_to_the_record_does_not_fault_the_caller() -> None:
+    """`_refuse` writes to a caller-controlled object, so every write is guarded together.
+
+    The previous version guarded only the per-attribute `setattr`, and justified it with a shape
+    that cannot reach that line: a read-only property lives on the CLASS, so it never appears in
+    `vars(record)` and can never be one of the keys `_refuse` iterates. A review measured the shape
+    that CAN raise, and it faulted on the first unguarded assignment - `record.msg = alarm` - which
+    propagates an `AttributeError` out of the filter and into the `logger.*` call site. That is the
+    failure this module's doctrine forbids, five lines above the guard placed to prevent it.
+
+    Containment does not depend on the refusal succeeding, which is why guarding it is the right
+    trade rather than a silent pass: `_patch_handler_format` scans the finished line, so the
+    assertion below is that the record still cannot reach the sink even though nothing could be
+    written onto it.
+    """
+    secret = "1Aj-4Sh_6Dg.3FZ~q7Wx9Yt2Ur5Ip8Ok1"
+
+    class Unwritable(logging.LogRecord):
+        """A record that refuses a write to `msg`, which is the refusal's FIRST write.
+
+        Only `msg`, deliberately. Sealing the whole record was the first attempt and it proved less:
+        `Formatter.format` writes `record.message` on every record it renders, so a wholly sealed
+        record breaks the formatter as well and `handleError` discards the emission. Nothing leaks,
+        but nothing is emitted either, so the assertion that the finished-line scan covered for the
+        failed refusal could not be made. Refusing one attribute leaves the formatter working, which
+        is what makes the second half of this test mean something.
+        """
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            if name == "msg" and getattr(self, "_sealed", False):
+                raise AttributeError("msg is read-only")
+            super().__setattr__(name, value)
+
+    sink = io.StringIO()
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    record = Unwritable(
+        name="unwritable.record",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=0,
+        msg=f"token rejected: {secret}",
+        args=(),
+        exc_info=None,
+    )
+    record._sealed = True
+    install_credential_guard(secret)
+    try:
+        # Reaching the next line is half the assertion: an unguarded write raises from the filter,
+        # through `Handler.handle`, into this frame.
+        handler.handle(record)
+        emitted = sink.getvalue()
+    finally:
+        install_credential_guard(None)
+        handler.close()
+
+    assert secret not in emitted, (
+        f"the refusal could not write to the record and the finished-line scan did not cover for "
+        f"it, so the credential reached the sink: {emitted!r}"
+    )
+    assert CREDENTIAL_ALARM in emitted, f"refused without an alarm: {emitted!r}"
+
+
+def test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces() -> None:
+    """The two SHIPPED limiter constants, which every other rate-limit test bypasses.
+
+    A review found both unpinned: raising either default to a billion left the whole suite green,
+    because every test of the two tiers injects its own limiter to keep the fixtures fast. The
+    control register claimed two-tier limiting, and what was held was two-tier limiting for
+    injected values - the deployed numbers were free to change without a single test noticing.
+
+    So this builds the app with NO limiter injected and drives the fine tier to its shipped edge.
+    Only the fine tier, because the coarse one is 240 requests and a test that made 241 real
+    requests would cost more than it proves; the coarse constant is pinned as a VALUE below, which
+    is weaker but is the honest trade, and it is stated rather than left as a gap.
+    """
+    assert (ACTOR_LIMIT, ACTOR_WINDOW_SECONDS) == (20, 60.0), (
+        "the shipped per-actor limit changed. The deployment sheet quotes it, so a change here "
+        "needs a change there"
+    )
+    assert (GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS) == (240, 60.0), (
+        "the shipped global limit changed. Value-pinned rather than driven: 241 real requests cost "
+        "more than the assertion is worth"
+    )
+
+    config = make_config(Path(tempfile.mkdtemp()), PREE_TEAM_TOKEN=TEST_TOKEN)
+    prober = StorageProber(cache_seconds=0.0)
+    try:
+        # NO limiter injected, which is the whole point: `build_client` passes none, so the app
+        # constructs both tiers from the shipped constants exactly as `main.build()` does.
+        with build_client(config, build_logger(io.StringIO()), prober) as client:
+            body = {"protected_asset_id": "a1", "candidate_id": "b1", "indicators": {}}
+            statuses = [
+                client.post("/v1/assess", json=body, headers=AUTH).status_code
+                for _ in range(ACTOR_LIMIT + 1)
+            ]
+    finally:
+        prober.shutdown()
+
+    assert statuses[:ACTOR_LIMIT] == [200] * ACTOR_LIMIT, (
+        f"the shipped per-actor limiter refused a request inside its own window: {statuses}"
+    )
+    assert statuses[ACTOR_LIMIT] == 429, (
+        f"the shipped per-actor limiter did not refuse request {ACTOR_LIMIT + 1}, so the deployed "
+        f"limit is not the one this constant names: {statuses}"
+    )
+
+
+def test_arming_twice_does_not_stack_the_stdlib_patches() -> None:
+    """The idempotence guards on two permanent stdlib patches, held rather than assumed.
+
+    `install_credential_guard` patches `logging.Handler.format` and `logging.Handler.__init__`, and
+    each patch checks a marker before wrapping. Neither check was held by anything: a review deleted
+    the one on `format` and measured the wrapper depth going 1, then 11, then 61 as arming repeated,
+    with the per-line cost rising by a third. This suite arms roughly thirty times, so it is a
+    reachable defect rather than a speculative one.
+
+    Asserted by IDENTITY, which is the only thing that distinguishes "checked the marker" from
+    "wrapped again with an identical closure".
+    """
+    secret = "4Sh-6Dg_3FZ.q7W~x9Yt2Ur5Ip8Ok1Aj4"
+    install_credential_guard(secret)
+    try:
+        after_first = (logging.Handler.format, logging.Handler.__init__)
+        for _ in range(5):
+            install_credential_guard(secret)
+        after_more = (logging.Handler.format, logging.Handler.__init__)
+    finally:
+        install_credential_guard(None)
+
+    assert after_more[0] is after_first[0], (
+        "arming again wrapped `Handler.format` a second time, so every line in the process pays "
+        "for one wrapper per arming and the depth grows without bound"
+    )
+    assert after_more[1] is after_first[1], (
+        "arming again wrapped `Handler.__init__` a second time, so a handler built later carries "
+        "one duplicate filter per arming"
+    )
+
+
+def test_a_handler_built_after_arming_carries_the_guard_filter() -> None:
+    """The construction patch, held by its mechanism rather than by a behaviour another layer gives.
+
+    A review found this layer unpinned: deleting `_patch_handler_construction()` left the whole
+    suite green, because the finished-line scan satisfied every behavioural assertion that had stood
+    in for it. That is not the same property. The construction patch is the layer that reaches
+    handlers which never call `Handler.format` at all - `HTTPHandler` urlencodes `record.__dict__`
+    and `SocketHandler` pickles it - so losing it silently would be a live gap the suite could not
+    see.
+
+    Asserted on the MECHANISM for that reason: the filter must be attached to a handler built after
+    arming, whatever any one handler then does with the record.
+    """
+    secret = "6Dg-3FZ_q7W.x9Y~t2Ur5Ip8Ok1Aj4Sh6"
+    install_credential_guard(secret)
+    try:
+        built_after = logging.StreamHandler(io.StringIO())
+        try:
+            attached = [f for f in built_after.filters if isinstance(f, _CredentialGuard)]
+        finally:
+            built_after.close()
+    finally:
+        install_credential_guard(None)
+
+    assert len(attached) == 1, (
+        f"a handler constructed while the guard was armed carries {len(attached)} credential "
+        f"filters, not one. This is the only layer covering a handler that never calls "
+        f"`Handler.format`, such as `HTTPHandler` or `SocketHandler`"
+    )
+
+
 def test_an_attribute_named_message_cannot_shadow_the_rendered_message() -> None:
     """Why the rendered parts carry a key prefix, asserted rather than asserted-in-prose.
 
@@ -4972,7 +5202,9 @@ def test_an_attribute_the_guard_cannot_stringify_does_not_alarm_a_clean_line() -
         f"an attribute the formatter never rendered cost a legitimate line: {emitted!r}"
     )
     assert CREDENTIAL_ALARM not in emitted, f"a clean line was alarmed: {emitted!r}"
-    assert UNSCANNABLE_ALARM not in emitted, f"a clean line was refused as unscannable: {emitted!r}"
+    assert emitted.count("a line whose rendering is fine") == 1, (
+        f"a clean line was refused for an attribute the formatter never rendered: {emitted!r}"
+    )
 
 
 def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> None:
@@ -4985,15 +5217,13 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
     could not be checked" and "a leak was refused" are different facts and a single marker would
     make a storm of the first indistinguishable from the second.
 
-    Five shapes, each holding a line nothing else holds:
+    Two shapes, each holding a line nothing else holds:
 
-    ● A `msg` whose `__str__` raises EVERY time. Nothing can read it, so nothing can scan it, and it
-      is refused. This is the shape that holds the fail-closed branch now.
-    ● The double-call `__str__`, which is the measured bypass, and which no longer reaches this
-      branch: the record scan covers `msg` as an attribute as well as through `getMessage()`, so the
-      second call reveals the credential and the record is refused as a LEAK rather than as
-      unreadable. That is the better of the two outcomes and the assertion says which one happens.
-      The finished-line scan is behind both.
+    ● The double-call `__str__`, which is the measured bypass. The FILTER no longer catches it - the
+      walk renders no non-`str` attribute, so nothing calls `__str__` a second time before the
+      formatter does - and it does not need to: the finished-line scan reads what the formatter
+      produced. A round refused such a record outright, with a second alarm, and that branch is gone
+      because it destroyed clean lines for no containment once the finished-line scan existed.
     ● A MALFORMED `exc_info` tuple, with the credential in `msg`. This is what holds the guard
       around `formatException`, and the input a review suggested for it - an exception whose
       `__str__` raises - does NOT work: `traceback` is defensive there and renders
@@ -5020,12 +5250,6 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
                 raise ValueError("not yet")
             return f"token={secret}"
 
-    class NeverRenders:
-        """Raises on every call, so no layer can read it and none can scan it."""
-
-        def __str__(self) -> str:
-            raise ValueError("never")
-
     sink = io.StringIO()
     handler = logging.StreamHandler(sink)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -5040,10 +5264,6 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
     logger.propagate = False
     install_credential_guard(secret)
     try:
-        logger.info(NeverRenders())
-        never_renders = sink.getvalue()
-        sink.truncate(0)
-        sink.seek(0)
         logger.info(DoubleCall())
         double_call = sink.getvalue()
         sink.truncate(0)
@@ -5061,14 +5281,11 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
         logger.propagate = previous_propagate
         handler.close()
 
-    assert UNSCANNABLE_ALARM in never_renders, (
-        f"a record no layer could read went out unscanned rather than refused: {never_renders!r}"
-    )
     assert secret not in double_call, f"the double-call bypass still leaks: {double_call!r}"
     assert CREDENTIAL_ALARM in double_call, (
-        f"the second rendering of a double-call `msg` was not scanned. It is covered as an "
-        f"ATTRIBUTE as well as through `getMessage()`, so the call that reveals the credential is "
-        f"the one the walk makes: {double_call!r}"
+        f"the second rendering of a double-call `msg` reached the line. The filter cannot see it - "
+        f"the walk renders no non-`str` attribute - so the finished-line scan is the only layer "
+        f"that can, and this asserts it did: {double_call!r}"
     )
     assert secret not in exception_render, (
         f"an unrenderable exception took the whole scan with it: {exception_render!r}"

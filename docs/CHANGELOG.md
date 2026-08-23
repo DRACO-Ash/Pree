@@ -1367,3 +1367,37 @@ Seventeen mutations run: sixteen red. Four were green first time and three were 
 lying-`str` coercion, which was held at only one of its three comparison points. The fourth green is
 recorded rather than fixed: adding dead code back cannot be caught by mutation testing, because dead
 code has no observable behaviour, which is why coverage is a separate gate.
+
+### Both gates FAIL again: ten majors, and the two answered by deleting code
+
+Five majors from the security round and five from the engineering round on the same commit. All real,
+none reachable from the unauthenticated edge: every one needs a formatter, a filter, or a handler
+choice inside the process.
+
+● **The coercion was applied to a copy while the original was emitted.** `str()` dispatches to
+  `type(value).__str__`, so a `str` subclass can return clean text while holding the credential; and
+  `StreamHandler.emit` writes `msg + terminator`, so a hostile `__add__` produced the credential
+  after the scan passed. `str.__str__` reads the underlying object and cannot be intercepted, and the
+  coerced value is now what gets written and returned.
+● **`Handler.format` is not the universal chokepoint the previous round claimed.** `HTTPHandler`
+  urlencodes `record.__dict__`; `SocketHandler` and `DatagramHandler` pickle it. No subclassing
+  needed, and `HTTPHandler` had been named as covered. For those three the record scan is the only
+  layer, which is now what the uncovered set says. This project's handlers are `StreamHandler`s on
+  stdout, so none of it is live here.
+● **The "arming is never worse" invariant was false.** The walk called `str()` on every non-`str`
+  attribute, so a `__str__` with a side effect ran zero times disarmed and once armed - measured
+  writing to a raw file descriptor. The walk reads `str` attributes only now and renders nothing,
+  which also halves the guard's cost.
+● **Two deletions, each of which was the finding.** The fail-closed refusal of an unreadable record
+  destroyed clean operational lines for no containment once the finished-line scan existed, so it and
+  its second alarm are gone. And a third dead defensive branch went the way of the previous two: a
+  defensive line needs a named reachable input or it goes.
+● **Two reasons that were wrong twice**, on the rendered-key skip and on the redaction's suppression.
+  The first was a self-inflicted scan bypass described as cosmetic; the second guarded a line the
+  named shape cannot reach while the shape that can raise faulted five lines above it.
+● **Five unpinned load-bearing lines** now have tests, each asserted on the mechanism because a
+  behavioural assertion was being satisfied by a different layer: both stdlib-patch idempotence
+  guards, the construction patch, the rendered-key skip, the redaction suppression - and the SHIPPED
+  rate limits, which every rate-limit test had bypassed by injecting its own limiter.
+
+Six new regression tests, 365 passing, coverage 99% against the gate's 80%, no missed statements.
