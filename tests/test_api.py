@@ -36,6 +36,7 @@ from starlette.routing import Route
 from pree import __version__
 from pree import app as app_module
 from pree import audit as audit_module
+from pree import main as main_module
 from pree.app import (
     DOC_PATHS,
     LIVENESS_PATHS,
@@ -48,7 +49,13 @@ from pree.app import (
     _limit_keys,
     create_app,
 )
-from pree.audit import audit, build_logger
+from pree.audit import (
+    CREDENTIAL_ALARM,
+    _GuardedStream,
+    audit,
+    build_logger,
+    install_credential_guard,
+)
 from pree.config import ServiceConfig
 from pree.health import StorageProber
 from pree.main import build
@@ -3702,19 +3709,23 @@ def test_every_boolean_audit_field_names_a_test_that_correlates_it() -> None:
 # The functions permitted to read the credential, and nothing else in the whole package. An
 # ALLOWLIST of readers, because the previous protection was a denylist of spellings and the
 # attacker picks the spellings.
+# Keyed on (MODULE, FUNCTION), not on a bare function name. A bare name gave any module a free read
+# by calling a helper `for_service` or `authorise`, and a bare `load_config` gave any module a free
+# environment read: a review planted exactly those and neither guard saw them. The pair is what
+# makes this an allowlist of PLACES rather than of words.
 CREDENTIAL_READERS = frozenset(
     {
-        # The compare itself, and the closure that hands the HTTP layer a callable instead.
-        "authorise",
-        "token_verifier",
+        # The closure that hands the HTTP layer a callable instead of a secret, and the arming of
+        # the runtime output guard, which needs the plaintext to compare against. `authorise` is
+        # NOT here any more: it was a second copy of the compare that no served request reached,
+        # so it is now a thin caller of the closure and reads nothing.
+        ("security.py", "token_verifier"),
+        ("security.py", "arm_output_guard"),
         # Config's own derivations of the token-free facts the service layer receives.
-        "auth_enabled",
-        "for_service",
+        ("config.py", "auth_enabled"),
+        ("config.py", "for_service"),
     }
 )
-# Where the credential may be read from. `main.py` is the boot path, which legitimately holds a
-# full Config; the module set is pinned so a new module cannot quietly join.
-CREDENTIAL_READER_MODULES = frozenset({"security.py", "config.py", "main.py"})
 
 
 def test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package() -> None:
@@ -3757,7 +3768,7 @@ def test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package(
             if not isinstance(node, ast.Attribute) or node.attr != "team_token":
                 continue
             where = owner.get(node.lineno, "<module level>")
-            if module_path.name in CREDENTIAL_READER_MODULES and where in CREDENTIAL_READERS:
+            if (module_path.name, where) in CREDENTIAL_READERS:
                 continue
             offenders.append(f"{module_path.name}:{node.lineno} in {where}()")
     assert not offenders, (
@@ -3788,14 +3799,15 @@ _INTROSPECTION_ATTRIBUTES = frozenset(
 _INTROSPECTION_CALLS = frozenset({"globals", "vars", "locals", "eval", "exec", "compile"})
 # `load_config` is the only function that may read the process environment. Anywhere else, an
 # `os.environ` read is a second source of truth for the credential that bypasses every boundary.
-ENVIRONMENT_READERS = frozenset({"load_config"})
+# Also keyed on (MODULE, FUNCTION), for the same measured reason.
+ENVIRONMENT_READERS = frozenset({("config.py", "load_config")})
 
 
-def _attribute_complaint(node: ast.Attribute, owner: dict[int, str]) -> str | None:
+def _attribute_complaint(node: ast.Attribute, owner: dict[int, str], module: str) -> str | None:
     """What is wrong with one attribute access, or None."""
     if node.attr in _INTROSPECTION_ATTRIBUTES:
         return f"introspects {node.attr}"
-    if node.attr == "environ" and owner.get(node.lineno) not in ENVIRONMENT_READERS:
+    if node.attr == "environ" and (module, owner.get(node.lineno)) not in ENVIRONMENT_READERS:
         return (
             f"reads os.environ in {owner.get(node.lineno)}(), outside {sorted(ENVIRONMENT_READERS)}"
         )
@@ -3817,13 +3829,286 @@ def _call_complaint(node: ast.Call) -> str | None:
     return None
 
 
-def _introspection_complaint(node: ast.AST, owner: dict[int, str]) -> str | None:
+def _introspection_complaint(node: ast.AST, owner: dict[int, str], module: str) -> str | None:
     """What is wrong with one node, or None. Split so each half stays inside the branch limit."""
     if isinstance(node, ast.Attribute):
-        return _attribute_complaint(node, owner)
+        return _attribute_complaint(node, owner, module)
     if isinstance(node, ast.Call):
         return _call_complaint(node)
     return None
+
+
+# Every route a review has actually used to reach the credential, spelled as the source it would
+# appear in. This list is NOT the control - it is a set of witnesses that the control is not inert.
+# The control is a runtime check on the emitted bytes, which is what makes it indifferent to
+# routes nobody has thought of.
+_MEASURED_LEAK_ROUTES = (
+    'verify_token.__getattribute__("__closure__")[0].__getattribute__("cell_contents")',
+    "verify_token.__closure__[0].cell_contents",
+    '"{0.__closure__[0].cell_contents}".format(verify_token)',
+    '"{0.team_token}".format(config)',
+    'os.getenv("PREE_TEAM_TOKEN")',
+    'environ.get("PREE_TEAM_TOKEN")',
+    'inspect.getclosurevars(verify_token).nonlocals["expected"]',
+    'operator.attrgetter("team_token")(config)',
+    'dataclasses.asdict(config)["team_token"]',
+    "pickle.dumps(config)",
+    "config.__getstate__()",
+    "config.__reduce__()",
+)
+
+
+def test_the_runtime_guard_refuses_every_channel_whatever_the_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control that is not an enumeration, and the reason it had to exist.
+
+    Three static guards were each defeated by stepping outside the set they enumerated. Sampled
+    tokens lost to a predicate constant across the sample. A denylist of name spellings lost to a
+    parameter called `cfg`. A denylist of language features lost to NINE routes, decisively
+    `verify_token.__getattribute__("__closure__")` - because attribute access has a method
+    spelling, a string spelling (`str.format`, `operator.attrgetter`) and a library spelling
+    (`inspect`, `pickle`, `dataclasses`), and no list of those is closed.
+
+    This checks the BYTES leaving the process against the actual secret, at the last point before
+    they leave, on both channels a leak has actually used: the audit logger and stdout, which is
+    the pod log the platform aggregates. It is indifferent to how the value was obtained, which is
+    exactly what the enumerations were not.
+
+    Every route in `_MEASURED_LEAK_ROUTES` is a witness rather than a case: the guard sees only the
+    resulting string, so the assertion below is over the OUTPUT of a leak, not its source form. What
+    the list documents is that each was measured to work against the static guards, which is why
+    those are now described as refusing named spellings rather than as closing the class.
+    """
+    secret = "Zq7-Wx9_Yt2.Ur5~Ip8Ok1Aj4Sh6Dg3F"
+    sink = io.StringIO()
+    # Captured BEFORE arming, so the guard wraps this sink exactly as it wraps the real stdout.
+    monkeypatch.setattr(sys, "stdout", sink)
+    install_credential_guard(secret)
+    try:
+        # stdout, which is what every measured route used.
+        for route in _MEASURED_LEAK_ROUTES:
+            print(f"leak via {route}: {secret}")
+        print("a benign line that must survive")
+        emitted = sink.getvalue()
+
+        # And the audit logger, independently.
+        logged = io.StringIO()
+        handler = logging.StreamHandler(logged)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger = logging.getLogger("pree.audit")
+        previous, previous_level = audit_logger.handlers, audit_logger.level
+        audit_logger.handlers = [handler]
+        # The LEVEL explicitly, because a logger left at the WARNING default emits nothing for
+        # `info` and the trail would be empty. An empty trail satisfies "the secret is absent"
+        # trivially, which is the vacuous-pass shape this suite keeps finding, so the count
+        # assertions below are what make it non-vacuous and the level is what lets them fire.
+        audit_logger.setLevel(logging.INFO)
+        try:
+            audit_logger.info('{"kind":"auth_reject","reason":"token rejected %s"}', secret)
+            audit_logger.info('{"kind":"auth_reject","reason":"token rejected"}')
+        finally:
+            audit_logger.handlers = previous
+            audit_logger.setLevel(previous_level)
+        trail = logged.getvalue()
+    finally:
+        install_credential_guard(None)
+
+    assert secret not in emitted, "the credential reached stdout, which is the pod log"
+    assert emitted.count(CREDENTIAL_ALARM) == len(_MEASURED_LEAK_ROUTES), (
+        f"expected one alarm per measured route, got "
+        f"{emitted.count(CREDENTIAL_ALARM)} of {len(_MEASURED_LEAK_ROUTES)}"
+    )
+    assert "a benign line that must survive" in emitted, (
+        "the guard suppressed a line carrying no credential, so it is a denial of service on the "
+        "log rather than a control on it"
+    )
+    assert secret not in trail, "the credential reached the audit stream"
+    assert trail.count(CREDENTIAL_ALARM) == 1, f"expected exactly one alarmed record: {trail!r}"
+    assert '"reason":"token rejected"' in trail, "the guard suppressed a clean audit record"
+
+
+def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard's own edge paths, exercised rather than left as unmeasured lines.
+
+    Three lines were uncovered after the guard landed, and an unexercised line in a security control
+    is the class this suite has been burned by twice: a fallback nobody drives is where a crash or a
+    silent pass waits. So each is driven.
+
+    A record whose `%`-formatting raises (wrong argument count) must not become an emitted secret
+    and must not take the process down: the filter lets it through unscrubbed, because a record that
+    cannot be rendered cannot be scanned, and logging would otherwise swallow the exception and emit
+    it anyway. The `isatty` and `encoding` fallbacks exist because the wrapper forwards only what a
+    stream user actually touches, and something asking a wrapped stream for either must not get an
+    AttributeError.
+    """
+    secret = "Ip8Ok1Aj4Sh6Dg3F-Zq7-Wx9_Yt2.Ur5"
+    logged = io.StringIO()
+    handler = logging.StreamHandler(logged)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    audit_logger = logging.getLogger("pree.audit")
+    previous, previous_level = audit_logger.handlers, audit_logger.level
+    audit_logger.handlers = [handler]
+    audit_logger.setLevel(logging.INFO)
+    install_credential_guard(secret)
+    try:
+        # Two format placeholders, one argument: `getMessage()` raises inside the filter. The
+        # lint rule that flags this is exactly right in production code, and this is the one place
+        # the malformed record IS the input under test, so it is silenced here and nowhere else.
+        audit_logger.info("a broken record %s %s", "only-one")  # noqa: PLE1206
+    finally:
+        audit_logger.handlers = previous
+        audit_logger.setLevel(previous_level)
+        install_credential_guard(None)
+    assert secret not in logged.getvalue(), "a record that could not be rendered leaked the secret"
+
+    # The stream fallbacks, on a stream that has neither attribute.
+    class _Bare:
+        def write(self, text: str) -> int:
+            return len(text)
+
+        def flush(self) -> None:
+            return None
+
+    wrapped = _GuardedStream(_Bare())
+    assert wrapped.isatty() is False
+    assert wrapped.encoding == "utf-8"
+    wrapped.flush()
+    assert wrapped.write("plain") == 5
+
+
+def test_the_runtime_guard_is_armed_by_the_boot_path_and_not_by_the_factory() -> None:
+    """WHERE it is armed is part of the control, so it is asserted rather than assumed.
+
+    `main.build()` arms it immediately after `load_config()`, before any line can be written and
+    before the boundary that drops the credential. Arming it in `create_app` instead would leave
+    the boot line itself unguarded, and the boot line is the one that reports the token's length.
+    """
+    source = Path(main_module.__file__ or "").resolve().read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    build = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "build"
+    )
+    calls = [
+        node.func.id
+        for node in ast.walk(build)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    ]
+    # `arm_output_guard`, not `install_credential_guard`. The read of `config.team_token` lives in
+    # `security.py` with the credential's other readers, so `build()` never touches the value: it
+    # hands the Config to a named reader instead. Putting the read here would have made a fifth
+    # reader in a third module, which is the argument that removed the boot line's own read.
+    assert "arm_output_guard" in calls, "the boot path does not arm the runtime output guard"
+    assert calls.index("load_config") < calls.index("arm_output_guard"), (
+        "the guard is armed before the config is resolved, so it cannot know the credential"
+    )
+    assert calls.index("arm_output_guard") < calls.index("create_app"), (
+        "the app is built before the guard is armed, so early output is unguarded"
+    )
+
+
+# What each module in the package may import. THIS is the set that is genuinely small and fixed,
+# which the attribute alphabet was not: a 900-statement package's import list is a dozen names per
+# module and every addition is visible in a diff. The reviewer's own framing, and it is the right
+# one - `inspect`, `pickle`, `operator`, `copy`, `gc`, `traceback` and `sys` are how attribute
+# access is spelled as a LIBRARY call, and none of them belong in a module that handles requests.
+EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
+    "__init__.py": frozenset(),
+    "api_models.py": frozenset({"__future__", "pydantic"}),
+    "app.py": frozenset(
+        {
+            "__future__",
+            "collections",
+            "fastapi",
+            "hashlib",
+            "json",
+            "logging",
+            "starlette",
+            "time",
+            "typing",
+        }
+    ),
+    # `sys` is here and nowhere else that serves a request: the output guard has to replace the
+    # streams, and that is the one place in the package that needs to.
+    "audit.py": frozenset({"__future__", "json", "logging", "sys", "typing"}),
+    "config.py": frozenset({"__future__", "dataclasses", "os", "pathlib", "re"}),
+    "health.py": frozenset(
+        {
+            "__future__",
+            "collections",
+            "concurrent",
+            "dataclasses",
+            "errno",
+            "os",
+            "pathlib",
+            "threading",
+            "time",
+            "typing",
+        }
+    ),
+    "main.py": frozenset({"__future__", "fastapi"}),
+    "ratelimit.py": frozenset({"__future__", "collections", "threading", "time"}),
+    "scoring.py": frozenset({"__future__", "dataclasses", "enum"}),
+    "security.py": frozenset({"__future__", "collections", "hmac", "re"}),
+    "store.py": frozenset(
+        {
+            "__future__",
+            "collections",
+            "contextlib",
+            "fcntl",
+            "json",
+            "os",
+            "pathlib",
+            "shutil",
+            "tempfile",
+            "typing",
+        }
+    ),
+}
+
+
+def test_every_module_imports_exactly_what_it_is_permitted_to() -> None:
+    """The structural half of closing the library-spelling route.
+
+    Attribute access has a method spelling (`__getattribute__`), a string spelling (`str.format`,
+    `operator.attrgetter`) and a LIBRARY spelling (`inspect.getclosurevars`, `pickle.dumps`,
+    `dataclasses.asdict`, `gc.get_referrers`, `sys._getframe`). A review used six of those and the
+    feature denylist saw none of them, because a denylist of attribute names cannot enumerate the
+    libraries that reach attributes for you.
+
+    The import set can be enumerated, and that is the asymmetry this test exploits: it is a dozen
+    names per module, every addition shows in a diff, and `inspect`, `pickle`, `copy`, `gc`,
+    `operator`, `traceback` and `sys` have no business in a module that handles a request. So the
+    library route needs an import that is not on the list, which is a visible change rather than an
+    invisible one.
+
+    EXACT, in both directions. A permitted import nothing uses is a standing exemption for whatever
+    arrives next, which is the lesson the ENV allowlist in the boot contract taught seven rounds
+    running.
+    """
+    source_root = Path(app_module.__file__ or "").resolve().parent
+    modules = sorted(path for path in source_root.rglob("*.py"))
+    assert {path.name for path in modules} == set(EXPECTED_MODULE_IMPORTS), (
+        f"the package's module set changed: "
+        f"{sorted({p.name for p in modules} ^ set(EXPECTED_MODULE_IMPORTS))}"
+    )
+    for path in modules:
+        imported: set[str] = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                imported |= {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported.add(node.module.split(".")[0])
+        permitted = EXPECTED_MODULE_IMPORTS[path.name]
+        assert imported == permitted, (
+            f"{path.name} imports {sorted(imported - permitted)} which it is not permitted, and "
+            f"is permitted {sorted(permitted - imported)} which it does not use. A library import "
+            f"is how attribute access is spelled without naming an attribute"
+        )
 
 
 def test_no_module_reaches_the_credential_by_introspection_or_the_environment() -> None:
@@ -3865,7 +4150,7 @@ def test_no_module_reaches_the_credential_by_introspection_or_the_environment() 
                     if line is not None:
                         owner.setdefault(line, node.name)
         for node in ast.walk(tree):
-            complaint = _introspection_complaint(node, owner)
+            complaint = _introspection_complaint(node, owner, module_path.name)
             if complaint:
                 offenders.append(f"{module_path.name}:{getattr(node, 'lineno', 0)} {complaint}")
     assert not offenders, (

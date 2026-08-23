@@ -896,8 +896,13 @@ def create_app(
     `Config`, and a security review recovered the deployed token verbatim from the pod log twice in
     nine lines, once via a helper in another module called as `helper(config, exc)` and once via a
     helper whose parameter was named `cfg`. The static rules meant to stop that checked how the
-    name was spelt, and the attacker picks the names. Now there is no attribute to reach from
-    anywhere in this module's scope.
+    name was spelt, and the attacker picks the names. No attribute `ServiceConfig` exposes now
+    carries the credential.
+
+    NOT an absolute, because the earlier version of this sentence was one and a review took it nine
+    ways from inside this very module, `__getattribute__("__closure__")` decisively. What refuses
+    those is `audit.install_credential_guard`, armed at boot, which checks the bytes leaving the
+    process rather than the shape of the code producing them.
     """
     audit_log = logger or build_logger()
     storage = prober or StorageProber()

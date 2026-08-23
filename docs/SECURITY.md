@@ -151,8 +151,10 @@ the assessment store.
 | The audited path EQUALS the recomputed scrub of the target, so nothing can be appended to it | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
 | Every boolean audit field is value-pinned on every kind that emits it, across the token axis | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it`, `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 | Every closed-set value pin equals what the application can emit, in both directions, and a closed-set field is emitted as a literal | `tests/test_api.py` | `test_every_closed_set_pin_is_exactly_what_the_application_can_emit`, `test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit` |
-| The credential is read in exactly four permitted functions in the whole package, under any spelling, in every subpackage | `src/pree/security.py` | `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` |
-| No module reaches past a name by introspection, nor reads the environment outside `load_config` | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
+| The credential is read only at named (module, function) pairs, under any spelling, in every subpackage | `src/pree/security.py` | `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` |
+| Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
+| The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
+| No line carrying the credential leaves the process, by any route, on any output channel | `src/pree/audit.py` | `test_the_runtime_guard_refuses_every_channel_whatever_the_route` |
 | No representation of a `Config` can print the credential | `src/pree/config.py` | `test_the_config_never_prints_the_credential_in_any_representation` |
 | The HTTP layer is handed a config with no token field and a callable, so the secret is not in its object graph | `src/pree/app.py` | `test_the_service_config_the_http_layer_receives_carries_no_credential` |
 | No audit expression can read the deployment's configuration, so none can encode the credential | `src/pree/app.py` | `test_no_audit_expression_can_reach_the_deployed_credential`, `test_the_http_layer_never_reads_the_deployed_token_at_all` |
@@ -2453,13 +2455,16 @@ correct token accepted:          True
 wrong token refused:             AuthError token rejected
 ```
 
-There is no attribute to reach, so no helper, parameter name, module, or encoding in `app.py` can
-reach it. Two tests keep that true, and both are ALLOWLISTS over the whole package rather than
+No ATTRIBUTE `ServiceConfig` exposes carries the credential. **This paragraph originally continued
+"so no helper, parameter name, module, or encoding in `app.py` can reach it", and that absolute was
+false**: see "Nine routes past a denylist" below, which a later review measured from inside that
+module. The amendment is here rather than only further down, because a reader who stops at this
+paragraph must not stop believing an absolute. Two tests keep that true, and both are ALLOWLISTS over the whole package rather than
 denylists of spellings:
 
 ● `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` walks every module
   in `src/pree/` and refuses any attribute named `team_token` on any base under any spelling,
-  outside three permitted functions. Variant A above turns it red.
+  outside FOUR permitted functions. Variant A above turns it red.
 ● `test_the_service_config_the_http_layer_receives_carries_no_credential` asserts the type has no
   token field, that its only secret-shaped field is `token_length`, and that `app.py` does not
   import `Config` at all. Restoring the field turns it red.
@@ -2527,10 +2532,13 @@ Four fixes, all cheap, and the division of labour between them stated rather tha
   and chosen, which is the whole difference from the denylist that failed last round: it cannot be
   one short.
 ● **`Config.team_token` is `field(repr=False)`.** `repr()` of a `Config` printed
-  `team_token='Zq7-Wx9_...'` verbatim, so any f-string, `print`, `format` or exception carrying one
-  disclosed the credential without spelling a token-shaped attribute. One dataclass keyword closes
-  that entire class, and a test drives all five real renderings rather than inspecting the metadata,
-  because the metadata is what would be edited beside the field.
+  `team_token='Zq7-Wx9_...'` verbatim, so an IMPLICIT render - `print(config)`, `f"{config}"`, an
+  exception carrying one - disclosed the credential without spelling a token-shaped attribute. A
+  test drives all five real renderings rather than inspecting the metadata, because the metadata is
+  what would be edited beside the field. **This entry said the keyword "closes that entire class",
+  and that was too broad**: an explicit field path (`"{0.team_token}".format(config)`) and every
+  serialiser (`dataclasses.asdict`, `astuple`, `pickle.dumps`, `__getstate__`, `__reduce__`) still
+  render it, all measured. What covers those is the runtime guard below.
 ● **`token_verifier` closes over the expected STRING, not the whole `Config`.** Introspecting the
   cell now yields one value instead of every setting beside it. Measured: the cell holds a `str`, no
   `Config`, and the gate still accepts the right token and refuses a wrong one.
@@ -2541,6 +2549,72 @@ now. And three citations in source docstrings did not resolve - a test name that
 count of readers that said two where the allowlist names four, and a method called `split()` that is
 `for_service()`. The register-row guard covers the control table, not source docstrings, so all
 three drifted unnoticed.
+
+### Nine routes past a denylist, and what replaced it
+
+**The guard I called closed was defeated nine ways.** I claimed its alphabet was "Python's and
+fixed rather than the author's and chosen ... it cannot be one short". That was wrong, and the
+review measured every route in real source with the whole loop green. Decisively, two lines in
+`app.py`:
+
+```python
+cell = verify_token.__getattribute__("__closure__")[0]
+print("leak-ga:", cell.__getattribute__("cell_contents"), flush=True)
+```
+
+`__getattribute__` was not on my list, and the classifier returned `None` for any call whose `func`
+was an attribute, so the entire dunder denylist fell to spelling attribute access as a method call.
+The other eight: a `str.format` field path (`"{0.__closure__[0].cell_contents}"` - a string
+constant, so no AST attribute node exists at all, which blinds the reader allowlist too);
+`os.getenv`; `from os import environ`; `inspect.getclosurevars`; `operator.attrgetter`; and
+`dataclasses.asdict`/`astuple`/`pickle.dumps`/`__getstate__`/`__reduce__`, none of which
+`repr=False` suppresses. `slots=True` had also made three of my denylist entries inert rather than
+protective: `config.__dict__` raises and `vars(config)` raises, while the serialiser routes that do
+work were absent from the list.
+
+**The lesson, and it is the third time in a row.** Attribute access has a METHOD spelling, a STRING
+spelling and a LIBRARY spelling. Sampling lost to a predicate constant across the sample; name
+spellings lost to `cfg`; language features lost to all of the above. Every one of those controls
+enumerated a set the adversary could step outside of.
+
+**So the control is now a runtime check on the bytes leaving the process.**
+`audit.install_credential_guard`, armed at boot by `security.arm_output_guard`, holds the expected
+credential and refuses any line containing it, on the audit logger and on stdout and stderr - the
+pod-log channels the platform aggregates. It does not care how a leak obtained the value, which is
+exactly what the enumerations were not. Fail-closed by SUBSTITUTION, not by raising or dropping: a
+raise inside a logging filter is swallowed and the line goes out anyway, and a dropped line is a
+control whose success looks like nothing happening. The record is replaced with a fixed alarm
+carrying no caller input.
+
+Measured: twelve leak routes printed to a wrapped stream and one to the audit logger, secret absent
+from both, one alarm per leak, and every benign line passing through untouched - because a guard
+that suppresses clean lines is a denial of service on the log rather than a control on it.
+
+**Three structural changes beside it, taking the reviewer's own framing.**
+
+● **Both allowlists are keyed on (MODULE, FUNCTION), not a bare name.** A bare name gave any module
+  a free credential read by calling a helper `for_service`, and a free environment read by calling
+  one `load_config`. The review planted both.
+● **A per-module IMPORT allowlist.** This is the set that genuinely is small and fixed, which the
+  attribute alphabet was not: a dozen names per module, every addition visible in a diff. It is how
+  the library spelling closes - `inspect`, `pickle`, `operator`, `copy`, `gc`, `traceback` have no
+  business in a module that serves a request, so reaching an attribute through one now requires a
+  visible change. Exact in both directions, because a permitted import nothing uses is a standing
+  exemption for whatever arrives next.
+● **`authorise` was a SECOND copy of the compare that no served request reached.** `create_app`
+  only ever calls the closure, so an edit to `authorise` - a lockout, an audit hook, a bug fix -
+  could not affect a single request while every test of it stayed green. A duplicated control with
+  one live copy is worse than one copy, because the dead one reads as coverage. It is a thin caller
+  of the closure now, and reads nothing.
+
+**And the worst finding was not in the code.** Three of the four claim sites I reported as corrected
+were NOT corrected; `main.py` had no hunk in that commit at all. I told my user "the claims are
+corrected where they were made", and it was true in one place of four. All four are corrected now,
+the register's absolute at the top of the previous section is amended in place rather than only
+answered thirty lines below, and the `repr=False` claim is narrowed to what it does: it removes the
+credential from the DEFAULT dataclass `__repr__`, so an implicit render is clean and an explicit
+field path or a serialiser is not. Two stale counts ("three readers" where the set names five, then
+four) are corrected with them.
 
 ## Not accepted, and why it is not a risk here
 

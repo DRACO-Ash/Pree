@@ -11,6 +11,7 @@ import hmac
 import re
 from collections.abc import Callable
 
+from .audit import install_credential_guard
 from .config import Config
 
 MAX_ACTOR_LENGTH = 64
@@ -60,21 +61,16 @@ def token_matches(presented: str | None, expected: str) -> bool:
 def authorise(config: Config, presented: str | None) -> None:
     """Gate a cost-incurring or state-changing route. Raises AuthError on failure.
 
-    With no token configured the app is in single-user local mode and the gate is open by
-    design. With a token configured every gated route requires it.
+    With no token configured the app is in single-user local mode and the gate is open by design.
+    With a token configured every gated route requires it.
 
-    One of FOUR permitted readers of `config.team_token` in the package, the others being
-    `token_verifier` below and `Config.auth_enabled` and `Config.for_service`, which derive the
-    token-free facts the service layer receives. That set is asserted across every module by
-    `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package`. An earlier
-    version of this docstring said "this function and `token_verifier` are the ONLY readers" and
-    cited a test name that does not exist; both were wrong, and no guard covers a source docstring.
+    A thin caller of `token_verifier`, deliberately, and this used to be a SECOND copy of the
+    compare. A review found the consequence: `create_app` only ever calls the closure, so nothing a
+    request meets went through this function, and an edit here - a lockout, an audit hook, a bug
+    fix - could not affect a single served request while every test of it stayed green. A duplicated
+    control with one live copy is worse than one copy, because the dead one reads as coverage.
     """
-    if not config.auth_enabled:
-        return
-    expected = config.team_token
-    if expected is None or not token_matches(presented, expected):
-        raise AuthError("token rejected")
+    token_verifier(config)(presented)
 
 
 def token_verifier(config: Config) -> Callable[[str | None], None]:
@@ -97,8 +93,14 @@ def token_verifier(config: Config) -> Callable[[str | None], None]:
 
     Two things narrow the cell itself. It closes over the EXPECTED STRING rather than the whole
     `Config`, so introspecting it yields one value instead of every setting beside it; and
-    `Config.team_token` is `repr=False`, so no `repr`, f-string or format of a `Config` anywhere can
-    print the credential, which closes that whole class in one keyword.
+    `Config.team_token` is `repr=False`, which removes the credential from the DEFAULT dataclass
+    `__repr__` and only from there. The first version of this sentence said that "closes that whole
+    class in one keyword", and it does not: an explicit field path and every serialiser
+    (`dataclasses.asdict`, `astuple`, `pickle.dumps`, `__getstate__`, `__reduce__`) still render it.
+
+    THE control against a deliberate leak is neither of those. It is `arm_output_guard` below,
+    which checks the bytes leaving the process against the actual secret and so does not care how
+    a leak obtained it. This function raises the cost of an accidental one.
     """
     expected = config.team_token
 
@@ -209,3 +211,14 @@ def _scrub(value: str, *, empty: str, limit: int, unsafe: re.Pattern[str] | None
     if not cleaned:
         return empty
     return cleaned[:limit]
+
+
+def arm_output_guard(config: Config) -> None:
+    """Arm the runtime output guard, keeping the credential's readers inside this module.
+
+    The guard needs the plaintext to compare emitted bytes against, so arming it IS a read. Doing
+    that in `main.build()` would put a fifth reader in a third module, and every reader is a place
+    the value can be handed somewhere else - which is the argument that removed the boot line's own
+    read last round. This keeps the whole set in `security.py` and `config.py`.
+    """
+    install_credential_guard(config.team_token)

@@ -1102,8 +1102,9 @@ Eighth security review: a blocker, a major and two minors, and the architecture 
 ● **The credential now leaves the HTTP layer entirely.** `create_app` takes a `ServiceConfig` with
   no token field plus a `verify_token` callable closed over the credential, and `main.py` takes that
   boundary before it writes the boot line, so even the logged length comes from the token-free view.
-  There is no attribute to reach, so no helper, parameter name, module or encoding in `app.py` can
-  reach it. Two allowlist tests keep it true: the credential is read in exactly three functions
+  No attribute `ServiceConfig` exposes carries the credential. This row originally claimed no
+  helper, parameter name, module or encoding in `app.py` could reach it, and that absolute was
+  false; see the nine-route entry below. Two allowlist tests keep it true: the credential is read in exactly three functions
   across the whole package under any spelling, and the type the HTTP layer receives has no token
   field and does not import `Config`.
 ● Four audited values were shape-checked only, so the claim that every caller-influenced value is
@@ -1143,6 +1144,37 @@ Ninth security review: one major, two minors, and a claim of mine that was the f
   resolve - a test name that never existed, "two readers" where the allowlist names four, and a
   `split()` that is `for_service()`. The register-row guard covers the control table, not source
   docstrings.
+
+Tenth security review: two majors, three minors, and the enumeration approach abandoned:
+
+● The feature denylist was defeated NINE ways with the loop green, decisively
+  `verify_token.__getattribute__("__closure__")[0].__getattribute__("cell_contents")`: the whole
+  dunder list falls to spelling attribute access as a method call, and my classifier returned None
+  for any call whose func was an attribute. Also a `str.format` field path (a string constant, so no
+  AST attribute node exists and the reader allowlist is blind too), `os.getenv`,
+  `from os import environ`, `inspect.getclosurevars`, `operator.attrgetter`, and
+  `dataclasses.asdict`/`astuple`/`pickle.dumps`/`__getstate__`/`__reduce__`. `slots=True` had made
+  three denylist entries inert rather than protective. My claim that the alphabet "cannot be one
+  short" was wrong: attribute access has a method spelling, a string spelling and a library
+  spelling.
+● **The control is now a RUNTIME check on the bytes leaving the process.**
+  `audit.install_credential_guard`, armed at boot by `security.arm_output_guard`, refuses any line
+  containing the credential on the audit logger, stdout and stderr. It does not care how a leak
+  obtained the value. Fail-closed by substitution, not by raising (swallowed by logging) or dropping
+  (a control whose success looks like nothing happening). Measured over twelve leak routes; benign
+  lines pass untouched, because a guard that suppresses clean lines is a denial of service on the log.
+● Both allowlists are keyed on (module, function) rather than a bare name, which had given any module
+  a free credential read via a helper called `for_service` and a free environment read via one called
+  `load_config`. A per-module IMPORT allowlist closes the library spelling: that set genuinely is
+  small and fixed, and `inspect`, `pickle`, `operator`, `copy`, `gc` have no business in a module
+  serving a request.
+● `authorise` was a second copy of the compare that no served request reached, so an edit to it could
+  not affect a request while every test of it stayed green. It is a thin caller of the closure now.
+● **The worst finding was not in the code: three of the four claim sites I reported as corrected were
+  not corrected, and `main.py` had no hunk at all.** I said "the claims are corrected where they were
+  made"; it was true in one place of four. All four are corrected, the register's absolute is amended
+  in place rather than answered thirty lines below, the `repr=False` claim is narrowed to the default
+  dataclass `__repr__`, and two stale reader counts are fixed.
 
 Continuous integration, which closes the standing container gap:
 

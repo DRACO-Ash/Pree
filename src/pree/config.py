@@ -56,9 +56,18 @@ class ServiceConfig:
     deployed credential verbatim from the pod log on every unauthenticated 401.
 
     A name-based rule will always lose that race, because the attacker chooses the names. So the
-    credential is not in this object. `create_app` is handed a `ServiceConfig` and a callable, and
-    nothing in the HTTP layer's object graph carries the token under ANY spelling: there is no
-    attribute to reach, so no helper, parameter name, module, or encoding can reach it.
+    credential is not in this object: `create_app` is handed a `ServiceConfig` and a callable, and
+    no ATTRIBUTE this type exposes carries the token.
+
+    What that does NOT mean, because the previous version of this docstring claimed an absolute and
+    a review then took it nine different ways: a module downstream of the boundary can still reach
+    the credential through `__getattribute__("__closure__")`, `os.getenv`, `from os import environ`,
+    `inspect.getclosurevars`, `operator.attrgetter`, a `str.format` field path, or
+    `dataclasses.asdict`/`pickle.dumps`/`__getstate__`. Attribute access has a method spelling, a
+    string spelling and a library spelling, and no denylist of them is closed. What stops those is
+    `audit.install_credential_guard`, a RUNTIME check on the bytes leaving the process, which does
+    not care how a leak obtained the value. This type raises the cost of an accidental leak; that
+    guard is what refuses a deliberate one.
 
     `auth_enabled` and `token_length` are carried as precomputed FACTS rather than derived from the
     value, because `/diagnostics` needs both and neither discloses the credential. Without them a
@@ -91,10 +100,14 @@ class Config:
 
     port: int
     data_dir: Path
-    # `repr=False` closes a whole class of disclosure in one keyword, and it was found by a review
-    # taking it: `repr()` of a `Config` printed `team_token='Zq7-Wx9_...'` verbatim, so any
-    # f-string, `print`, `format` or log of a Config anywhere disclosed the credential without ever
-    # spelling a token-shaped attribute, which is exactly what a name-based guard cannot see.
+    # `repr=False` removes the credential from the DEFAULT dataclass `__repr__`, and only from
+    # there. It was found by a review taking it: `repr()` of a `Config` printed
+    # `team_token='Zq7-Wx9_...'` verbatim, so an implicit render - `print(config)`, `f"{config}"`,
+    # an exception carrying one - disclosed the credential without spelling a token-shaped
+    # attribute. An EXPLICIT field path still renders it (`"{0.team_token}".format(config)`), and so
+    # does any serialiser (`dataclasses.asdict`, `astuple`, `pickle.dumps`, `__getstate__`,
+    # `__reduce__`), all measured. The first claim here said this "closes that whole class in one
+    # keyword", which was false; the runtime guard in `audit.py` is what covers the rest.
     team_token: str | None = field(repr=False)
     allowed_origin: str | None
     environment: str

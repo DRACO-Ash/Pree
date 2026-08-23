@@ -12,7 +12,7 @@ from fastapi import FastAPI
 
 from .app import create_app
 from .config import load_config
-from .security import token_verifier
+from .security import arm_output_guard, token_verifier
 from .store import JsonStore, StoreError
 
 
@@ -23,6 +23,13 @@ def build() -> FastAPI:
     so a misconfiguration surfaces as a start-up error rather than a silent runtime fault.
     """
     config = load_config()
+    # ARMED FIRST, before anything can write a line. Every static guard before this one was an
+    # enumeration the adversary could step outside: sampled tokens, then name spellings, then
+    # language features, each defeated in a handful of lines. This one checks the bytes leaving the
+    # process against the actual secret, so it does not care how a leak obtained the value, and it
+    # covers routes nobody enumerated. It is defence in depth, not a replacement for the boundary
+    # below: the boundary is what stops the credential being in reach at all.
+    arm_output_guard(config)
     store = JsonStore(config.data_dir)
     try:
         store.seed()
@@ -37,13 +44,15 @@ def build() -> FastAPI:
         storage_state = "refused"
     # The BOUNDARY, taken BEFORE the boot line rather than after it. `for_service()` drops the
     # credential and `token_verifier` closes over it, so the app is built from a config with no
-    # token field and a callable that does the compare, and nothing downstream can read the secret
-    # whatever it is named.
+    # token field and a callable that does the compare. That removes the ATTRIBUTE route, not every
+    # route: this comment used to say "nothing downstream can read the secret whatever it is named",
+    # and a review then read it nine ways, `__getattribute__("__closure__")` decisively. The guard
+    # armed above is what covers the rest, at the point the bytes leave.
     #
     # The boot line then reads its length from the token-free view rather than from the token. That
     # is not fussiness: this function was the ONLY reader of `config.team_token` outside the two
     # permitted ones, and every reader is a place the value can be passed somewhere else. Deriving
-    # the length here instead leaves the credential with exactly three readers in the package,
+    # the length here instead leaves the credential with exactly FOUR readers in the package,
     # which `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` asserts.
     service = config.for_service()
     # One decisive boot line to stdout, which is where the platform collects pod logs.
