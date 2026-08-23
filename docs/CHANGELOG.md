@@ -1200,6 +1200,10 @@ Eleventh security review: two majors, three minors, and my framing was the deepe
   process-wide logger; it failed in isolation. It manages `propagate` itself now.
 ● Two more copies of the `repr=False` absolute corrected, and the over-claiming test name changed to
   what it asserts.
+● Correction to the commit that landed this round: its message says "345 passed" and the real count
+  is 344. Recorded here rather than rewritten out of the pushed history, because a record that says
+  what was claimed and what was true is worth more than a tidy one. Second miscount in a commit
+  message this range; the first was caught before pushing.
 
 Continuous integration, which closes the standing container gap:
 
