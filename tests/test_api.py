@@ -19,6 +19,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from string import Formatter
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol
 from unittest import mock
@@ -3784,6 +3785,13 @@ def test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package(
 # and chosen, so unlike a list of variable spellings it cannot be one short.
 _INTROSPECTION_ATTRIBUTES = frozenset(
     {
+        # The METHOD spelling of attribute access, which was the decisive bypass: the whole dunder
+        # list below is reachable through `x.__getattribute__("__closure__")`, and the classifier
+        # returned None for any call whose func was an attribute, so nothing saw it.
+        "__getattribute__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
         "__closure__",
         "cell_contents",
         "__globals__",
@@ -3814,6 +3822,30 @@ def _attribute_complaint(node: ast.Attribute, owner: dict[int, str], module: str
     return None
 
 
+def _format_field_complaint(node: ast.Constant) -> str | None:
+    """Whether a string literal is a format template whose FIELD PATH reaches an attribute.
+
+    `"{0.__closure__[0].cell_contents}".format(x)` reaches two attributes without producing a
+    single `ast.Attribute` node, because the path lives inside a string constant. That blinded both
+    the introspection guard and the reader allowlist, and it is why `string.Formatter` is used here
+    rather than another regular expression over source: the format mini-language is a real grammar
+    with a real parser, and reimplementing it is how the next gap gets introduced.
+    """
+    if not isinstance(node.value, str) or "{" not in node.value:
+        return None
+    try:
+        fields = [field for _, field, _, _ in Formatter().parse(node.value) if field]
+    except ValueError:
+        # An unparseable template cannot be a working leak, but it also cannot be cleared, so it is
+        # reported rather than skipped.
+        return "contains an unparseable format template"
+    for field in fields:
+        for part in field.replace("[", ".").replace("]", ".").split("."):
+            if part in _INTROSPECTION_ATTRIBUTES or part == "team_token":
+                return f"has a format field path reaching {part!r}"
+    return None
+
+
 def _call_complaint(node: ast.Call) -> str | None:
     """What is wrong with one call, or None."""
     if not isinstance(node.func, ast.Name):
@@ -3835,6 +3867,8 @@ def _introspection_complaint(node: ast.AST, owner: dict[int, str], module: str) 
         return _attribute_complaint(node, owner, module)
     if isinstance(node, ast.Call):
         return _call_complaint(node)
+    if isinstance(node, ast.Constant):
+        return _format_field_complaint(node)
     return None
 
 

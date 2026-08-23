@@ -2590,6 +2590,20 @@ Measured: twelve leak routes printed to a wrapped stream and one to the audit lo
 from both, one alarm per leak, and every benign line passing through untouched - because a guard
 that suppresses clean lines is a denial of service on the log rather than a control on it.
 
+**And the static half is closed too, for the two routes that needed no import.** Canarying the six
+measured routes against the new controls showed four caught by the import allowlist or the reader
+pairs, and two still statically invisible: the `__getattribute__` method spelling and the format
+field path. Both are cheap to name, so both are named - `__getattribute__`, `__getattr__`,
+`__setattr__` and `__delattr__` join the attribute list, and every string literal is parsed with
+`string.Formatter` (the real grammar, not another regular expression over source) and refused if a
+field path reaches an introspection attribute or `team_token`. That also catches the module-level
+`_FMT = "{v.__closure__[0].cell_contents}"` form, which evades ruff's own UP030/UP032.
+
+**The framing matters more than the entries.** These are additional WITNESSES, not the control. The
+control is the runtime guard, because it is the only one of these that does not depend on having
+enumerated the adversary's alphabet correctly - and this project has now got that wrong three times
+running. A statically invisible leak that never emits is not a leak; one that emits meets the guard.
+
 **Three structural changes beside it, taking the reviewer's own framing.**
 
 ● **Both allowlists are keyed on (MODULE, FUNCTION), not a bare name.** A bare name gave any module
