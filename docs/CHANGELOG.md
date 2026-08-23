@@ -1328,3 +1328,9 @@ Everything else closed in this round:
 
 Four new regression tests, 354 passing, coverage 99% against the gate's 80%. Still no version bump:
 V0.1 is unreleased.
+
+Twelve mutations were run against these fixes and two came back green first time, which is the
+argument for running them: the test holding the `formatException` guard used an input the standard
+library renders defensively rather than raising, and a two-field fix had only one field driven. Both
+are red now.
+

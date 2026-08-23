@@ -4606,15 +4606,22 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
     could not be checked" and "a leak was refused" are different facts and a single marker would
     make a storm of the first indistinguishable from the second.
 
-    Three shapes, each holding a line nothing else holds:
+    Four shapes, each holding a line nothing else holds:
 
     ● The double-call `__str__`, which is the measured bypass.
-    ● An `exc_info` whose exception raises while being rendered, with the credential in `msg`. This
-      is the only thing holding the guard around `formatException`: deleting that guard turns this
-      red, where the whole suite stayed green before this test existed.
-    ● A truthy NON-`str` `stack_info`. The docstring claimed every part was produced under its own
-      guard while two were appended raw, so this input made the join raise `TypeError` out of the
-      filter and into the `logger.*` call site - where logging itself had previously contained it.
+    ● A MALFORMED `exc_info` tuple, with the credential in `msg`. This is what holds the guard
+      around `formatException`, and the input a review suggested for it - an exception whose
+      `__str__` raises - does NOT work: `traceback` is defensive there and renders
+      `<exception str() failed>` instead. Measured. `formatException` raises `AttributeError` on a
+      tuple whose value is not an exception, which `logging` passes through from a caller unchanged,
+      so the reachable input is a caller's mistake rather than a hostile exception. This test
+      asserted the wrong thing for one commit: the mutation that rendered the exception unguarded
+      stayed GREEN.
+    ● A truthy NON-`str` `stack_info`, and a truthy non-`str` `exc_text`. The docstring claimed
+      every part was produced under its own guard while BOTH were appended raw, so either made the
+      substring test raise `TypeError` out of the filter and into the `logger.*` call site - where
+      logging itself had previously contained it. Only `stack_info` was driven for one commit, and
+      the `exc_text` mutation stayed green.
     """
     secret = "Sh6-Dg3_FZq.7Wx~9Yt2Ur5Ip8Ok1Aj4"
 
@@ -4629,14 +4636,6 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
             if self.calls == 1:
                 raise ValueError("not yet")
             return f"token={secret}"
-
-    class UnrenderableError(Exception):
-        def __str__(self) -> str:
-            raise RuntimeError("this exception cannot be rendered")
-
-    def fail_unrenderably() -> None:
-        """Raise from a frame of its own, so the traceback under test is a real one."""
-        raise UnrenderableError
 
     class NotAString:
         """A truthy non-`str` `stack_info`, carrying the credential through `str()`."""
@@ -4662,12 +4661,11 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
         double_call = sink.getvalue()
         sink.truncate(0)
         sink.seek(0)
-        # The credential is in `msg`, so the refusal must happen even though the exception render
-        # failed. Without the guard around `formatException` this raises out of `logger.error`.
-        try:
-            fail_unrenderably()
-        except UnrenderableError:
-            logger.error("token rejected: %s", secret, exc_info=True)
+        # A MALFORMED exc_info tuple, which `logging` passes through from the caller unchanged and
+        # `formatException` raises `AttributeError` on. The credential is in `msg`, so the refusal
+        # must happen even though the exception render failed; without the guard around
+        # `formatException` this raises out of `logger.error` instead.
+        logger.error("token rejected: %s", secret, exc_info=(TypeError, "not an exception", None))  # type: ignore[arg-type]
         exception_render = sink.getvalue()
         sink.truncate(0)
         sink.seek(0)
@@ -4683,9 +4681,24 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
         )
         record.stack_info = NotAString()  # type: ignore[assignment]
         # Reaching the next line at all is half the assertion: without `str()` around this field the
-        # join raises `TypeError` out of the filter, out of `handle`, and into this frame.
+        # substring test raises `TypeError` out of the filter, out of `handle`, and into this frame.
         handler.handle(record)
         non_string_stack = sink.getvalue()
+        sink.truncate(0)
+        sink.seek(0)
+        # The SAME shape in the other raw-appended field, which nothing drove for a commit.
+        cached = logging.LogRecord(
+            name=logger.name,
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=0,
+            msg="a clean message with a cached rendering",
+            args=(),
+            exc_info=None,
+        )
+        cached.exc_text = NotAString()  # type: ignore[assignment]
+        handler.handle(cached)
+        non_string_exc_text = sink.getvalue()
     finally:
         install_credential_guard(None)
         logger.handlers = previous
@@ -4715,6 +4728,13 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
     assert CREDENTIAL_ALARM in non_string_stack, (
         f"a non-str stack_info was not scanned, or was not cleared by the refusal: "
         f"{non_string_stack!r}"
+    )
+    assert secret not in non_string_exc_text, (
+        f"a non-str exc_text carried the credential past the scan: {non_string_exc_text!r}"
+    )
+    assert CREDENTIAL_ALARM in non_string_exc_text, (
+        f"a non-str exc_text was not scanned, or was not cleared by the refusal: "
+        f"{non_string_exc_text!r}"
     )
 
 

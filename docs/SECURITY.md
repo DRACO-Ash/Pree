@@ -2879,13 +2879,19 @@ pinned by a test asserting the set has exactly one member, that the function exi
 Four smaller things, each a sentence that was false or a line nothing held:
 
 ● **"Each part is produced under its own `try`"** was false for two of the four. `exc_text` and
-  `stack_info` were appended raw, so a truthy non-`str` in either made the join raise `TypeError`
-  out of the filter and into the log call site - where logging itself had previously contained the
-  same input. Both go through `str()` now, and the test drives a non-`str` `stack_info` carrying the
-  credential, so it proves the field is both scanned and cleared in one assertion.
-● **The suppression around `formatException` was unheld**: deleting it left all 350 tests green. It
-  is now driven by an `exc_info` whose exception raises while being rendered, with the credential in
-  `msg`, which must still be refused.
+  `stack_info` were appended raw, so a truthy non-`str` in either made the substring test raise
+  `TypeError` out of the filter and into the log call site - where logging itself had previously
+  contained the same input. Both go through `str()` now, and BOTH are driven, each carrying the
+  credential, so each assertion proves the field is scanned and cleared at once. Driving only one of
+  them - the first attempt - left the other's mutation green.
+● **The suppression around `formatException` was unheld**: deleting it left all 350 tests green. The
+  input the review suggested for it does not work, and the canary said so rather than the reasoning:
+  an exception whose `__str__` raises is rendered as `<exception str() failed>`, because `traceback`
+  is defensive there, so the first fix left the mutation GREEN. What reaches the line is a MALFORMED
+  `exc_info` tuple - `formatException` raises `AttributeError` on a value that is not an exception,
+  and `logging` passes a caller's tuple through unchanged. So the reachable input is a caller's
+  mistake, not a hostile exception, and the test drives that with the credential in `msg`, which must
+  still be refused.
 ● **`TypeError` in the re-point's suppression set was speculative and unheld.** Narrowing to
   `AttributeError` alone leaves the suite green, and all three real shapes raise it: a property with
   no setter, `__slots__`, and a frozen dataclass, whose `FrozenInstanceError` subclasses it. A catch
@@ -2904,6 +2910,13 @@ practice that keeps catching them is the one applied to every rule added here - 
 on synthetic input with a known outcome, prove the channel is real by driving it with the control
 disarmed, canary the rule by reverting the fix, and delete any comment asserting a security property
 that does not name the test asserting it.
+
+The canary is the part that cannot be skipped, and this round is the proof. Twelve mutations were
+run against the fixes above and TWO came back green on the first attempt: the `formatException`
+guard, whose test used an input the standard library renders defensively instead of raising, and the
+`exc_text` half of a two-field fix where only `stack_info` had been driven. Both were fixed and both
+are red now, and neither would have been found by reading the diff - the reasoning in both cases was
+sound and the input was wrong.
 
 ## Not accepted, and why it is not a risk here
 
