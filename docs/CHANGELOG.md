@@ -1200,6 +1200,34 @@ Eleventh security review: two majors, three minors, and my framing was the deepe
   process-wide logger; it failed in isolation. It manages `propagate` itself now.
 ● Two more copies of the `repr=False` absolute corrected, and the over-claiming test name changed to
   what it asserts.
+
+Twelfth security review: two majors, four minors:
+
+● `sys.__stdout__` holds the PRE-WRAP object, permanently, one underscore from the covered name, so
+  `print(token, file=sys.__stdout__)` reached the pod log in plaintext. Neither fd-level nor
+  re-encoded, so it sat outside both stated limits while the register claimed the covered set was
+  stated exactly. All four `sys` stream attributes are wrapped now, sharing one wrapper per
+  underlying object so a handler re-pointed at one is recognised via the other.
+● Writing that taught its own lesson: the obvious `for name in (...): setattr(sys, name, ...)` was
+  refused by this project's OWN introspection guard, correctly, because a computed attribute name is
+  what a static rule about names cannot see. A control that exempts its own module is not a control,
+  so the four attributes are written out explicitly.
+● Two halves of the guard could be deleted with the suite green: the stream re-point, which its own
+  docstring calls necessary, and the second source of the handler walk, whose docstring says "either
+  alone has a gap". Both claims true, neither asserted - the recurring shape of this project's
+  defects. Each is now driven through the path where it is the only defence: the re-point via
+  `handler.emit` directly rather than a logger, and the walk with `_handlerList` cleared as
+  `dictConfig` clears it.
+● A THIRD limit was missing and is now stated: the guard cannot survive an adversary with the same
+  privilege as the code it guards. `dictConfig` with `{".": {"filters": []}}`, a Handler subclass
+  overriding `handle`, or restoring `logging.Handler.__init__` each removes it in a few lines.
+  Inherent to any in-process guard, not a defect in this one.
+● The fd bullet named two instances where it meant a class; `sys.stdout.buffer.write`,
+  `open("/dev/stdout")` and `os.fdopen(1)` are further instances, and enumerating them would repeat
+  the mistake this module's history is made of.
+● On a refused line the wrapper returned the alarm's length rather than the caller's, so a caller
+  looping until everything is written would re-submit the tail. Unreachable through `print` or
+  `StreamHandler`, both of which discard the return, so a trap rather than a fault.
 ● Correction to the commit that landed this round: its message says "345 passed" and the real count
   is 344. Recorded here rather than rewritten out of the pushed history, because a record that says
   what was claimed and what was true is worth more than a tidy one. Second miscount in a commit

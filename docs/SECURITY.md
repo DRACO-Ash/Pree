@@ -155,7 +155,9 @@ the assessment store.
 | The output guard covers handlers it was never told about, including propagated records and handlers built before arming | `src/pree/audit.py` | `test_the_runtime_guard_covers_handlers_it_was_never_told_about` |
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
-| No credential-bearing line reaches any logging handler or a write through `sys.stdout`/`sys.stderr`, in plaintext (NOT fd-level writes, NOT other encodings) | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers` |
+| No credential-bearing line reaches any logging handler, or a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT anything reaching fd 1 or 2 without a wrapped object, NOT other encodings, NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
+| A handler that captured a stream before arming is re-pointed at the wrapper | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming` |
+| A handler the private registry has forgotten is still found | `src/pree/audit.py` | `test_the_guard_finds_a_handler_the_private_registry_has_forgotten` |
 | No representation of a `Config` can print the credential | `src/pree/config.py` | `test_the_config_never_prints_the_credential_in_any_representation` |
 | The HTTP layer is handed a config with no token field and a callable, so the secret is not in its object graph | `src/pree/app.py` | `test_the_service_config_the_http_layer_receives_carries_no_credential` |
 | No audit expression can read the deployment's configuration, so none can encode the credential | `src/pree/app.py` | `test_no_audit_expression_can_reach_the_deployed_credential`, `test_the_http_layer_never_reads_the_deployed_token_at_all` |
@@ -2699,6 +2701,57 @@ Four smaller things from the same review:
   still render the credential.
 ● The test named `..._refuses_every_channel_whatever_the_route` exercised one stream and one logger.
   It is `..._refuses_the_channels_it_covers` now, which is what it asserts.
+
+### The pre-wrap reference the standard library keeps, and two halves nothing held
+
+**`sys.__stdout__` is the pre-wrap object, permanently, one underscore from the covered name.**
+`print(token, file=sys.__stdout__)` and `sys.__stdout__.write(token)` both reached the pod log in
+plaintext. Neither is an fd-level write nor a re-encoding, so both sat outside the two limits this
+module names while the register said the covered set was "stated exactly". It is the same shape as
+the gunicorn hole closed the round before - a live reference to the pre-wrap object held somewhere
+the guard did not re-point - and unlike a write to fd 1 it is wrappable, so it was a missed wrap
+rather than a boundary. All four `sys` stream attributes are wrapped now, sharing ONE wrapper per
+underlying object, because two wrappers over one stream would mean a handler re-pointed at one is
+not recognised as guarded by a check against the other.
+
+Writing that required a small lesson of its own. The obvious implementation was
+`for name in (...): setattr(sys, name, wrap(getattr(sys, name)))`, and **this project's own
+introspection guard refused it**, correctly: a computed attribute name is exactly what a static rule
+about attribute names cannot see. A control that exempts the module implementing it is not a control,
+so the four attributes are written out explicitly. typeshed marks the dunder pair `Final`, which is a
+declaration of intent rather than a runtime restriction, and the intent is overridden here for that
+one measured reason with the reason recorded beside the ignore.
+
+**And two halves of the guard could be deleted with the whole suite green.** The stream re-point,
+which the guard's own docstring calls "the half that a review's measurement made necessary", and the
+second source of the handler walk, whose docstring says "either alone has a gap". Both claims were
+true; neither was asserted. That is the recurring shape of this project's defects in one sentence: a
+fact stated in prose beside code that nothing exercises.
+
+Both are held now, and each is driven through the path where it is the ONLY defence:
+
+● The re-point is driven through `handler.emit(record)` and `handler.stream.write(...)` directly,
+  not through a logger, because a record routed through `handle` meets the filter and a test that
+  only logs cannot tell the two halves apart.
+● The manager walk is driven with `logging._handlerList` cleared, exactly as
+  `logging.config.dictConfig` clears it, leaving a handler attached to a logger and invisible to the
+  private registry.
+
+Deleting either now turns its own test red, as does leaving the dunder streams unwrapped.
+
+**Three limits, and the third was missing.** Alongside fd-level writes and non-plaintext encodings,
+the guard cannot survive **an adversary with the same privilege as the code it guards**:
+`dictConfig` with `{".": {"filters": []}}`, a `Handler` subclass overriding `handle`, reassigning
+this module's state, or restoring `logging.Handler.__init__` each removes it in a few lines from
+inside the process. That is inherent to any in-process guard rather than a defect in this one, and it
+is now stated so a reader does not have to infer it. The fd bullet also named two instances where it
+meant a class: `sys.stdout.buffer.write`, `open("/dev/stdout", "w")` and `os.fdopen(1)` are further
+instances, and enumerating them would be the same mistake this module's history is made of.
+
+One minor with them: on a refused line the wrapper returned the alarm's length rather than the
+caller's, so a caller looping until everything is written - which `write`'s contract permits - would
+re-submit the tail of the refused text. Not reachable through `print` or `StreamHandler`, both of
+which discard the return, so a trap rather than a fault.
 
 ## Not accepted, and why it is not a risk here
 

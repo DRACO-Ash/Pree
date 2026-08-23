@@ -4131,6 +4131,139 @@ def test_the_runtime_guard_covers_handlers_it_was_never_told_about() -> None:
     )
 
 
+def test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming() -> None:
+    """The half the guard's own docstring calls necessary, and no test held it.
+
+    Deleting the re-point left the whole suite green at 344 passed. In-process it is not cosmetic:
+    for any handler that existed before arming - which is exactly gunicorn's ordering, since
+    `Arbiter.setup` builds its handlers before the worker imports the factory - both
+    `handler.emit(record)` and `handler.stream.write(...)` put the credential in the pod log in
+    plaintext. Replacing the `sys.stdout` OBJECT does nothing for a handler holding the old one.
+
+    Driven through `emit` directly rather than through a logger, because that is the path a
+    re-pointed stream is the only defence on: the filter would catch a record routed through
+    `handle`, so a test that only logs cannot tell the two halves apart.
+    """
+    secret = "Ur5~Ip8Ok1Aj4Sh6Dg3F-Zq7-Wx9_Yt2"
+    sink = io.StringIO()
+    original_stdout = sys.stdout
+    sys.stdout = sink
+    try:
+        captured = logging.StreamHandler(sys.stdout)
+        captured.setFormatter(logging.Formatter("%(message)s"))
+        assert captured.stream is sink, "the handler did not capture the pre-arm stream"
+        install_credential_guard(secret)
+        try:
+            assert isinstance(captured.stream, _GuardedStream), (
+                "the handler still holds the pre-wrap stream, so replacing sys.stdout bought "
+                "nothing for it"
+            )
+            assert captured.stream.wrapped is sink, "re-pointed at the wrong wrapper"
+            # `emit`, not a logger call: this is the path where the stream IS the only defence.
+            captured.emit(logging.LogRecord("x", logging.ERROR, "f", 1, "leak %s", (secret,), None))
+            # And the write path on the same handler.
+            captured.stream.write(f"direct write {secret}\n")
+        finally:
+            install_credential_guard(None)
+        emitted = sink.getvalue()
+    finally:
+        sys.stdout = original_stdout
+
+    assert secret not in emitted, f"a pre-arm handler leaked the credential: {emitted!r}"
+    assert emitted.count(CREDENTIAL_ALARM) == 2, (
+        f"expected an alarm from both emit and write, got {emitted.count(CREDENTIAL_ALARM)}: "
+        f"{emitted!r}"
+    )
+
+
+def test_the_guard_finds_a_handler_the_private_registry_has_forgotten() -> None:
+    """Why the handler walk has TWO sources, asserted rather than asserted-in-prose.
+
+    The docstring says "either alone has a gap" and nothing exercised the second source: coverage
+    reported the manager walk as a miss on a green run, and deleting it left 344 passed.
+
+    It is genuinely load-bearing. `logging.config.dictConfig({"version": 1})` clears
+    `logging._handlerList`, so a handler still attached to a logger becomes invisible to the private
+    registry and is found only by walking the manager's loggers.
+    """
+    secret = "Ip8Ok1Aj4Sh6Dg3F-Ur5-Zq7-Wx9_Yt2x"
+    sink = io.StringIO()
+    logger = logging.getLogger("forgotten.by.the.registry")
+    previous, previous_level, previous_propagate = (
+        logger.handlers,
+        logger.level,
+        logger.propagate,
+    )
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    # Clear the private registry, exactly as dictConfig does, leaving the handler attached.
+    registry = getattr(logging, "_handlerList", None)
+    saved = list(registry) if registry is not None else []
+    if registry is not None:
+        registry.clear()
+    try:
+        assert handler not in [
+            reference() if callable(reference) else reference
+            for reference in list(getattr(logging, "_handlerList", []))
+        ], "the private registry still knows the handler, so this test proves nothing"
+        install_credential_guard(secret)
+        try:
+            logger.error("leak via a forgotten handler: %s", secret)
+            emitted = sink.getvalue()
+        finally:
+            install_credential_guard(None)
+    finally:
+        if registry is not None:
+            registry.extend(saved)
+        logger.handlers = previous
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+
+    assert secret not in emitted, f"a handler missing from the private registry leaked: {emitted!r}"
+    assert emitted.count(CREDENTIAL_ALARM) == 1, f"expected one alarm: {emitted!r}"
+
+
+def test_the_guard_covers_the_pre_wrap_dunder_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`sys.__stdout__` holds the PRE-WRAP object, one underscore from the covered name.
+
+    A review measured the consequence: `print(token, file=sys.__stdout__)` and
+    `sys.__stdout__.write(token)` both reached the pod log in plaintext. Neither is an fd-level
+    write nor a re-encoding, so both sat outside the two limits the guard named while the register
+    claimed its covered set was stated exactly. Same shape as the gunicorn hole - a live reference
+    to the pre-wrap object held somewhere the guard did not re-point - and wrappable, so a missed
+    wrap rather than a boundary.
+
+    Driven through `monkeypatch` and read back through a deliberately untyped accessor, because
+    typeshed declares this attribute `Final` and `TextIOWrapper | None`: assigning it directly makes
+    mypy treat every following line as unreachable, which would silently delete the assertions.
+    """
+    secret = "Sh6Dg3F-Zq7-Wx9_Yt2.Ur5~Ip8Ok1Aj"
+    sink = io.StringIO()
+
+    def dunder_stdout() -> Any:
+        return sys.__stdout__
+
+    monkeypatch.setattr(sys, "stdout", sink)
+    monkeypatch.setattr(sys, "__stdout__", sink)
+    install_credential_guard(secret)
+    try:
+        assert isinstance(dunder_stdout(), _GuardedStream), "the dunder stream is unwrapped"
+        # ONE wrapper shared, or a handler re-pointed at one is not recognised via the other.
+        assert dunder_stdout() is sys.stdout, "stdout and its dunder hold different wrappers"
+        print(f"leak via the dunder stream: {secret}", file=dunder_stdout())
+        dunder_stdout().write(f"direct dunder write: {secret}\n")
+        emitted = sink.getvalue()
+    finally:
+        install_credential_guard(None)
+
+    assert dunder_stdout() is sink, "disarming did not restore the dunder stream"
+    assert secret not in emitted, f"the dunder stream leaked the credential: {emitted!r}"
+    assert emitted.count(CREDENTIAL_ALARM) == 2, f"expected two alarms: {emitted!r}"
+
+
 def test_the_runtime_guard_is_armed_by_the_boot_path_and_not_by_the_factory() -> None:
     """WHERE it is armed is part of the control, so it is asserted rather than assumed.
 

@@ -219,10 +219,16 @@ class _GuardedStream:
 
     def write(self, text: str) -> int:
         expected = _GUARDED_CREDENTIAL
-        payload = f"{CREDENTIAL_ALARM}\n" if expected and expected in text else text
+        refused = bool(expected and expected in text)
+        payload = f"{CREDENTIAL_ALARM}\n" if refused else text
         # A stream whose `write` returns None is legal (a review found `int(None)` raising here),
         # and a guard that raises inside someone else's write is worse than the leak it prevents.
-        return int(self._stream.write(payload) or 0)
+        written = int(self._stream.write(payload) or 0)
+        # On a REFUSAL, report the caller's length rather than the alarm's. `write`'s contract lets
+        # a caller loop until everything is written, so returning the alarm's length made such a
+        # caller re-submit the tail of the refused text. Not reachable through `print` or
+        # `StreamHandler`, both of which discard the return, so this was a trap rather than a fault.
+        return len(text) if refused else written
 
     def writelines(self, lines: Any) -> None:
         for line in lines:
@@ -260,8 +266,8 @@ def _guard_handler(handler: logging.Handler) -> None:
     stream = getattr(handler, "stream", None)
     if stream is None or isinstance(stream, _GuardedStream):
         return
-    for wrapper in (sys.stdout, sys.stderr):
-        if isinstance(wrapper, _GuardedStream) and stream is wrapper.wrapped:
+    for wrapper in _installed_wrappers():
+        if stream is wrapper.wrapped:
             handler.stream = wrapper  # type: ignore[attr-defined]
             return
 
@@ -277,13 +283,23 @@ def install_credential_guard(expected: str | None) -> None:
     WHAT IT DOES NOT COVER, named because the previous version of this docstring said "every channel
     that leaves this process" and a review then took seven of them:
 
-      ● **fd-level writes.** `os.write(1, ...)` and a subprocess inheriting file descriptor 1 do not
-        pass through any Python object this touches.
+      ● **Anything reaching file descriptor 1 or 2 without going through a wrapped object.**
+        `os.write(1, ...)`, a subprocess inheriting the descriptor, `sys.stdout.buffer.write`,
+        `open("/dev/stdout", "w")` and `os.fdopen(1)` are INSTANCES of that class, not the set:
+        a new handle on the same descriptor is a new instance, and enumerating them would be the
+        same mistake this module's history is made of.
       ● **Any encoding but plaintext.** The comparison is a substring test against the credential as
         configured, so base64, hex or a reversal passes. This is a deliberate boundary - the
         emitting code chose the encoding, and matching every encoding is not possible - but it means
         this guard IS an enumeration, over (channel x encoding), and both dimensions belong to the
         same adversary who chose the acquisition route.
+
+      ● **An adversary with the same privilege as the code being guarded.**
+        `logging.config.dictConfig` with `{".": {"filters": []}}`, a `Handler` subclass overriding
+        `handle`, reassigning this module's own state, or restoring `logging.Handler.__init__` each
+        removes the control in a few lines from inside the process. That is inherent to ANY
+        in-process guard rather than a defect in this one, and it is stated so a reader does not
+        have to infer it.
 
     That last point is the honest correction to how this was described. It was called "the only one
     that does not depend on enumerating the adversary's alphabet". It is not: it swapped an alphabet
@@ -300,10 +316,7 @@ def install_credential_guard(expected: str | None) -> None:
     if not expected:
         _restore_streams()
         return
-    if not isinstance(sys.stdout, _GuardedStream):
-        sys.stdout = _GuardedStream(sys.stdout)
-    if not isinstance(sys.stderr, _GuardedStream):
-        sys.stderr = _GuardedStream(sys.stderr)
+    _wrap_streams()
     # Every handler that already exists, including gunicorn's and uvicorn's, which are built before
     # the worker imports this module.
     for handler in _existing_handlers():
@@ -335,12 +348,73 @@ def _existing_handlers() -> list[logging.Handler]:
     return found
 
 
+# Every attribute of `sys` that names a text stream leaving this process. `__stdout__` and
+# `__stderr__` are in this list because a review measured the consequence of their absence: they
+# hold the PRE-WRAP objects, permanently, one underscore from the covered name, and
+# `print(token, file=sys.__stdout__)` landed in the pod log in plaintext. That is neither an
+# fd-level write nor a re-encoding, so it sat outside both limits this module names while the
+# register claimed the covered set was stated exactly.
+#
+# It is the same shape as the gunicorn hole: a live reference to the pre-wrap object held somewhere
+# the guard did not re-point. The standard library guarantees such a reference exists, so it is a
+# missed wrap rather than a boundary, and it is wrapped.
+# Documentation of the covered attributes, and what a test asserts the code handles. The code
+# itself writes them out explicitly rather than looping with `getattr`, because the project's own
+# introspection guard refuses a computed attribute name and a control that exempts its own module
+# is not a control.
+GUARDED_STREAM_ATTRIBUTES = ("stdout", "stderr", "__stdout__", "__stderr__")
+
+
+def _wrap_streams() -> None:
+    """Wrap every `sys` text stream, sharing one wrapper per underlying object.
+
+    SHARED deliberately: `sys.stdout` and `sys.__stdout__` are normally the same object, and two
+    wrappers over one stream would mean a handler re-pointed at one of them is not recognised as
+    guarded by a check against the other.
+    """
+    # EXPLICIT attribute access, not `getattr(sys, name)` in a loop. The loop was the obvious way
+    # to write this and the project's own guard refused it, correctly: a computed attribute name is
+    # exactly what a static rule about attribute names cannot see, and a control that exempts the
+    # module implementing it is not a control. Four attributes, written out.
+    wrappers: dict[int, _GuardedStream] = {}
+
+    def wrap(stream: Any) -> Any:
+        if stream is None or isinstance(stream, _GuardedStream):
+            return stream
+        # SHARED per underlying object: `sys.stdout` and `sys.__stdout__` are normally the same
+        # object, and two wrappers over one stream would mean a handler re-pointed at one is not
+        # recognised as guarded by a check against the other.
+        return wrappers.setdefault(id(stream), _GuardedStream(stream))
+
+    sys.stdout = wrap(sys.stdout)
+    sys.stderr = wrap(sys.stderr)
+    # `# type: ignore[misc]` because typeshed marks these Final. That is a declaration of intent,
+    # not a runtime restriction, and the intent is worth overriding here for one measured reason:
+    # they hold the PRE-WRAP objects permanently, and `print(token, file=sys.__stdout__)` reached
+    # the pod log in plaintext while this module claimed its covered set was stated exactly.
+    sys.__stdout__ = wrap(sys.__stdout__)  # type: ignore[misc]
+    sys.__stderr__ = wrap(sys.__stderr__)  # type: ignore[misc]
+
+
+def _installed_wrappers() -> list[_GuardedStream]:
+    """Every wrapper currently installed on a `sys` stream, for the handler re-point."""
+    return [
+        stream
+        for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__)
+        if isinstance(stream, _GuardedStream)
+    ]
+
+
 def _restore_streams() -> None:
     """Put the real streams back, so arming is reversible within one process."""
     if isinstance(sys.stdout, _GuardedStream):
         sys.stdout = sys.stdout.wrapped
     if isinstance(sys.stderr, _GuardedStream):
         sys.stderr = sys.stderr.wrapped
+    if isinstance(sys.__stdout__, _GuardedStream):
+        sys.__stdout__ = sys.__stdout__.wrapped  # type: ignore[unreachable]
+    if isinstance(sys.__stderr__, _GuardedStream):
+        sys.__stderr__ = sys.__stderr__.wrapped  # type: ignore[unreachable]
 
 
 def _patch_handler_construction() -> None:
