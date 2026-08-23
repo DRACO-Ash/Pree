@@ -152,9 +152,10 @@ the assessment store.
 | Every boolean audit field is value-pinned on every kind that emits it, across the token axis | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it`, `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 | Every closed-set value pin equals what the application can emit, in both directions, and a closed-set field is emitted as a literal | `tests/test_api.py` | `test_every_closed_set_pin_is_exactly_what_the_application_can_emit`, `test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit` |
 | The credential is read only at named (module, function) pairs, under any spelling, in every subpackage | `src/pree/security.py` | `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` |
+| The output guard covers handlers it was never told about, including propagated records and handlers built before arming | `src/pree/audit.py` | `test_the_runtime_guard_covers_handlers_it_was_never_told_about` |
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
-| No line carrying the credential leaves the process, by any route, on any output channel | `src/pree/audit.py` | `test_the_runtime_guard_refuses_every_channel_whatever_the_route` |
+| No credential-bearing line reaches any logging handler or a write through `sys.stdout`/`sys.stderr`, in plaintext (NOT fd-level writes, NOT other encodings) | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers` |
 | No representation of a `Config` can print the credential | `src/pree/config.py` | `test_the_config_never_prints_the_credential_in_any_representation` |
 | The HTTP layer is handed a config with no token field and a callable, so the secret is not in its object graph | `src/pree/app.py` | `test_the_service_config_the_http_layer_receives_carries_no_credential` |
 | No audit expression can read the deployment's configuration, so none can encode the credential | `src/pree/app.py` | `test_no_audit_expression_can_reach_the_deployed_credential`, `test_the_http_layer_never_reads_the_deployed_token_at_all` |
@@ -2629,6 +2630,75 @@ answered thirty lines below, and the `repr=False` claim is narrowed to what it d
 credential from the DEFAULT dataclass `__repr__`, so an implicit render is clean and an explicit
 field path or a serialiser is not. Two stale counts ("three readers" where the set names five, then
 four) are corrected with them.
+
+### The guard was bypassed seven ways, and my framing of it was the deeper error
+
+**Two independent causes, both measured under the shipped launch command.** A logger-level filter
+does not run for a record propagated from a DESCENDANT - only the ancestor's handlers do - so a child
+of `pree.audit` walked past the filter on its parent. And `gunicorn.Arbiter.setup` builds its
+handlers before the worker imports the app factory, so they hold the PRE-WRAP stream: measured,
+`gunicorn.error`'s handler had `guarded=False` and `filters=[]`. Replacing the `sys.stdout` OBJECT
+does nothing for a handler that already captured the old one.
+
+Three lines in a request handler then put the credential in the aggregated pod log on an
+unauthenticated 401, with 343 tests and both linters green:
+
+```python
+logging.getLogger("gunicorn.error").error("diag %s", __import__("os").getenv("PREE_TEAM_TOKEN"))
+```
+
+`__import__` appears in no `ast.Import` node, so the import allowlist is blind; `getenv` is not
+`environ`, so the attribute rule is blind. Both static guards saw nothing, correctly, and the
+runtime guard was not attached where the bytes passed.
+
+**Fixed at HANDLER level.** `Handler.handle` runs handler filters for every record that reaches it,
+whatever logger emitted it, which removes the name enumeration entirely. Existing handlers are found
+through two sources (the private `_handlerList` and a manager walk, because either alone has a gap),
+handlers built later are covered by patching `Handler.__init__`, and a handler holding the pre-wrap
+stream is re-pointed at the wrapper. Measured against the reviewer's exact plant, under
+`gunicorn -k uvicorn.workers.UvicornWorker --access-logfile - --error-logfile -`, one unauthenticated
+401: **0 credential occurrences in the pod log, 1 guard alarm.** The static guards still report
+nothing for that plant, which is the honest division of labour rather than a gap.
+
+**And the deeper error was the framing, which the reviewer corrected and I accept in full.** I called
+this "the only one that does not depend on enumerating the adversary's alphabet". That is false. A
+plaintext substring test over a set of channels IS an enumeration - over (channel x encoding) - and
+both dimensions belong to the same adversary who chose the acquisition route. I had swapped an
+alphabet of attribute spellings for a smaller alphabet of channels and encodings, and called it an
+escape.
+
+So the covered set is now stated exactly, in the docstring, in the register row and in the test's own
+name:
+
+● **Covered:** every `logging.Handler` existing at arm time or constructed after it, whatever logger
+  and whether propagated; and every write through the `sys.stdout` / `sys.stderr` objects, including
+  `print`. Plaintext only.
+● **NOT covered, named rather than implied:** fd-level writes (`os.write(1, ...)`, a subprocess
+  inheriting descriptor 1), which pass through no Python object this touches; and any encoding but
+  plaintext, since base64, hex and a reversal all pass. That is a deliberate boundary - the emitting
+  code chose the encoding - and it is a LIMIT, not a property.
+
+What the guard is worth: it catches the two channels a leak has actually used, at the point of
+emission, whatever route acquired the value. That is real, and it is less than I claimed.
+
+Four smaller things from the same review:
+
+● The `_GuardedStream` wrapper was irreversible and incomplete. `writelines`, `fileno` and `buffer`
+  are forwarded now, because their absence would break `subprocess(stdout=sys.stdout)`,
+  `faulthandler.enable()` and `print(file=sys.stdout.buffer)` - and a control that breaks the process
+  is one an operator removes. `int(None)` raised on a stream whose `write` returns None. Disarming
+  restores the real streams rather than leaving the wrapper installed for the process's life.
+  `buffer` and `fileno` are forwarded UNGUARDED, deliberately: withholding them would move the
+  breakage, not the exposure, and the fd route is named as uncovered above.
+● The guard's edge-path test **passed only because an earlier test in the file had left
+  `propagate=False`** on the process-wide logger. In isolation, under `-k`, or shuffled, it failed.
+  A test that depends on another test's side effect is not evidence, and the three lines it covers
+  were not independently established. It sets and restores `propagate` itself now, and passes alone.
+● Two more copies of the `repr=False` absolute, in test docstrings, said the keyword "closes the
+  class". It closes one half: the default `__repr__`. An explicit field path and every serialiser
+  still render the credential.
+● The test named `..._refuses_every_channel_whatever_the_route` exercised one stream and one logger.
+  It is `..._refuses_the_channels_it_covers` now, which is what it asserts.
 
 ## Not accepted, and why it is not a risk here
 

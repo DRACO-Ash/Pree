@@ -3892,7 +3892,7 @@ _MEASURED_LEAK_ROUTES = (
 )
 
 
-def test_the_runtime_guard_refuses_every_channel_whatever_the_route(
+def test_the_runtime_guard_refuses_the_channels_it_covers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The control that is not an enumeration, and the reason it had to exist.
@@ -3984,8 +3984,16 @@ def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
     handler.setFormatter(logging.Formatter("%(message)s"))
     audit_logger = logging.getLogger("pree.audit")
     previous, previous_level = audit_logger.handlers, audit_logger.level
+    # PROPAGATE explicitly. This test passed only because an EARLIER test in the file had called
+    # `build_logger()` and left `propagate=False` on the process-wide logger: run in isolation, with
+    # `-k`, or under a shuffle, the record reached pytest's capture handler, whose `handleError`
+    # re-raises, and the test failed with `TypeError: not enough arguments for format string`. A
+    # test that depends on another test's side effect is not evidence about the code, and the three
+    # guard lines it covers were not independently established.
+    previous_propagate = audit_logger.propagate
     audit_logger.handlers = [handler]
     audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
     install_credential_guard(secret)
     try:
         # Two format placeholders, one argument: `getMessage()` raises inside the filter. The
@@ -3995,13 +4003,17 @@ def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
     finally:
         audit_logger.handlers = previous
         audit_logger.setLevel(previous_level)
+        audit_logger.propagate = previous_propagate
         install_credential_guard(None)
     assert secret not in logged.getvalue(), "a record that could not be rendered leaked the secret"
 
     # The stream fallbacks, on a stream that has neither attribute.
     class _Bare:
-        def write(self, text: str) -> int:
-            return len(text)
+        # `write` returns None, which is legal for a stream and is the case the guard's `or 0`
+        # exists for: `int(None)` raised, so a guard installed over such a stream took the process
+        # down on the first write. A review named it; this is what drives it.
+        def write(self, text: str) -> None:
+            return None
 
         def flush(self) -> None:
             return None
@@ -4010,7 +4022,113 @@ def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
     assert wrapped.isatty() is False
     assert wrapped.encoding == "utf-8"
     wrapped.flush()
-    assert wrapped.write("plain") == 5
+    # A stream whose `write` returns None is legal, and `int(None)` used to raise here.
+    assert wrapped.write("plain") == 0
+
+    # The passthroughs a review measured as breaking real callers by their absence:
+    # `subprocess(stdout=sys.stdout)` needs `fileno`, `faulthandler.enable()` needs it too, and
+    # `print(file=sys.stdout.buffer)` needs `buffer`. Their absence broke nothing shipped today,
+    # which is exactly why it would have been found by an operator rather than by this suite.
+    real = _GuardedStream(sys.__stdout__)
+    assert isinstance(real.fileno(), int)
+    assert real.buffer is not None
+    lines_written: list[str] = []
+
+    class _Recording:
+        def write(self, text: str) -> int:
+            lines_written.append(text)
+            return len(text)
+
+    recorder = _GuardedStream(_Recording())
+    recorder.writelines(["one", "two"])
+    assert lines_written == ["one", "two"], "writelines does not reach the stream"
+
+    # And arming must be REVERSIBLE. It used to leave the wrapper installed for the life of the
+    # process, so every later test ran against a wrapped stdout with no way back.
+    original = sys.stdout
+    install_credential_guard(secret)
+    assert isinstance(sys.stdout, _GuardedStream)
+    install_credential_guard(None)
+    assert sys.stdout is original, "disarming did not restore the real stream"
+
+
+def test_the_runtime_guard_covers_handlers_it_was_never_told_about() -> None:
+    """The bypass that failed the previous round, and why the fix is at HANDLER level.
+
+    The guard was attached to three logger NAMES and it replaced the `sys.stdout` object. A review
+    measured seven channels straight past it, and two independent causes:
+
+      ● A logger-level filter does not run for a record propagated from a DESCENDANT - only the
+        ancestor's handlers do - so `pree.audit.child` walked past the filter on `pree.audit`.
+      ● `gunicorn.Arbiter.setup` builds its handlers before the worker imports the app factory, so
+        they hold the PRE-WRAP stream. Measured under the shipped launch command:
+        `gunicorn.error`'s handler had `guarded=False` and `filters=[]`. Replacing `sys.stdout`
+        does nothing for an object that already captured the old one.
+
+    Three lines in a handler then put the credential in the aggregated pod log on an unauthenticated
+    401 with 343 tests and both linters green.
+
+    So the filter attaches to handlers, existing and future, and a handler holding the pre-wrap
+    stream is re-pointed at the wrapper. `Handler.handle` runs handler filters for every record that
+    reaches it, whatever logger emitted it, which removes the name enumeration.
+
+    Every channel below is a logger this module was NEVER told about, with its handler built BEFORE
+    arming, which is exactly gunicorn's ordering.
+    """
+    secret = "Zq7-Wx9_Yt2.Ur5~Ip8Ok1Aj4Sh6Dg3F"
+    sink = io.StringIO()
+    unknown_names = ("gunicorn.error", "uvicorn.error", "some.brand.new.name", "")
+    restore: list[tuple[logging.Logger, list[logging.Handler], int, bool]] = []
+    for name in unknown_names:
+        logger = logging.getLogger(name)
+        restore.append((logger, logger.handlers, logger.level, logger.propagate))
+        handler = logging.StreamHandler(sink)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.handlers = [handler]
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+    # And a DESCENDANT of the one logger the old version did filter, which propagates to it.
+    parent = logging.getLogger("pree.audit")
+    child = logging.getLogger("pree.audit.child")
+    restore.append((parent, parent.handlers, parent.level, parent.propagate))
+    restore.append((child, child.handlers, child.level, child.propagate))
+    parent_handler = logging.StreamHandler(sink)
+    parent_handler.setFormatter(logging.Formatter("%(message)s"))
+    parent.handlers = [parent_handler]
+    parent.setLevel(logging.INFO)
+    parent.propagate = False
+    child.setLevel(logging.INFO)
+
+    install_credential_guard(secret)
+    try:
+        for name in unknown_names:
+            logging.getLogger(name).error("leak via %s: %s", name or "root", secret)
+        child.info("leak via a propagated descendant: %s", secret)
+        # A handler built AFTER arming, which the construction patch must cover.
+        later = logging.getLogger("made.after.arming")
+        restore.append((later, later.handlers, later.level, later.propagate))
+        later_handler = logging.StreamHandler(sink)
+        later_handler.setFormatter(logging.Formatter("%(message)s"))
+        later.handlers = [later_handler]
+        later.setLevel(logging.INFO)
+        later.propagate = False
+        later.error("leak via a handler built after arming: %s", secret)
+        emitted = sink.getvalue()
+    finally:
+        install_credential_guard(None)
+        for logger, handlers, level, propagate in restore:
+            logger.handlers = handlers
+            logger.setLevel(level)
+            logger.propagate = propagate
+
+    expected_channels = len(unknown_names) + 2
+    assert secret not in emitted, (
+        f"the credential reached a channel the guard was not told about: {emitted!r}"
+    )
+    assert emitted.count(CREDENTIAL_ALARM) == expected_channels, (
+        f"expected one alarm per channel ({expected_channels}), got "
+        f"{emitted.count(CREDENTIAL_ALARM)}: {emitted!r}"
+    )
 
 
 def test_the_runtime_guard_is_armed_by_the_boot_path_and_not_by_the_factory() -> None:
@@ -4167,7 +4285,10 @@ def test_no_module_reaches_the_credential_by_introspection_or_the_environment() 
     So this refuses the LANGUAGE FEATURES that reach past a name, rather than more spellings of a
     name. Two other narrowings landed with it and are recorded where they live: the cell now closes
     over the expected string rather than the whole `Config`, and `Config.team_token` is
-    `repr=False`, which closes the `repr`/f-string/format class in one keyword.
+    `repr=False`, which removes it from the DEFAULT dataclass `__repr__` and only from there: an
+    explicit field path and every serialiser still render it. Two copies of this sentence claimed it
+    "closes the class in one keyword"; both are corrected, and what covers the rest is the runtime
+    guard, within the limits that guard states about itself.
 
     `rglob`, not `glob`. The reader allowlist walked only the top level while its docstring said
     "every module", so the first subpackage would have been outside it silently.
@@ -4198,11 +4319,17 @@ def test_no_module_reaches_the_credential_by_introspection_or_the_environment() 
 def test_the_config_never_prints_the_credential_in_any_representation(tmp_path: Path) -> None:
     """`repr=False` on the field, asserted rather than assumed.
 
-    A review found that `repr()` of a `Config` printed `team_token='Zq7-Wx9_...'` verbatim, so any
-    f-string, `print`, `format` or exception carrying a Config disclosed the credential without
-    spelling a token-shaped attribute. One dataclass keyword closes the class; this is what keeps
-    it closed, and it drives the real renderings rather than inspecting the field metadata, because
-    the metadata is what would be edited alongside the field.
+    A review found that `repr()` of a `Config` printed `team_token='Zq7-Wx9_...'` verbatim, so an
+    implicit render - `print(config)`, `f"{config}"`, an exception carrying one - disclosed the
+    credential without spelling a token-shaped attribute.
+
+    The keyword removes it from the DEFAULT `__repr__` and ONLY from there. An explicit field path
+    (`"{0.team_token}".format(config)`) and every serialiser (`asdict`, `astuple`, `pickle.dumps`,
+    `__getstate__`, `__reduce__`) still render it, all measured. Two copies of this docstring said
+    the keyword "closes the class"; it closes one half of it.
+
+    This drives the real renderings rather than inspecting the field metadata, because the metadata
+    is what would be edited alongside the field.
     """
     secret = "Zq7-Wx9_Yt2.Ur5~Ip8Ok1Aj4Sh6Dg3F"
     config = make_config(tmp_path, PREE_TEAM_TOKEN=secret)

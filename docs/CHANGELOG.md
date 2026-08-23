@@ -1176,6 +1176,31 @@ Tenth security review: two majors, three minors, and the enumeration approach ab
   in place rather than answered thirty lines below, the `repr=False` claim is narrowed to the default
   dataclass `__repr__`, and two stale reader counts are fixed.
 
+Eleventh security review: two majors, three minors, and my framing was the deeper error:
+
+● The runtime guard was bypassed SEVEN ways. A logger-level filter does not run for a record
+  propagated from a descendant, only the ancestor's handlers do; and gunicorn builds its handlers
+  before the worker imports the factory, so they hold the pre-wrap stream - measured,
+  `gunicorn.error`'s handler had `guarded=False, filters=[]`. Three lines put the credential in the
+  pod log on an unauthenticated 401 with everything green, acquiring it via
+  `__import__("os").getenv(...)`, which no `ast.Import` node contains.
+● Fixed at HANDLER level: `Handler.handle` runs handler filters for every record reaching it,
+  whatever logger emitted it. Existing handlers found through two sources, later ones covered by
+  patching `Handler.__init__`, and a handler holding the pre-wrap stream re-pointed at the wrapper.
+  Measured against the exact plant under the real launch command: 0 credential occurrences, 1 alarm.
+● **The framing was the deeper error and the reviewer was right.** I called the guard "the only one
+  that does not depend on enumerating the adversary's alphabet". A plaintext substring test over a
+  set of channels IS an enumeration, over (channel x encoding), and both dimensions belong to the
+  same adversary. The covered set is now stated exactly and the uncovered set named: fd-level writes
+  (`os.write(1, ...)`, a subprocess inheriting descriptor 1) and any encoding but plaintext.
+● `_GuardedStream` was irreversible and incomplete: `writelines`, `fileno` and `buffer` forwarded
+  now, `int(None)` no longer raises, and disarming restores the real streams. `buffer` and `fileno`
+  are forwarded unguarded, deliberately, since withholding them moves the breakage not the exposure.
+● The guard's edge-path test passed only because an earlier test left `propagate=False` on the
+  process-wide logger; it failed in isolation. It manages `propagate` itself now.
+● Two more copies of the `repr=False` absolute corrected, and the over-claiming test name changed to
+  what it asserts.
+
 Continuous integration, which closes the standing container gap:
 
 ● `.github/workflows/verify.yml` runs the verification loop and the pipeline simulation on a runner
