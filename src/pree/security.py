@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hmac
 import re
+from collections.abc import Callable
 
 from .config import Config
 
@@ -61,12 +62,33 @@ def authorise(config: Config, presented: str | None) -> None:
 
     With no token configured the app is in single-user local mode and the gate is open by
     design. With a token configured every gated route requires it.
+
+    This function and `token_verifier` below are the ONLY readers of `config.team_token` in the
+    whole application, which is a property `test_the_credential_has_exactly_one_reader` asserts
+    across every module rather than a convention.
     """
     if not config.auth_enabled:
         return
     expected = config.team_token
     if expected is None or not token_matches(presented, expected):
         raise AuthError("token rejected")
+
+
+def token_verifier(config: Config) -> Callable[[str | None], None]:
+    """Close over the credential once, and hand the caller a callable instead of a secret.
+
+    The BOUNDARY. A security review defeated the previous protection twice in nine lines, because
+    it was a static rule about how the name `config` was spelt inside an audit expression, and the
+    attacker picks the names: a helper called as `helper(config, exc)` in another module, and a
+    helper whose parameter was named `cfg`, each recovered the deployed token verbatim from the pod
+    log on an unauthenticated 401.
+
+    So the HTTP layer is handed this closure and a `ServiceConfig` that has no token field. The
+    credential is then reachable only from inside this function's cell, which no expression in
+    `app.py` can name, and the class of attack closes by construction rather than by a walk that
+    has to be right about every spelling.
+    """
+    return lambda presented: authorise(config, presented)
 
 
 def sanitise_actor(value: str | None) -> str:

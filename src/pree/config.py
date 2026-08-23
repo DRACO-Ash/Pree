@@ -44,8 +44,49 @@ class ConfigError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class ServiceConfig:
+    """Everything the HTTP layer needs, and DELIBERATELY not the team token.
+
+    This type exists because a security review defeated the previous protection twice in nine
+    lines. That protection was a static rule refusing `config.<attr>` inside an expression that
+    reaches an audit record, plus a pin on which `config` attributes the HTTP layer reads. Both
+    checked the SPELLING of a name rather than the flow of a value, so two variants walked
+    straight past them: a helper in another module called as `helper(config, exc)`, and a helper
+    in the same module whose parameter was named `cfg` rather than `config`. Either recovered the
+    deployed credential verbatim from the pod log on every unauthenticated 401.
+
+    A name-based rule will always lose that race, because the attacker chooses the names. So the
+    credential is not in this object. `create_app` is handed a `ServiceConfig` and a callable, and
+    nothing in the HTTP layer's object graph carries the token under ANY spelling: there is no
+    attribute to reach, so no helper, parameter name, module, or encoding can reach it.
+
+    `auth_enabled` and `token_length` are carried as precomputed FACTS rather than derived from the
+    value, because `/diagnostics` needs both and neither discloses the credential. Without them a
+    stale token is invisible on a deployed pod: every client gets 401, and the read-out that would
+    show it sits behind the very token that is wrong.
+    """
+
+    port: int
+    data_dir: Path
+    allowed_origin: str | None
+    environment: str
+    build_id: str
+    data_dir_was_configured: bool
+    auth_enabled: bool
+    token_length: int
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
-    """The resolved runtime contract. Immutable once boot has validated it."""
+    """The resolved runtime contract, including the credential. Immutable once boot validated it.
+
+    Held by the boot path only. `split()` is the boundary: past it, the credential exists solely
+    inside one closure and the HTTP layer holds a callable instead of a secret.
+    """
 
     port: int
     data_dir: Path
@@ -63,6 +104,19 @@ class Config:
     def auth_enabled(self) -> bool:
         """Authentication is on exactly when a team token is configured."""
         return self.team_token is not None
+
+    def for_service(self) -> ServiceConfig:
+        """The token-free view the HTTP layer receives."""
+        return ServiceConfig(
+            port=self.port,
+            data_dir=self.data_dir,
+            allowed_origin=self.allowed_origin,
+            environment=self.environment,
+            build_id=self.build_id,
+            data_dir_was_configured=self.data_dir_was_configured,
+            auth_enabled=self.auth_enabled,
+            token_length=len(self.team_token or ""),
+        )
 
 
 def _read(env: dict[str, str], name: str) -> str | None:

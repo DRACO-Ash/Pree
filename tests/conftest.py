@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pree.app import create_app
 from pree.config import Config, load_config
 from pree.health import StorageProber
+from pree.security import token_verifier
 from pree.store import JsonStore
 
 # At least MIN_PRODUCTION_TOKEN_LENGTH characters, so the production configurations the
@@ -60,7 +61,14 @@ def build_client(
     """Mount the app in-process through the factory, with the store seeded."""
     store = JsonStore(config.data_dir)
     store.seed()
-    app = create_app(config, store, logger=logger, prober=pool, **deps)  # type: ignore[arg-type]
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=logger,
+        prober=pool,
+        **deps,  # type: ignore[arg-type]
+    )
     return TestClient(app)
 
 

@@ -151,6 +151,8 @@ the assessment store.
 | The audited path EQUALS the recomputed scrub of the target, so nothing can be appended to it | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
 | Every boolean audit field is value-pinned on every kind that emits it, across the token axis | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it`, `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 | Every closed-set value pin equals what the application can emit, in both directions, and a closed-set field is emitted as a literal | `tests/test_api.py` | `test_every_closed_set_pin_is_exactly_what_the_application_can_emit`, `test_the_confidence_pin_is_exactly_the_tiers_the_application_can_emit` |
+| The credential is read in exactly three functions in the whole package, under any spelling | `src/pree/security.py` | `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` |
+| The HTTP layer is handed a config with no token field and a callable, so the secret is not in its object graph | `src/pree/app.py` | `test_the_service_config_the_http_layer_receives_carries_no_credential` |
 | No audit expression can read the deployment's configuration, so none can encode the credential | `src/pree/app.py` | `test_no_audit_expression_can_reach_the_deployed_credential`, `test_the_http_layer_never_reads_the_deployed_token_at_all` |
 | Every caller-influenced audit value is recomputed from the request, not shape-checked | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
 | Every boolean audit field names the test that correlates its value | `tests/test_api.py` | `test_every_boolean_audit_field_names_a_test_that_correlates_it` |
@@ -2413,6 +2415,77 @@ runner with a working daemon is a failure.
   failure**: the account is created and the image runs as `10001:10001`, which the third assertion
   measured directly. Recorded so it is not mistaken for a finding later, and not silenced, because
   silencing a warning is how a real one gets lost.
+
+### The credential leaves the HTTP layer: closing the class by construction, not by a walk
+
+**A BLOCKER, and the most important architectural change in this project.** The previous round
+closed the credential channel by scope: a static rule refusing `config.<attr>` inside any expression
+that reaches an audit record, plus a pin on which `config` attributes `app.py` reads. The next review
+defeated both **twice, in nine lines, with the whole loop green at 335 tests**:
+
+● A helper in `security.py` - the one module that legitimately reads the token, and the one the
+  emission walk did not cover - called as `rejection_reason(config, exc)` from the `auth_reject`
+  record.
+● A helper in `app.py` whose parameter was named `cfg` rather than `config`, so `cfg.team_token`
+  was not a read of anything spelt `config`.
+
+Either recovered the deployed token **verbatim** from the pod log on every unauthenticated 401.
+
+**Both rules checked the SPELLING of a name rather than the flow of a value, and the attacker
+chooses the names.** That is the whole lesson, and it generalises past this control: a static rule
+naming what must not appear is a denylist over an alphabet the adversary controls.
+
+**The fix removes the credential from the HTTP layer's object graph.** `create_app` now takes a
+`ServiceConfig`, which has no token field, plus `verify_token`, a callable closed over the credential
+by `security.token_verifier`. `main.py` takes that boundary before it even writes the boot line, so
+the length in that line comes from the token-free view rather than from the token. Measured directly
+rather than asserted:
+
+```
+full Config has the token:       'sV8kQ2mZ-...'
+ServiceConfig fields:            port, data_dir, allowed_origin, environment, build_id,
+                                 data_dir_was_configured, auth_enabled, token_length
+getattr(svc, 'team_token', None): None
+any attribute holding it?        []
+correct token accepted:          True
+wrong token refused:             AuthError token rejected
+```
+
+There is no attribute to reach, so no helper, parameter name, module, or encoding in `app.py` can
+reach it. Two tests keep that true, and both are ALLOWLISTS over the whole package rather than
+denylists of spellings:
+
+● `test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package` walks every module
+  in `src/pree/` and refuses any attribute named `team_token` on any base under any spelling,
+  outside three permitted functions. Variant A above turns it red.
+● `test_the_service_config_the_http_layer_receives_carries_no_credential` asserts the type has no
+  token field, that its only secret-shaped field is `token_length`, and that `app.py` does not
+  import `Config` at all. Restoring the field turns it red.
+
+**A MAJOR alongside it: four audited values were shape-checked only**, and the register's claim that
+"every caller-influenced value is now recomputed" was therefore false. `status` was bounded to
+400-599, so `400 + (exc.status_code % 7) * 13` made the record disagree with the response it
+describes at about 7.6 bits per unauthenticated 404. `error_count` admitted about 12.4 bits.
+`errors[].type` was pattern-checked, and **unpadded lowercase base32 fits `^[a-z0-9_.]{0,64}$` and
+is not one of the six encodings the secrecy sweep enumerates**, so it carried a whole credential;
+padded base32 was caught, by one character of padding, which is the sweep working by accident. All
+four are now recomputed against what the driven request produced.
+
+Two minors closed with them:
+
+● The `reason` recomputation was a PREFIX match on every kind, leaving 512 minus 14 free printable
+  characters on `auth_reject` - the exact channel the blocker used. It is equality now, and
+  `store_error`'s configured path is recomputed from the data directory rather than conceded as an
+  arbitrary suffix.
+● The unresolvable-payload self-assertion was bypassable by a decoy: a `dict(...)` payload beside
+  any unreached dict literal in the same call left the count at zero, so the record's fields went
+  unchecked while the guard reported success. It now resolves the argument actually passed, through
+  at most one level of name binding, and counts anything it cannot follow.
+
+**And the honest reading of this round, which the reviewer put better than I would have.** The
+diagnosis of the class was right, and a sampled axis genuinely cannot close it. What did not survive
+was the *implementation* of the closure, because both rules tested the spelling of a name rather than
+the flow of a value. The structural change is the one that stops needing a walk to be right.
 
 ## Not accepted, and why it is not a risk here
 

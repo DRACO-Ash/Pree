@@ -1092,6 +1092,32 @@ approach changed rather than the code:
   earlier series. They have never collided, so the sweep is scoped to the three audit-layer headings
   and the entry says so.
 
+Eighth security review: a blocker, a major and two minors, and the architecture changed:
+
+● The scope closure was defeated TWICE in nine lines with the whole loop green: a helper in
+  `security.py` called as `rejection_reason(config, exc)`, and a helper in `app.py` whose parameter
+  was named `cfg`. Either recovered the deployed token verbatim from the pod log on an
+  unauthenticated 401. Both rules checked the SPELLING of a name rather than the flow of a value,
+  and the attacker chooses the names.
+● **The credential now leaves the HTTP layer entirely.** `create_app` takes a `ServiceConfig` with
+  no token field plus a `verify_token` callable closed over the credential, and `main.py` takes that
+  boundary before it writes the boot line, so even the logged length comes from the token-free view.
+  There is no attribute to reach, so no helper, parameter name, module or encoding in `app.py` can
+  reach it. Two allowlist tests keep it true: the credential is read in exactly three functions
+  across the whole package under any spelling, and the type the HTTP layer receives has no token
+  field and does not import `Config`.
+● Four audited values were shape-checked only, so the claim that every caller-influenced value is
+  recomputed was false. `status` was bounded to 400-599, so a record could disagree with the
+  response it describes at about 7.6 bits per 404; `error_count` admitted about 12.4; and
+  `errors[].type` was pattern-checked, where unpadded lowercase base32 fits the charset, is not one
+  of the six encodings swept, and carried a whole credential. All four are recomputed now.
+● The `reason` recomputation was a prefix match, leaving 498 free printable characters on
+  `auth_reject`, which is the channel the blocker used. Equality now, with `store_error`'s path
+  recomputed from the data directory.
+● The unresolvable-payload self-assertion was bypassable by a decoy dict literal in the same call.
+  It resolves the argument actually passed, through one level of binding, and counts what it cannot
+  follow.
+
 Continuous integration, which closes the standing container gap:
 
 ● `.github/workflows/verify.yml` runs the verification loop and the pipeline simulation on a runner

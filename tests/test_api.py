@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import dataclasses
 import errno
 import inspect
 import io
@@ -48,6 +49,7 @@ from pree.app import (
     create_app,
 )
 from pree.audit import audit, build_logger
+from pree.config import ServiceConfig
 from pree.health import StorageProber
 from pree.main import build
 from pree.ratelimit import GLOBAL_LIMIT, RateLimiter
@@ -59,6 +61,7 @@ from pree.security import (
     sanitise_actor,
     sanitise_log_part,
     sanitise_log_path,
+    token_verifier,
 )
 from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, PRODUCTION_TOKEN, TEST_TOKEN, build_client, make_config
@@ -134,7 +137,12 @@ def _app_in(env: str) -> Iterator[Any]:
         config = make_config(Path(directory), **overrides)
         prober = StorageProber(cache_seconds=0.0)
         try:
-            yield create_app(config, JsonStore(config.data_dir), prober=prober)
+            yield create_app(
+                config.for_service(),
+                JsonStore(config.data_dir),
+                verify_token=token_verifier(config),
+                prober=prober,
+            )
         finally:
             prober.shutdown()
 
@@ -536,6 +544,15 @@ ACTOR_HEADER = "x-pree-actor"
 # The literal each handler's reason begins with, so the field is recomputed rather than
 # charset-checked. `store_error` embeds a configured path after its prefix, which is why the
 # assertion accepts a prefix match for that one and equality for the rest.
+# What the boundary produces for the correlation drive's body, `{"bad": 1}`, against a model with
+# `extra="forbid"` and two required identifiers: one refusal for the unknown field and one for each
+# missing one. Pinned as literals so a change in what the boundary reports is a named failure
+# rather than a widening.
+_EXPECTED_PROBE_ERROR_COUNT = 3
+_EXPECTED_PROBE_ERROR_TYPES = frozenset({"extra_forbidden", "missing"})
+_EXPECTED_PROBE_ERROR_LOCS = frozenset(
+    {("body", "bad"), ("body", "protected_asset_id"), ("body", "candidate_id")}
+)
 _EXPECTED_REASONS = {
     "auth_reject": "token rejected",
     "http_reject": "Not Found",
@@ -664,14 +681,47 @@ def _assert_record_recomputes(
                 f"({body[field]!r}); a bound constrains the range and says nothing about the "
                 f"mantissa, which carries four credential bytes per write"
             )
+    # EQUALITY, not a prefix. The prefix form left 512 minus 14 free printable characters on
+    # `auth_reject`, and that tail is exactly the channel a review used to recover the whole
+    # credential from an unauthenticated 401. `store_error` embeds a configured path, so its
+    # expectation is RECOMPUTED from the data directory rather than conceded as a suffix.
     if "reason" in record:
-        assert record["reason"] == _EXPECTED_REASONS[kind] or record["reason"].startswith(
-            _EXPECTED_REASONS[kind]
-        ), (
-            f"the {kind} reason {record['reason']!r} does not begin with the handler's own text "
-            f"({_EXPECTED_REASONS[kind]!r}); this field permits 512 printable characters, which is "
-            f"room for the credential in any encoding on a record needing no token"
+        expected_reason = (
+            f"snapshot at {seen['data_dir']}/assessments.json.bak is unreadable"
+            if kind == "store_error"
+            else _EXPECTED_REASONS[kind]
         )
+        assert record["reason"] == expected_reason, (
+            f"the {kind} reason {record['reason']!r} is not the handler's own text "
+            f"({expected_reason!r}); this field permits 512 printable characters, which is room "
+            f"for the credential in any encoding on a record needing no token"
+        )
+    # The STATUS against the response, not merely inside 400-599.
+    if "status" in record:
+        assert record["status"] == seen["status"], (
+            f"the {kind} record says status {record['status']} while the response was "
+            f"{seen['status']}; a record that disagrees with the response it describes is a "
+            f"channel, and the 400-599 bound admits about 7.6 bits of one"
+        )
+    if kind == "validation_reject":
+        # `error_count` against the errors the boundary actually produced for this body, and the
+        # `loc` and `type` of each against what it can produce. `type` is pydantic's vocabulary and
+        # was pattern-checked only: unpadded lowercase base32 fits `^[a-z0-9_.]{0,64}$`, is not one
+        # of the six encodings the secrecy sweep enumerates, and carried the whole credential.
+        assert record["error_count"] == _EXPECTED_PROBE_ERROR_COUNT, (
+            f"the driven body produces {_EXPECTED_PROBE_ERROR_COUNT} boundary errors and the "
+            f"record says {record['error_count']}; the derived ceiling admits about 12.4 bits"
+        )
+        for item in record["errors"]:
+            assert item["type"] in _EXPECTED_PROBE_ERROR_TYPES, (
+                f"the boundary reported error type {item['type']!r}, which is outside what this "
+                f"body can produce ({sorted(_EXPECTED_PROBE_ERROR_TYPES)}); the charset pin admits "
+                f"64 characters of anything lowercase, which is room for a whole credential"
+            )
+            assert tuple(item["loc"]) in _EXPECTED_PROBE_ERROR_LOCS, (
+                f"the boundary reported loc {item['loc']!r}, which is not a field this body sent "
+                f"({sorted(_EXPECTED_PROBE_ERROR_LOCS)})"
+            )
     # EVERY encoding, not verbatim and hex. Base64 is what the gate used on `reason` precisely
     # because the two-form sweep did not look for it, and a sweep enumerating forms will always be
     # one short - so this is the honest limit of this assertion, and the scope closure above is
@@ -721,6 +771,11 @@ def _every_kind_with(
         "store_error": "/v1/assessments/a:b",
     }
     body: dict[str, Any] = {}
+    # The response status each drive actually received, so the audited `status` can be recomputed
+    # against it rather than merely bounded to 400-599. `400 + (exc.status_code % 7) * 13` sat
+    # inside that bound and made the record disagree with the response it describes, about 7.6 bits
+    # per unauthenticated 404, with the whole suite green.
+    statuses: dict[str, int] = {}
     with build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0)) as probe:
         # audit: the SUCCESS record, which no earlier version of this exercise reached, so its
         # `key`, `actor`, `score` and `evidence_coverage` were shape-checked and never recomputed.
@@ -736,23 +791,31 @@ def _every_kind_with(
         assert accepted.status_code == 200, accepted.text
         body = accepted.json()
         # auth_reject: a gated route with the wrong token, which needs no token at all.
-        probe.get(f"{targets['auth_reject']}{query}", headers={"x-pree-token": "wrong"})
+        statuses["auth_reject"] = probe.get(
+            f"{targets['auth_reject']}{query}", headers={"x-pree-token": "wrong"}
+        ).status_code
         # validation_reject: authenticated, body refused at the boundary.
-        probe.post(f"{targets['validation_reject']}{query}", headers=auth, json={"bad": 1})
+        statuses["validation_reject"] = probe.post(
+            f"{targets['validation_reject']}{query}", headers=auth, json={"bad": 1}
+        ).status_code
         # http_reject: a route that does not exist.
-        probe.get(f"{targets['http_reject']}{query}", headers=auth)
+        statuses["http_reject"] = probe.get(
+            f"{targets['http_reject']}{query}", headers=auth
+        ).status_code
         # cors_reject: a preflight from a disallowed origin.
-        probe.options(
+        statuses["cors_reject"] = probe.options(
             f"{targets['cors_reject']}{query}",
             headers={
                 "Origin": "https://evil.test",
                 "Access-Control-Request-Method": "POST",
             },
-        )
+        ).status_code
         # store_error: a corrupt snapshot AND a corrupt backup, so the real 503 path runs.
         (config.data_dir / "assessments.json").write_text("{ not json", encoding="utf-8")
         (config.data_dir / "assessments.json.bak").write_text("nor this", encoding="utf-8")
-        probe.get(f"{targets['store_error']}{query}", headers=auth)
+        statuses["store_error"] = probe.get(
+            f"{targets['store_error']}{query}", headers=auth
+        ).status_code
 
     # EVERY record, not only the ones carrying `had_query`. Selecting on that field left the
     # `audit` kind outside the correlation entirely, so its four caller-influenced values were
@@ -766,7 +829,13 @@ def _every_kind_with(
         kind = record.get("kind")
         if kind not in targets:
             continue
-        observed[kind] = {"record": record, "target": targets[kind], "body": body}
+        observed[kind] = {
+            "record": record,
+            "target": targets[kind],
+            "body": body,
+            "status": statuses.get(kind),
+            "data_dir": config.data_dir,
+        }
     return observed
 
 
@@ -843,7 +912,13 @@ def test_a_server_that_puts_the_query_in_raw_path_still_cannot_reach_the_audit_f
 
     store = JsonStore(config.data_dir)
     store.seed()
-    app = create_app(config, store, logger=logger, prober=StorageProber(cache_seconds=0.0))
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=logger,
+        prober=StorageProber(cache_seconds=0.0),
+    )
     with TestClient(_RawPathCarriesTheQuery(app)) as hostile:
         refused = hostile.get(
             f"/diagnostics?x-pree-token={TEST_TOKEN}", headers={"x-pree-token": "wrong"}
@@ -899,7 +974,13 @@ def test_the_audited_path_falls_back_when_no_usable_raw_path_is_supplied(
 
     store = JsonStore(config.data_dir)
     store.seed()
-    app = create_app(config, store, logger=logger, prober=StorageProber(cache_seconds=0.0))
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=logger,
+        prober=StorageProber(cache_seconds=0.0),
+    )
     with TestClient(_ReplaceRawPath(app)) as stripped:
         refused = stripped.get("/diagnostics", headers={"x-pree-token": "wrong"})
         assert refused.status_code == 401, refused.text
@@ -1005,7 +1086,13 @@ def test_a_bodiless_status_stays_bodiless(tmp_path: Path) -> None:
     logger = build_logger(io.StringIO())
     store = JsonStore(tmp_path / "data")
     store.seed()
-    app = create_app(config, store, logger=logger, prober=StorageProber(cache_seconds=0.0))
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=logger,
+        prober=StorageProber(cache_seconds=0.0),
+    )
 
     @app.get("/test-only/no-content")
     async def _no_content() -> None:
@@ -1396,7 +1483,11 @@ def test_the_frame_guard_is_the_outermost_middleware(tmp_path: Path) -> None:
     store = JsonStore(tmp_path / "data")
     store.seed()
     app = create_app(
-        config, store, logger=build_logger(io.StringIO()), prober=StorageProber(cache_seconds=0.0)
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=build_logger(io.StringIO()),
+        prober=StorageProber(cache_seconds=0.0),
     )
     names = [
         middleware.cls.__name__
@@ -1791,7 +1882,13 @@ def test_a_failing_store_returns_a_generic_503_and_still_audits_the_action(
     store = RefusingStore(config.data_dir)
     store.seed()
     buffer = io.StringIO()
-    app = create_app(config, store, logger=build_logger(buffer), prober=prober)
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=build_logger(buffer),
+        prober=prober,
+    )
     with TestClient(app, raise_server_exceptions=False) as failing:
         response = failing.post(
             "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": FORGING_ACTOR}
@@ -1915,7 +2012,13 @@ def test_a_real_storage_refusal_returns_503_and_audits_the_action(
     store = JsonStore(config.data_dir)
     store.seed()
     buffer = io.StringIO()
-    app = create_app(config, store, logger=build_logger(buffer), prober=prober)
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=build_logger(buffer),
+        prober=prober,
+    )
 
     def refuse(*_: object, **__: object) -> object:
         raise PermissionError(13, "permission denied")
@@ -2016,7 +2119,13 @@ def test_the_liveness_routes_never_occupy_the_shared_request_threadpool(
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
     store = JsonStore(config.data_dir)
     store.seed()
-    app = create_app(config, store, logger=quiet_logger, prober=prober)
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=quiet_logger,
+        prober=prober,
+    )
     by_path = {
         getattr(route, "path", ""): route
         for route in _all_routes(app)
@@ -3439,6 +3548,40 @@ def _bound_record_dicts(tree: ast.Module) -> dict[str, ast.Dict]:
     return bound
 
 
+def _audit_call_fields(node: ast.Call, parameters: list[str]) -> list[tuple[str, ast.expr]]:
+    """Each (field, expression) an `audit()` call supplies, positional and keyword.
+
+    Positional arguments are bound to the real signature rather than to hard-coded indices,
+    because an index would be a second copy of the parameter order and would drift from it.
+    """
+    fields: list[tuple[str, ast.expr]] = [
+        (parameters[index], value)
+        for index, value in enumerate(node.args)
+        if index < len(parameters)
+    ]
+    fields.extend((argument.arg, argument.value) for argument in node.keywords if argument.arg)
+    return fields
+
+
+def _resolve_payload(argument: ast.expr, bound: dict[str, ast.Dict]) -> ast.Dict | None:
+    """The dict literal a logger argument actually carries, or None if it cannot be followed.
+
+    Unwraps the `json.dumps(...)` the application wraps every record in, then follows at most one
+    level of name binding, which is what `audit.py` uses. Anything else - a `dict(...)` call, a
+    comprehension, a second level of binding - returns None and is COUNTED as unresolved, so it
+    fails loudly instead of being skipped while a decoy elsewhere in the same call kept the count
+    at zero.
+    """
+    inner = argument
+    while isinstance(inner, ast.Call) and inner.args:
+        inner = inner.args[0]
+    if isinstance(inner, ast.Dict):
+        return inner
+    if isinstance(inner, ast.Name) and inner.id in bound:
+        return bound[inner.id]
+    return None
+
+
 def _emissions_in(module: ModuleType) -> tuple[list[_Emission], int]:
     """Every audit emission expression in one module, and how many payloads went unresolved.
 
@@ -3469,12 +3612,8 @@ def _emissions_in(module: ModuleType) -> tuple[list[_Emission], int]:
             continue
         called = node.func
         if isinstance(called, ast.Name) and called.id == "audit":
-            for index, value in enumerate(node.args):
-                if index < len(audit_parameters):
-                    emit(value, audit_parameters[index])
-            for argument in node.keywords:
-                if argument.arg:
-                    emit(argument.value, argument.arg)
+            for field, value in _audit_call_fields(node, audit_parameters):
+                emit(value, field)
             continue
         if not isinstance(called, ast.Attribute) or not isinstance(called.value, ast.Name):
             continue
@@ -3483,16 +3622,20 @@ def _emissions_in(module: ModuleType) -> tuple[list[_Emission], int]:
         # refuse the tree it was measuring.
         if called.value.id not in _AUDIT_LOGGER_NAMES or called.attr not in _LOG_EMIT_METHODS:
             continue
-        payloads = [
-            inner
-            for argument in node.args
-            for inner in ast.walk(argument)
-            if isinstance(inner, ast.Dict) or (isinstance(inner, ast.Name) and inner.id in bound)
-        ]
-        if not payloads:
-            unresolved += 1
-        for payload in payloads:
-            record = payload if isinstance(payload, ast.Dict) else bound[payload.id]
+        # The payload ACTUALLY passed, resolved from the call's first positional argument through
+        # at most one level of name binding. Walking the whole argument for any dict literal was
+        # bypassable by a decoy: a `dict(...)` payload beside any unreached dict literal in the same
+        # call left `unresolved` at zero, so the emitted record's fields went unchecked while this
+        # guard reported success. That is the decoy trick already recorded for the `outcome` pin,
+        # one level up.
+        payloads = []
+        for argument in node.args:
+            resolved_payload = _resolve_payload(argument, bound)
+            if resolved_payload is None:
+                unresolved += 1
+            else:
+                payloads.append(resolved_payload)
+        for record in payloads:
             for key, value in zip(record.keys, record.values, strict=True):
                 emit(value, str(key.value if isinstance(key, ast.Constant) else "?"))
     return found, unresolved
@@ -3553,6 +3696,112 @@ def test_every_boolean_audit_field_names_a_test_that_correlates_it() -> None:
     assert frozenset(_BOOLEAN_CORRELATIONS) == AUDIT_BOOLEAN_FIELDS, (
         "the boolean field set is no longer derived from the correlation registry, so a field can "
         "be pinned by name with nothing asserting its value"
+    )
+
+
+# The functions permitted to read the credential, and nothing else in the whole package. An
+# ALLOWLIST of readers, because the previous protection was a denylist of spellings and the
+# attacker picks the spellings.
+CREDENTIAL_READERS = frozenset(
+    {
+        # The compare itself, and the closure that hands the HTTP layer a callable instead.
+        "authorise",
+        "token_verifier",
+        # Config's own derivations of the token-free facts the service layer receives.
+        "auth_enabled",
+        "for_service",
+    }
+)
+# Where the credential may be read from. `main.py` is the boot path, which legitimately holds a
+# full Config; the module set is pinned so a new module cannot quietly join.
+CREDENTIAL_READER_MODULES = frozenset({"security.py", "config.py", "main.py"})
+
+
+def test_the_credential_has_exactly_one_set_of_readers_across_the_whole_package() -> None:
+    """The BLOCKER's fix, and the reason the previous version of this rule was never going to hold.
+
+    The old protection was two static rules: refuse `config.<attr>` inside an expression that
+    reaches an audit record, and pin which `config` attributes `app.py` reads. A security review
+    defeated both twice in nine lines, because both check the SPELLING of a name and the attacker
+    chooses the names:
+
+      ● a helper in `security.py` (unwalked, because the emission walk covers two modules) called
+        as `rejection_reason(config, exc)` from the `auth_reject` record, and
+      ● a helper in `app.py` whose parameter was named `cfg`, so `cfg.team_token` was not a read
+        of anything named `config`.
+
+    Each recovered the deployed token verbatim from the pod log on every unauthenticated 401, with
+    the whole loop green at 335 tests.
+
+    The structural fix is that the HTTP layer no longer has the secret in its object graph:
+    `create_app` takes a `ServiceConfig`, which has no token field, plus a callable closed over the
+    credential. This test is what keeps that true. It is an ALLOWLIST over the whole package rather
+    than a denylist of spellings, so a new reader is a named failure wherever it is added and
+    whatever it calls its parameter.
+    """
+    source_root = Path(app_module.__file__ or "").resolve().parent
+    offenders: list[str] = []
+    for module_path in sorted(source_root.glob("*.py")):
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        # Which function each line belongs to, so a read can be attributed to its enclosing name.
+        owner: dict[int, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                for inner in ast.walk(node):
+                    line = getattr(inner, "lineno", None)
+                    if line is not None:
+                        owner.setdefault(line, node.name)
+        for node in ast.walk(tree):
+            # ANY attribute named team_token, on any base, under any spelling of that base. That is
+            # the whole point: `cfg.team_token`, `c.team_token` and `self.team_token` all count.
+            if not isinstance(node, ast.Attribute) or node.attr != "team_token":
+                continue
+            where = owner.get(node.lineno, "<module level>")
+            if module_path.name in CREDENTIAL_READER_MODULES and where in CREDENTIAL_READERS:
+                continue
+            offenders.append(f"{module_path.name}:{node.lineno} in {where}()")
+    assert not offenders, (
+        f"the deployed credential is read outside its permitted readers "
+        f"{sorted(CREDENTIAL_READERS)}: {offenders}. A reader anywhere else can pass the value to "
+        f"anything, including an audit record, and no rule about how a name is spelt will catch it"
+    )
+
+
+def test_the_service_config_the_http_layer_receives_carries_no_credential() -> None:
+    """The other half: the type itself must not have the field.
+
+    The reader allowlist above constrains who may read `team_token`. This constrains what the HTTP
+    layer is even given, which is what makes the class closed rather than policed: there is no
+    attribute on `ServiceConfig` to reach, so no helper, parameter name, module or encoding in
+    `app.py` can reach it.
+
+    `token_length` is permitted and named explicitly. It is a precomputed integer, not the value,
+    and `/diagnostics` needs it: without it a stale token is invisible on a deployed pod, because
+    every client gets 401 and the read-out that would show it sits behind the wrong token.
+    """
+    fields = {field.name for field in dataclasses.fields(ServiceConfig)}
+    assert "team_token" not in fields, (
+        "ServiceConfig carries the credential, so the HTTP layer has it in scope again and the "
+        "reader allowlist is the only thing standing between it and an audit record"
+    )
+    secret_shaped = {
+        name for name in fields if "token" in name or "secret" in name or "key" in name
+    }
+    assert secret_shaped == {"token_length"}, (
+        f"ServiceConfig carries secret-shaped fields beyond the permitted length: "
+        f"{sorted(secret_shaped - {'token_length'})}"
+    )
+    # And the module must not import the full Config, which would let a caller hand one in.
+    app_source = Path(app_module.__file__ or "").resolve().read_text(encoding="utf-8")
+    imported = {
+        alias.name
+        for node in ast.walk(ast.parse(app_source))
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "Config" not in imported, (
+        "app.py imports the full Config, so a caller can pass one and every expression in the "
+        "module is back in reach of the credential"
     )
 
 

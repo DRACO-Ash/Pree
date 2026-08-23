@@ -36,7 +36,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import __version__
 from .api_models import AssessRequest, AssessResponse, ContributionOut
 from .audit import audit, bound_access_log, build_logger
-from .config import Config
+from .config import ServiceConfig
 from .health import StorageProbe, StorageProber, diagnostics
 from .ratelimit import (
     ACTOR_LIMIT,
@@ -49,7 +49,6 @@ from .scoring import ThreatIndicators, assess
 from .security import (
     MAX_ACTOR_LENGTH,
     AuthError,
-    authorise,
     sanitise_actor,
     sanitise_log_part,
     sanitise_log_path,
@@ -582,7 +581,7 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
 
 def register_health_routes(
     app: FastAPI,
-    config: Config,
+    config: ServiceConfig,
     probe_now: Callable[[], StorageProbe],
     require_token: Callable[..., None],
 ) -> None:
@@ -658,7 +657,7 @@ def register_health_routes(
 def register_api_routes(
     app: FastAPI,
     *,
-    config: Config,
+    config: ServiceConfig,
     store: JsonStore,
     audit_log: logging.Logger,
     fine: RateLimiter,
@@ -779,7 +778,7 @@ def register_api_routes(
 
 def register_cors(
     app: FastAPI,
-    config: Config,
+    config: ServiceConfig,
     audit_log: logging.Logger,
     meter_preflight: Callable[[Request], Response | None],
 ) -> None:
@@ -880,15 +879,26 @@ def register_cors(
 
 
 def create_app(
-    config: Config,
+    config: ServiceConfig,
     store: JsonStore,
     *,
+    verify_token: Callable[[str | None], None],
     logger: logging.Logger | None = None,
     prober: StorageProber | None = None,
     global_limiter: RateLimiter | None = None,
     actor_limiter: RateLimiter | None = None,
 ) -> FastAPI:
-    """Build the app from injected dependencies. Does not listen."""
+    """Build the app from injected dependencies. Does not listen.
+
+    `config` is a `ServiceConfig`, which has NO token field, and the gate arrives as
+    `verify_token`, a callable closed over the credential in `security.token_verifier`. That is a
+    deliberate structural choice, not a style one: this module previously received the full
+    `Config`, and a security review recovered the deployed token verbatim from the pod log twice in
+    nine lines, once via a helper in another module called as `helper(config, exc)` and once via a
+    helper whose parameter was named `cfg`. The static rules meant to stop that checked how the
+    name was spelt, and the attacker picks the names. Now there is no attribute to reach from
+    anywhere in this module's scope.
+    """
     audit_log = logger or build_logger()
     storage = prober or StorageProber()
     # Bound the access log before anything can be served through it.
@@ -1029,7 +1039,7 @@ def create_app(
         x_pree_token: str | None = Header(default=None, alias=_TOKEN_HEADER),
     ) -> None:
         """The token gate on every gated route."""
-        authorise(config, x_pree_token)
+        verify_token(x_pree_token)
 
     register_health_routes(app, config, probe_now, require_token)
 

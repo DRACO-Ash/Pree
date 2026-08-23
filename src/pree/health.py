@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import Config
+from .config import ServiceConfig
 
 # Strictly shorter than the platform's readiness probe timeout, so this path always answers
 # with a diagnosis rather than being cut off mid-write by the platform.
@@ -205,21 +205,23 @@ class StorageProber:
         self._executor.shutdown(wait=False)
 
 
-def diagnostics(config: Config, probe: StorageProbe) -> dict[str, Any]:
+def diagnostics(config: ServiceConfig, probe: StorageProbe) -> dict[str, Any]:
     """A secret-free read-out. Every critical input is a boolean and a length, never a value.
 
     Every plausible field is present at once, so one read-out answers the whole question
     rather than prompting a second round trip during a deploy failure.
     """
-    token = config.team_token
+    # The LENGTH, carried as a precomputed fact on ServiceConfig. This module never held the
+    # value and now cannot: the token field does not exist on the type it receives.
+    token_length = config.token_length
     origin = config.allowed_origin
     return {
         "build_id": config.build_id,
         "environment": config.environment,
         "port": config.port,
         "auth_enabled": config.auth_enabled,
-        "team_token_present": token is not None,
-        "team_token_length": len(token) if token else 0,
+        "team_token_present": config.auth_enabled,
+        "team_token_length": token_length,
         "allowed_origin_present": origin is not None,
         "allowed_origin_length": len(origin) if origin else 0,
         "allowed_origin_is_wildcard": origin == "*",

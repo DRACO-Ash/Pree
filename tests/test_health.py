@@ -71,7 +71,7 @@ def test_diagnostics_reports_identity_and_never_a_secret_value(
     tmp_path: Path, prober: StorageProber
 ) -> None:
     config = make_config(tmp_path, PREE_TEAM_TOKEN="a-real-looking-token")
-    body = health.diagnostics(config, prober.probe(config.data_dir))
+    body = health.diagnostics(config.for_service(), prober.probe(config.data_dir))
     assert "a-real-looking-token" not in str(body)
     assert body["team_token_length"] == len("a-real-looking-token")
     assert body["identity_is_root"] == (body["identity_uid"] == 0)
