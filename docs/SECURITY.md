@@ -155,7 +155,7 @@ the assessment store.
 | Every caller-influenced audit value is recomputed from the request, not shape-checked | `src/pree/app.py` | `test_the_query_bit_is_the_query_and_nothing_else_on_every_kind_that_emits_it` |
 | Every boolean audit field names the test that correlates its value | `tests/test_api.py` | `test_every_boolean_audit_field_names_a_test_that_correlates_it` |
 | No truncated audit path can read as a route this app serves | `src/pree/security.py` | `test_no_truncated_path_record_can_read_as_a_route_this_app_serves` |
-| The BUILT image carries no setuid or setgid bit, no pip, and runs as 10001:10001 | `Dockerfile` | `scripts/simulate-pipeline.sh` containerize stage, executed by `.github/workflows/verify.yml` |
+| The BUILT image carries no setuid or setgid bit, no pip, and runs as 10001:10001 | `Dockerfile` | `scripts/simulate-pipeline.sh` containerize stage, run on every push by the continuous-integration workflow |
 | The audited path keeps its separator and carries no control character | `src/pree/app.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
 | A stage before the shipped one cannot mount over or de-privilege what the suid sweep visits | `Dockerfile` | `test_no_stage_declares_an_instruction_that_undoes_the_hardening` |
 | A refused preflight records whether the ORIGIN was allowed, by value | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
@@ -2362,6 +2362,20 @@ runner that has a daemon, and treats a deferral as a failure. Three things about
   explicit allowlist rather than an exclusion list, so `.github` is absent by construction, and
   `.dockerignore` excludes it from the build context. The App Store generates its own pipeline,
   which this never touches.
+
+**And that last point has a consequence this register's own guard caught within minutes.** The
+control row added for the new container control cited `.github/workflows/verify.yml` as its
+evidence. Locally that path exists, so `sh scripts/verify.sh` was green and I committed on it. Run
+against the EXTRACTED ARCHIVE, where `.github` is deliberately absent,
+`test_every_control_row_cites_a_test_that_exists` turned red and CI run 32631016826 failed on a
+docs-only commit.
+
+The guard is right and the row was wrong. **This document SHIPS inside the archive, so it must not
+cite evidence that does not.** The row now cites the pipeline stage, which does ship, and names the
+workflow in prose instead. The wider lesson is about process rather than the row: I committed on a
+green `verify.sh` without running `simulate-pipeline.sh`, and the archive leg catches a class the
+local loop structurally cannot see, because the local loop reads a tree that has files the archive
+does not.
 
 **And the run happened.** CI run 32630383551, on commit `fbefd3f`, built the image and executed all
 three assertions. The output is the evidence, not the exit code:
