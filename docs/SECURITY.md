@@ -2335,6 +2335,39 @@ Three further gaps closed:
   the wrong reason, which is why the accessor now asserts it resolved something and refuses a
   payload it cannot follow.
 
+### The container gap, and the gate that finally executes it
+
+**Every round of this register has carried the same standing gap: the three container hard rules
+have never executed on any machine.** No setuid or setgid bits, the non-root numeric user
+`10001:10001`, and no pip in the shipped filesystem are each a hard rule verified only by reading
+the Dockerfile's TEXT. `scripts/simulate-pipeline.sh` exits 2 for want of a Docker daemon, and exit
+2 is not a pass. The text assertions are strong and mutation-verified - the sweep's start path, its
+exact predicate set, the argument to each `-type`, `VOLUME` and `STOPSIGNAL` refused in every stage,
+an early `USER` refused - but no number of text assertions is evidence about a built image.
+
+`.github/workflows/verify.yml` closes it. It runs the same two scripts a developer runs, on a
+runner that has a daemon, and treats a deferral as a failure. Three things about it are deliberate:
+
+● **The daemon is PROVED reachable before the pipeline runs.** Without that step, an exit 2 on a
+  runner that happened to have no daemon would read as "the detection broke" when it in fact means
+  "there was nothing to detect with". My first draft of this workflow made exactly that claim in a
+  comment, which is the same defect class as every other false claim in this document, one layer out
+  in the tooling. With the proof first, the claim is true.
+● **The actions are pinned to version tags, not commit digests.** Digest pinning is stronger and is
+  the right end state. It is not done here because this session cannot resolve a digest for a
+  repository outside its own scope, and a guessed digest is worse than an honest tag. The residual
+  is real and named: a compromised tag on `actions/checkout` or `astral-sh/setup-uv` would run
+  arbitrary code in that job. It holds no deploy secret, because it performs no deploy.
+● **The workflow is not shipped in the upload archive.** `package-appstore.sh` builds from an
+  explicit allowlist rather than an exclusion list, so `.github` is absent by construction, and
+  `.dockerignore` excludes it from the build context. The App Store generates its own pipeline,
+  which this never touches.
+
+**What this does NOT do.** It does not make the three rules verified today. It makes them verified
+on the next push to this branch, and a red run there is the first real evidence about the image this
+project has ever had. Until that run is green, the honest statement is unchanged: the container
+rules are asserted in text and unverified in fact.
+
 ## Not accepted, and why it is not a risk here
 
 A client-side gate is never a boundary. Pree has no browser-side flag, PIN, or hidden field

@@ -1,0 +1,70 @@
+# The pull-request gate. It exists for ONE reason the local loop cannot serve.
+#
+# This project's development environment has no Docker daemon, so
+# `scripts/simulate-pipeline.sh` exits 2 and the three container hard rules - no setuid or setgid
+# bits, the non-root numeric user 10001:10001, and no pip in the shipped filesystem - have never
+# executed on any machine. They are verified today only by reading the Dockerfile's text, and no
+# number of text assertions is evidence about a built image. A GitHub-hosted runner has a daemon.
+# Here they execute, and a deferral is a FAILURE rather than a pass.
+#
+# The job runs the same two scripts a developer runs, rather than restating their steps, so a check
+# cannot be enforced in one place and absent from the other.
+name: verify
+
+on:
+  push: {}
+  pull_request:
+    branches: [main]
+
+# CI holds no deploy secret because it performs no deploy. The App Store generates its own
+# pipeline, which this never touches.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      # Version tags, not commit digests. Digest pinning is stronger and is the right end state;
+      # it is not done here because this session cannot resolve a digest for a repository outside
+      # its own scope, and a guessed digest is worse than an honest tag. Recorded rather than
+      # implied: a compromised tag on either action would run arbitrary code in this job.
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: install the pinned runtime from the hash-locked lockfile
+        # The interpreter version is read from .python-version, which both scripts also read.
+        # Naming it here as well would be a second copy of one fact, and copies drift.
+        run: |
+          uv venv --python "$(cat .python-version)" .venv
+          uv pip install --require-hashes -r requirements-dev.txt
+
+      - name: the verification loop
+        run: sh scripts/verify.sh
+
+      - name: prove a Docker daemon is actually reachable
+        # BEFORE the pipeline runs, so the exit-2 check below means what the next step says it
+        # means. Without this, exit 2 on a runner that happens to have no daemon would read as
+        # "the detection broke" when it in fact means "there was nothing to detect with" - which
+        # is precisely the kind of claim this project has had to correct too many times.
+        run: |
+          docker version
+          docker info > /dev/null
+
+      - name: the platform pipeline, container leg included
+        # Exit 2 is the script's own signal that the containerize leg was DEFERRED for want of a
+        # daemon. The step above has just proved a daemon is reachable, so exit 2 here can only
+        # mean the detection itself broke, and treating it as a pass would restore exactly the
+        # blind spot this job exists to remove. Exit 2 is not a pass anywhere.
+        run: |
+          set +e
+          sh scripts/simulate-pipeline.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::error::the containerize leg was deferred on a runner with a working Docker daemon" >&2
+            exit 1
+          fi
+          exit "$status"

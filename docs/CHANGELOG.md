@@ -1091,3 +1091,19 @@ approach changed rather than the code:
 ● The claim that ordinals were "gone from" the security register was false: fourteen remain from the
   earlier series. They have never collided, so the sweep is scoped to the three audit-layer headings
   and the entry says so.
+
+Continuous integration, which closes the standing container gap:
+
+● `.github/workflows/verify.yml` runs the verification loop and the pipeline simulation on a runner
+  that has a Docker daemon, so the three container hard rules - no setuid or setgid bits, the
+  non-root numeric user, no pip in the shipped filesystem - execute for the first time on any
+  machine. Exit 2, the script's own deferral signal, is treated as a failure.
+● The daemon is proved reachable BEFORE the pipeline runs, so the exit-2 check means what its
+  comment says. My first draft claimed exit 2 "means the detection broke", which is false on a
+  runner with no daemon; with the proof first it is true.
+● The actions are pinned to version tags rather than commit digests, and the residual is named
+  rather than implied: this session cannot resolve a digest for a repository outside its scope, and
+  a guessed digest is worse than an honest tag. The job holds no deploy secret because it deploys
+  nothing.
+● The workflow is not in the upload archive. `package-appstore.sh` builds from an allowlist, so
+  `.github` is absent by construction, and `.dockerignore` keeps it out of the build context.
