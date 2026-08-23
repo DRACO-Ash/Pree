@@ -1160,8 +1160,10 @@ Tenth security review: two majors, three minors, and the enumeration approach ab
 ● **The control is now a RUNTIME check on the bytes leaving the process.**
   `audit.install_credential_guard`, armed at boot by `security.arm_output_guard`, refuses any line
   containing the credential on the audit logger, stdout and stderr. It does not care how a leak
-  obtained the value. Fail-closed by substitution, not by raising (swallowed by logging) or dropping
-  (a control whose success looks like nothing happening). Measured over twelve leak routes; benign
+  obtained the value. Fail-closed by substitution, not by raising (which propagates to the `logger.*`
+  call site and emits the record nowhere - this row said "swallowed by logging", which a later round
+  measured as false; see the ninth security review below) or dropping (a control whose success looks
+  like nothing happening). Measured over twelve leak routes; benign
   lines pass untouched, because a guard that suppresses clean lines is a denial of service on the log.
 ● Both allowlists are keyed on (module, function) rather than a bare name, which had given any module
   a free credential read via a helper called `for_service` and a free environment read via one called

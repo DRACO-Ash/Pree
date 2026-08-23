@@ -156,10 +156,17 @@ UNSCANNABLE_ALARM = '{"kind":"credential_guard","outcome":"refused_a_line_it_cou
 # format string and the alarm is a whole JSON line. Spelt to the project's own convention for a
 # withheld value.
 REDACTED_ATTRIBUTE = "[REDACTED:credential]"
-# The attributes a refusal replaces ITSELF, so the blanket redaction must not touch them. `args` is
-# the load-bearing one: the refusal sets it to `()`, and setting it to a string afterwards would
-# make `getMessage()` raise on the alarm's own text, which carries no placeholder.
-_REPLACED_ATTRIBUTES = frozenset({"msg", "args", "exc_info", "exc_text", "stack_info"})
+# The attributes a refusal replaces ITSELF, so a redaction must never write over them. `args` is the
+# load-bearing one: the refusal sets it to `()`, and setting it to a string afterwards would make
+# `getMessage()` raise on the alarm's own text, which carries no placeholder.
+#
+# This set used to do TWO jobs - "not redacted" and "not scanned" - and both reviews found the same
+# consequence, independently. `msg` and `args` were excluded from the scan as well, and
+# `getMessage()` does not reproduce an argument the `%` substitution does not consume:
+# `logger.info("%(a)s", {"a": 1, "tok": TOKEN})` and `logger.info("%.4s", TOKEN)` with a formatter
+# naming `%(args)s` both put the credential on the line in plaintext with no alarm. Conflating the
+# two jobs in one name is how the axis this module had just closed stayed open two names short.
+_NOT_REDACTABLE = frozenset({"msg", "args", "exc_info", "exc_text", "stack_info"})
 # The key prefix for a RENDERED part, chosen because no Python attribute name can start with it, so
 # a part key and an attribute name can never collide in one dictionary.
 _RENDERED_PREFIX = "<"
@@ -241,16 +248,44 @@ def _scannable_parts(record: logging.LogRecord) -> tuple[dict[str, str], bool]:
         )
     if stack_info:
         unrendered += _add(parts, f"{_RENDERED_PREFIX}stack_info>", lambda: str(stack_info))
-    for name, value in list(vars(record).items()):
-        if name in _REPLACED_ATTRIBUTES:
-            continue
-        # SUPPRESSED rather than counted, which is the deliberate asymmetry with the four rendered
+    for name, value in _record_attributes(record):
+        # SKIPPED rather than counted, which is the deliberate asymmetry with the four rendered
         # parts above: a non-stringifiable attribute is not an unscanned emission, so failing closed
         # on it would cost a legitimate line. Held by
         # `test_an_attribute_the_guard_cannot_stringify_does_not_alarm_a_clean_line`.
-        with contextlib.suppress(Exception):
-            parts[name] = value if isinstance(value, str) else str(value)
+        #
+        # `type(value) is str` and not `isinstance`, because a `str` SUBCLASS can override
+        # `__contains__` and answer False for a substring it holds; coercing through `str()` gives
+        # an exact `str` whose `in` is the builtin one.
+        try:
+            text = value if type(value) is str else str(value)
+        except Exception:  # arbitrary caller `__str__`, so any exception
+            text = None
+        if text is not None:
+            parts[name] = text
     return parts, unrendered > 0
+
+
+def _record_attributes(record: logging.LogRecord) -> list[tuple[str, Any]]:
+    """The record's own attributes. EVERY name, including `msg` and `args`.
+
+    See `_NOT_REDACTABLE` for the two-name gap that came from reusing one constant for "not
+    redacted" and "not scanned".
+
+    UNGUARDED, and that is a decision with a mechanism behind it rather than an oversight. A
+    `try/except TypeError` sat here for a draft, on the reasoning that a `LogRecord` subclass might
+    use `__slots__` and `vars()` raises on a slotted object. That reasoning is wrong:
+    `logging.LogRecord` declares no `__slots__`, so every instance has a `__dict__`, and a subclass
+    declaring `__slots__` ADDS slots without removing the inherited dictionary - it cannot take it
+    away. The branch was unreachable, coverage said so, and this project removed a speculative
+    `TypeError` from another suppression two commits ago for exactly that reason: a catch with
+    nothing named that raises it and no test holding it pins nothing.
+
+    The mechanism is asserted rather than trusted, by
+    `test_no_log_record_can_be_built_without_the_dictionary_the_scan_reads`, which fails if a future
+    Python gives `LogRecord` slots. That is the signal to put the guard back.
+    """
+    return list(vars(record).items())
 
 
 def _refuse(record: logging.LogRecord, alarm: str, carrying: list[str]) -> None:
@@ -263,8 +298,22 @@ def _refuse(record: logging.LogRecord, alarm: str, carrying: list[str]) -> None:
 
     Then each ATTRIBUTE that carried the credential is redacted individually. Redacting only the
     ones that carried it keeps the rest of the record diagnosable, which is the whole reason the
-    audit trail exists. The rendered parts are skipped by their key prefix, because the five fields
-    above have already replaced them and `args` in particular must stay a tuple.
+    audit trail exists.
+
+    Two things are skipped, and the stated reason for the first used to be wrong. The RENDERED keys
+    are skipped because they are not attribute names at all - writing them back would mint junk
+    `<message>` attributes on the record - and the prefix exists so a record carrying an attribute
+    literally named `message` cannot overwrite the rendered message's entry in the parts dictionary
+    and take it out of the scan. A previous version said the skip was what kept `args` a tuple,
+    which is false: `_NOT_REDACTABLE` does that, and deleting this conditional left the whole suite
+    green. The collision is held by
+    `test_an_attribute_named_message_cannot_shadow_the_rendered_message`.
+
+    The redaction is BEST EFFORT and says so. `setattr` can raise on a `LogRecord` subclass exposing
+    a read-only property, which would put an `AttributeError` in the `logger.*` call site - the
+    failure this module's doctrine forbids - so it is guarded. What is lost on that path is
+    field-level redaction, not the control: `_patch_handler_format` scans the finished line and
+    replaces the whole of it.
     """
     record.msg = alarm
     record.args = ()
@@ -272,7 +321,9 @@ def _refuse(record: logging.LogRecord, alarm: str, carrying: list[str]) -> None:
     record.exc_text = None
     record.stack_info = None
     for key in carrying:
-        if not key.startswith(_RENDERED_PREFIX):
+        if key.startswith(_RENDERED_PREFIX) or key in _NOT_REDACTABLE:
+            continue
+        with contextlib.suppress(AttributeError):
             setattr(record, key, REDACTED_ATTRIBUTE)
 
 
@@ -363,7 +414,10 @@ class _GuardedStream:
 
     def write(self, text: str) -> int:
         expected = _GUARDED_CREDENTIAL
-        refused = bool(expected and expected in text)
+        # `str(text)`, not `text`. `in` dispatches to `type(text).__contains__`, so a `str` SUBCLASS
+        # can answer False for a substring it holds - measured on this channel, which is `print` and
+        # the pod log. Coercing gives an exact `str` whose `in` is the builtin one.
+        refused = bool(expected and expected in str(text))
         payload = f"{CREDENTIAL_ALARM}\n" if refused else text
         # A stream whose `write` returns None is legal (a review found `int(None)` raising here),
         # and a guard that raises inside someone else's write is worse than the leak it prevents.
@@ -439,20 +493,23 @@ def _guard_handler(handler: logging.Handler) -> None:
 def install_credential_guard(expected: str | None) -> None:
     """Arm the runtime guard, and be exact about what it does and does not cover.
 
-    WHAT IT COVERS. Every `logging.Handler` that exists when this runs or is constructed after it,
-    whatever logger it is attached to and whether the record was emitted directly or propagated from
-    a descendant, over the record's WHOLE default rendering including its traceback and stack text;
-    and every write through the four `sys` text-stream attributes, including `print`. Handlers that
-    captured the pre-wrap stream are re-pointed at the wrapper WHERE `stream` IS ASSIGNABLE; where
-    it is not, the filter half alone covers that handler and a direct write to the stream it
-    captured is uncovered. That qualification arrived with the `suppress` that made it true, and
-    for one commit this sentence and the control register both still stated the re-point flatly.
+    WHAT IT COVERS, in three layers, of which only the first two are guarantees.
 
-    The record scan covers the four strings `logging.Formatter` concatenates and every attribute of
-    the record, as itself or through `str()`. The residual on that half is a handler whose formatter
-    synthesises text neither of those reveals: an override of `format` or `formatException` reading
-    a non-`str` attribute in a way `str()` does not show. It is a residual rather than a hole only
-    because the second half covers the emission when such a handler's stream is a wrapped one.
+    ● **The finished line, at `logging.Handler.format`.** Whatever the record held and whatever
+      rendered it - any attribute, any conversion (`str`, `repr`, `ascii`), a formatter default that
+      never touched the record, a filter that ran after this guard's, an unstable `__str__` - the
+      text a stock handler emits is scanned before it leaves. This is the guarantee for the log
+      channel and it replaced four rounds of scanning a MODEL of that line, each of which lost to a
+      part of the real one the model did not have. See `_patch_handler_format` for the six measured
+      bypasses that forced it.
+    ● **The byte channel, at the four `sys` text-stream attributes**, including `print`. Handlers
+      that captured a pre-wrap stream are re-pointed at the wrapper WHERE `stream` IS ASSIGNABLE;
+      where it is not, the layers above still cover the record and only a DIRECT write to the stream
+      it captured is uncovered.
+    ● **The record itself, at filter time** - the four strings `logging.Formatter` concatenates plus
+      every attribute, as itself or through `str()`. This is no longer a guarantee and is not meant
+      to be one: it refuses early and redacts the individual field that carried the credential, so a
+      refused record stays diagnosable. Its gaps cost redaction fidelity, not containment.
 
     WHAT IT DOES NOT COVER, named because the previous version of this docstring said "every channel
     that leaves this process" and a review then took seven of them:
@@ -462,6 +519,11 @@ def install_credential_guard(expected: str | None) -> None:
         `open("/dev/stdout", "w")` and `os.fdopen(1)` are INSTANCES of that class, not the set:
         a new handle on the same descriptor is a new instance, and enumerating them would be the
         same mistake this module's history is made of.
+      ● **A `Handler` subclass that overrides `format`, or emits without calling it.** The finished
+        line is scanned where `logging.Handler.format` produces it, so a handler that produces it
+        somewhere else is outside that layer. This is the same-privilege class below rather than a
+        new one - it takes code in the process to arrange - and it is named separately because the
+        layer it defeats is the one described as the guarantee.
       ● **Any channel that is not a log line.** The reach above is "a write through a wrapped `sys`
         text stream, and a record passing a `logging.Handler`". A credential put in a RESPONSE BODY,
         written to a file on the data volume, used as a FILENAME, or passed in a child process's
@@ -470,7 +532,13 @@ def install_credential_guard(expected: str | None) -> None:
         while the register claimed the uncovered set was stated exactly, and the omission is the
         same shape as everything else in this module's history: the three classes below were the
         ones that had been ATTACKED, so they read as the ones that existed.
-      ● **Any encoding but plaintext, and any framing but one write.** The comparison is a substring
+      ● **A refusal whose redaction then breaks the formatter.** `_refuse` replaces an offending
+        attribute with a `str`, and a format spec such as `{v[0]:d}` over the original then raises
+        inside `Formatter.format`, so `handleError` discards the whole emission: no credential
+        anywhere, and no alarm either. The "substitution leaves an audible marker" rationale is
+        therefore conditional, and this is the condition. Nothing leaks on that path; what is lost
+        is the record that something was refused.
+    ● **Any encoding but plaintext, and any framing but one write.** The comparison is a substring
         test against the credential as configured, so base64, hex or a reversal passes; and it is a
         test against ONE string, so `write(token[:16])` followed by `write(token[16:])` reassembles
         in the log with no alarm, as do two log records carrying a half each. Both are deliberate
@@ -521,6 +589,9 @@ def install_credential_guard(expected: str | None) -> None:
     for handler in _existing_handlers():
         _guard_handler(handler)
     _patch_handler_construction()
+    # LAST, and it is the guarantee rather than a further layer: everything above scans a model of
+    # the line, this scans the line.
+    _patch_handler_format()
 
 
 def _existing_handlers() -> list[logging.Handler]:
@@ -614,6 +685,66 @@ def _restore_streams() -> None:
         sys.__stdout__ = sys.__stdout__.wrapped  # type: ignore[unreachable]
     if isinstance(sys.__stderr__, _GuardedStream):
         sys.__stderr__ = sys.__stderr__.wrapped  # type: ignore[unreachable]
+
+
+def _patch_handler_format() -> None:
+    """Scan the FINISHED LINE, which is the only text a handler actually emits.
+
+    THE GUARANTEE for the log channel, and the reason it exists is that four rounds of scanning a
+    MODEL of the line each lost to a part of the real one the model did not have. The record scan
+    reached: the message, then the traceback, then every attribute - and a plain `logging.Formatter`
+    still put the credential on the line six ways, every one measured on the commit before this:
+
+      ● `%(args)s` where the `%` substitution does not consume the argument, by a mapping key the
+        message never names or by a `%.4s` that truncates it.
+      ● `%(obj)r` and `{obj!r}` and `{obj!a}`, because a format string chooses the CONVERSION and
+        `repr` is not `str`. An object hiding the credential in `__repr__` renders it.
+      ● `Formatter(defaults={...})`, where the value never touches the record, so no record scan can
+        see it however complete.
+      ● A `str` subclass whose `__contains__` lies, kept verbatim by an `isinstance` check.
+      ● A filter added AFTER this guard's, which is the ordinary context-enricher pattern: the
+        patched constructor makes the guard the first filter, so every later one runs after it and
+        whatever it puts on the record is unscanned.
+      ● An attribute whose `__str__` raises on the first call and returns the credential on the
+        second. This was the worst of the six, because it made the guard actively harmful: DISARMED,
+        the formatter's first call raises and `handleError` discards the emission, so nothing is
+        written; ARMED, the record scan absorbs the raising call and the formatter's second call
+        succeeds, so the credential is emitted. A control that leaks what its absence would have
+        contained is worse than no control.
+
+    None of those is an fd-level write, a re-encoding, a split write, or a same-privilege disarm.
+    They are all the same defect: a scan of what the line was PREDICTED to contain, not of what it
+    does. So this stops predicting. `Handler.format` is where every stock handler turns a record
+    into the string it emits - `StreamHandler`, `FileHandler`, `SysLogHandler`, `SMTPHandler`,
+    `HTTPHandler` and `QueueHandler.prepare` all call it - and scanning its return value is
+    indifferent to which attribute, conversion, formatter default, filter, or `__str__` produced the
+    text. It is the same principle `_GuardedStream` already applied to the byte channel, applied to
+    the log channel.
+
+    The record scan is KEPT, and its job has changed rather than gone: it refuses early and redacts
+    the individual field that carried the credential, so a refused record stays diagnosable. It is
+    no longer the guarantee, which is why its remaining gaps are a loss of redaction fidelity rather
+    than a leak.
+
+    What this does NOT cover, named because being exact about it is the whole discipline here: a
+    `Handler` subclass that overrides `format`, or that emits without calling it. That is the
+    same-privilege class already recorded, not a new one.
+    """
+    if getattr(logging.Handler.format, "_pree_guarded", False):
+        return
+    original = logging.Handler.format
+
+    def guarded_format(self: logging.Handler, record: logging.LogRecord) -> str:
+        text = original(self, record)
+        expected = _GUARDED_CREDENTIAL
+        # `str(text)` for the same reason `_GuardedStream.write` coerces: a formatter is free to
+        # return a `str` subclass, and `in` dispatches to its `__contains__`.
+        if expected and expected in str(text):
+            return CREDENTIAL_ALARM
+        return text
+
+    guarded_format._pree_guarded = True  # type: ignore[attr-defined]
+    logging.Handler.format = guarded_format  # type: ignore[method-assign]
 
 
 def _patch_handler_construction() -> None:

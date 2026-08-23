@@ -54,6 +54,7 @@ from pree.audit import (
     CREDENTIAL_ALARM,
     REDACTED_ATTRIBUTE,
     UNSCANNABLE_ALARM,
+    _CredentialGuard,
     _GuardedStream,
     audit,
     build_logger,
@@ -3822,7 +3823,7 @@ _INTROSPECTION_CALLS = frozenset({"globals", "vars", "locals", "eval", "exec", "
 # is pinned by `test_the_introspection_exemption_is_exactly_one_function_on_a_log_record`, which
 # asserts the set has one member and that the member's `vars()` argument is its own record
 # parameter.
-INTROSPECTION_EXEMPTIONS = frozenset({("audit.py", "_scannable_parts", "vars")})
+INTROSPECTION_EXEMPTIONS = frozenset({("audit.py", "_record_attributes", "vars")})
 # `load_config` is the only function that may read the process environment. Anywhere else, an
 # `os.environ` read is a second source of truth for the credential that bypasses every boundary.
 # Also keyed on (MODULE, FUNCTION), for the same measured reason.
@@ -4420,7 +4421,10 @@ def test_the_introspection_exemption_is_exactly_one_function_on_a_log_record() -
         f"to refuse; a second one needs its own argument, not this one's"
     )
     module_name, function_name, call_name = next(iter(INTROSPECTION_EXEMPTIONS))
-    assert (module_name, call_name) == ("audit.py", "vars")
+    # The FUNCTION name is pinned too. Without it the exemption read "some function called
+    # `vars` in some file named audit.py", and the guard keys on the basename, so a second
+    # `audit.py` in a subpackage with a function of that name would inherit it.
+    assert (module_name, function_name, call_name) == ("audit.py", "_record_attributes", "vars")
 
     source = Path(audit_module.__file__ or "").resolve().read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -4547,6 +4551,286 @@ def test_the_guard_scans_every_record_attribute_a_formatter_can_render() -> None
         )
 
 
+class _HidesInStr:
+    """Benign through `str()`, credential through `repr()`. A format string picks the conversion."""
+
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+
+    def __str__(self) -> str:
+        return "harmless"
+
+    def __repr__(self) -> str:
+        return f"repr holding {self._secret}"
+
+
+class _DoubleCallStr:
+    """Raises on the first `str()` and returns the credential on the second.
+
+    The shape that made the guard actively HARMFUL. Disarmed, the formatter's first call raises and
+    `handleError` discards the emission; armed, the record scan absorbed the raising call and the
+    formatter's second call succeeded, so arming the guard was what put the credential in the log.
+    """
+
+    def __init__(self, secret: str) -> None:
+        self._secret = secret
+        self.calls = 0
+
+    def __str__(self) -> str:
+        self.calls += 1
+        if self.calls == 1:
+            raise ValueError("not yet")
+        return f"token={self._secret}"
+
+
+class _LyingStr(str):
+    """A `str` subclass that answers False for a substring it holds."""
+
+    def __contains__(self, item: object) -> bool:
+        return False
+
+
+class _Enricher(logging.Filter):
+    """The ordinary context-enricher pattern, attached AFTER the guard's own filter."""
+
+    def __init__(self, secret: str) -> None:
+        super().__init__()
+        self._secret = secret
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.injected = self._secret
+        return True
+
+
+def _emit_one(
+    secret: str,
+    *,
+    fmt: str,
+    msg: object,
+    args: object = (),
+    extra: dict[str, Any] | None = None,
+    defaults: dict[str, Any] | None = None,
+    enrich: bool = False,
+    armed: bool,
+) -> str:
+    """Put one record through one real handler and return what the sink received.
+
+    A helper because the point of these cases is that they differ ONLY in what produced the text, so
+    everything else has to be identical between them, and between the armed and disarmed arms.
+    """
+    sink = io.StringIO()
+    handler = logging.StreamHandler(sink)
+    handler.setFormatter(
+        logging.Formatter(fmt, defaults=defaults) if defaults else logging.Formatter(fmt)
+    )
+    logger = logging.getLogger(f"finished.line.{abs(hash((fmt, armed, enrich)))}")
+    previous, previous_level, previous_propagate = (
+        logger.handlers,
+        logger.level,
+        logger.propagate,
+    )
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if armed:
+        install_credential_guard(secret)
+    if enrich:
+        # AFTER arming, so the guard's own filter is already first and this one runs after it.
+        handler.addFilter(_Enricher(secret))
+    try:
+        logger.handle(
+            logger.makeRecord(logger.name, logging.INFO, __file__, 0, msg, args, None, extra=extra)  # type: ignore[arg-type]
+        )
+    finally:
+        if armed:
+            install_credential_guard(None)
+        logger.handlers = previous
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+        handler.close()
+    return sink.getvalue()
+
+
+def test_the_finished_line_is_scanned_whatever_produced_it() -> None:
+    """The change from scanning a MODEL of the emitted line to scanning the line.
+
+    Four rounds each widened the model - the message, then the traceback, then every attribute - and
+    each lost to a part of the real line the model did not have. All six below were measured on a
+    plain `logging.Formatter` with the guard armed, no override of `format` or `formatException`,
+    one write, plaintext, after arming, with no same-privilege disarm. Every one sat outside every
+    limit the module named at the time.
+
+    `logging.Handler.format` is where a stock handler turns a record into the string it emits, so
+    scanning its return value is indifferent to which attribute, conversion, formatter default,
+    filter, or `__str__` produced the text. The record scan is kept for early refusal and
+    field-level redaction; it is no longer what makes the guarantee.
+
+    Each case runs DISARMED first. A case whose channel does not reach the line unguarded proves
+    nothing about the guard, and this suite has been caught by exactly that kind of vacuous pass.
+    """
+    secret = "Dg3-FZq_7Wx.9Yt~2Ur5Ip8Ok1Aj4Sh6"
+    cases: tuple[tuple[str, dict[str, Any]], ...] = (
+        (
+            "%(args)s with a mapping key the message never names",
+            {
+                "fmt": "%(message)s a=%(args)s",
+                "msg": "count=%(a)s",
+                "args": {"a": 1, "tok": secret},
+            },
+        ),
+        (
+            "%(args)s with a message that truncates the argument",
+            {"fmt": "%(message)s a=%(args)s", "msg": "%.4s", "args": (secret,)},
+        ),
+        (
+            "an attribute rendered through repr, not str",
+            {"fmt": "%(message)s x=%(obj)r", "msg": "m", "extra": {"obj": _HidesInStr(secret)}},
+        ),
+        (
+            "a formatter default, which never touches the record",
+            {"fmt": "%(message)s d=%(dflt)s", "msg": "m", "defaults": {"dflt": secret}},
+        ),
+        (
+            "a str subclass whose __contains__ lies",
+            {"fmt": "%(message)s v=%(v)s", "msg": "m", "extra": {"v": _LyingStr(secret)}},
+        ),
+        (
+            "a filter that runs after the guard's own",
+            {"fmt": "%(message)s i=%(injected)s", "msg": "m", "enrich": True},
+        ),
+    )
+    for label, keywords in cases:
+        unguarded = _emit_one(secret, armed=False, **keywords)
+        assert secret in unguarded, (
+            f"{label}: the channel does not reach the line even with the guard disarmed, so this "
+            f"case measures nothing"
+        )
+        guarded = _emit_one(secret, armed=True, **keywords)
+        assert secret not in guarded, f"{label}: the credential reached the line: {guarded!r}"
+        assert CREDENTIAL_ALARM in guarded, f"{label}: refused without an alarm: {guarded!r}"
+
+
+def test_the_armed_guard_never_emits_what_the_disarmed_process_would_not() -> None:
+    """The invariant a BLOCKER violated: arming must never make the leak worse.
+
+    An attribute whose `__str__` raises on the first call and returns the credential on the second
+    turned the guard into the cause of the leak. DISARMED, the formatter's first call raises,
+    `handleError` discards the emission, and nothing is written at all. ARMED, the record scan
+    absorbed the raising call under its own suppression and the formatter's second call succeeded,
+    so the credential was emitted - by a process that would have emitted nothing without the
+    control.
+
+    That is worse than no control, and it is why the guarantee moved to the finished line: scanning
+    the text a handler is about to emit cannot be defeated by a value that renders differently the
+    second time, because there is no second time.
+
+    Stated as an INVARIANT rather than as a case, deliberately. The specific object below is one
+    witness; the assertion is the general property, so a future value with an unstable rendering is
+    caught by the same test.
+    """
+    secret = "FZq-7Wx_9Yt.2Ur~5Ip8Ok1Aj4Sh6Dg3"
+    keywords: dict[str, Any] = {
+        "fmt": "%(message)s x=%(obj)s",
+        "msg": "an authentication failure",
+    }
+    disarmed = _emit_one(secret, armed=False, extra={"obj": _DoubleCallStr(secret)}, **keywords)
+    armed = _emit_one(secret, armed=True, extra={"obj": _DoubleCallStr(secret)}, **keywords)
+
+    assert secret not in disarmed, (
+        f"the disarmed process emitted the credential, so this test cannot measure whether arming "
+        f"made it worse: {disarmed!r}"
+    )
+    assert secret not in armed, (
+        f"ARMING THE GUARD CAUSED THE LEAK. The disarmed process emitted {disarmed!r} and the "
+        f"armed one emitted {armed!r}. A control that leaks what its absence would have contained "
+        f"is worse than no control"
+    )
+
+
+def test_no_log_record_can_be_built_without_the_dictionary_the_scan_reads() -> None:
+    """The mechanism the attribute walk depends on, asserted rather than assumed.
+
+    `_record_attributes` calls `vars(record)` with no guard, and the reason is a property of the
+    standard library rather than a hope: `logging.LogRecord` declares no `__slots__`, so every
+    instance carries a `__dict__`, and a subclass declaring `__slots__` ADDS slots without removing
+    the inherited dictionary. `vars()` therefore cannot raise on anything that is a `LogRecord`.
+
+    A draft guarded the call against `TypeError` on the opposite belief, and it was dead code:
+    coverage reported the branch as never taken, and the test written to drive it could not. This
+    project removed a speculative `TypeError` from another suppression on exactly that argument, so
+    keeping this one would have been the same defect with the author's own precedent against it.
+
+    What replaces the guard is this assertion. If a future Python gives `LogRecord` slots, or a
+    subclass here finds a way to shed the dictionary, this fails and the guard goes back.
+    The subclass below is the real test of the second half: it declares `__slots__` and must STILL
+    have a readable dictionary.
+    """
+    assert not hasattr(logging.LogRecord, "__slots__"), (
+        "logging.LogRecord now declares __slots__, so an instance may have no __dict__ and the "
+        "unguarded vars() call in audit._record_attributes can raise TypeError from inside a "
+        "logging filter, which propagates to the logger.* call site. Restore the guard"
+    )
+
+    class Slotted(logging.LogRecord):
+        """A subclass that adds slots. It must not lose the inherited dictionary."""
+
+        __slots__ = ("extra_field",)
+
+    record = Slotted(
+        name="slotted.record",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=0,
+        msg="a message",
+        args=(),
+        exc_info=None,
+    )
+    attributes = vars(record)
+    assert isinstance(attributes, dict), "a slotted LogRecord subclass has no readable dictionary"
+    assert attributes["msg"] == "a message", (
+        f"the dictionary a slotted subclass exposes is not the record's own: {sorted(attributes)}"
+    )
+
+
+def test_an_attribute_named_message_cannot_shadow_the_rendered_message() -> None:
+    """Why the rendered parts carry a key prefix, asserted rather than asserted-in-prose.
+
+    The parts dictionary holds the four rendered strings alongside every record attribute, and the
+    attribute walk runs second. Without a prefix that no attribute name can have, a record carrying
+    an attribute literally named `message` overwrites the rendered message's entry, and the rendered
+    message - the one place the credential most often is - goes unscanned.
+
+    Driven against the FILTER directly, because that is the layer the prefix belongs to. Through a
+    handler the finished-line scan would refuse the emission anyway and this would pass with the
+    prefix deleted, which is precisely the vacuous shape this suite keeps finding. The previous
+    version of this reasoning claimed the skip was what kept `args` a tuple, which was false, and
+    deleting the conditional left the whole suite green.
+    """
+    secret = "7Wx-9Yt_2Ur.5Ip~8Ok1Aj4Sh6Dg3FZq"
+    record = logging.LogRecord(
+        name="prefix.collision",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=0,
+        msg=f"token rejected: {secret}",
+        args=(),
+        exc_info=None,
+    )
+    # Set directly: `makeRecord` refuses `message` in `extra`, but a filter or an adapter can set
+    # it, and `Formatter.format` writes it on every record it renders.
+    record.message = "a benign rendering"
+    install_credential_guard(secret)
+    try:
+        _CredentialGuard().filter(record)
+    finally:
+        install_credential_guard(None)
+
+    assert record.msg == CREDENTIAL_ALARM, (
+        f"an attribute named `message` took the rendered message out of the scan, so the filter "
+        f"did not refuse a record whose message carried the credential: msg={record.msg!r}"
+    )
+
+
 def test_an_attribute_the_guard_cannot_stringify_does_not_alarm_a_clean_line() -> None:
     """The deliberate ASYMMETRY between the two halves of the scan, which is easy to get wrong.
 
@@ -4606,9 +4890,15 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
     could not be checked" and "a leak was refused" are different facts and a single marker would
     make a storm of the first indistinguishable from the second.
 
-    Four shapes, each holding a line nothing else holds:
+    Five shapes, each holding a line nothing else holds:
 
-    ● The double-call `__str__`, which is the measured bypass.
+    ● A `msg` whose `__str__` raises EVERY time. Nothing can read it, so nothing can scan it, and it
+      is refused. This is the shape that holds the fail-closed branch now.
+    ● The double-call `__str__`, which is the measured bypass, and which no longer reaches this
+      branch: the record scan covers `msg` as an attribute as well as through `getMessage()`, so the
+      second call reveals the credential and the record is refused as a LEAK rather than as
+      unreadable. That is the better of the two outcomes and the assertion says which one happens.
+      The finished-line scan is behind both.
     ● A MALFORMED `exc_info` tuple, with the credential in `msg`. This is what holds the guard
       around `formatException`, and the input a review suggested for it - an exception whose
       `__str__` raises - does NOT work: `traceback` is defensive there and renders
@@ -4617,11 +4907,9 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
       so the reachable input is a caller's mistake rather than a hostile exception. This test
       asserted the wrong thing for one commit: the mutation that rendered the exception unguarded
       stayed GREEN.
-    ● A truthy NON-`str` `stack_info`, and a truthy non-`str` `exc_text`. The docstring claimed
-      every part was produced under its own guard while BOTH were appended raw, so either made the
-      substring test raise `TypeError` out of the filter and into the `logger.*` call site - where
-      logging itself had previously contained it. Only `stack_info` was driven for one commit, and
-      the `exc_text` mutation stayed green.
+
+    The two non-`str` traceback fields have their own test, because this one reached the statement
+    cap: see `test_a_non_string_traceback_field_is_scanned_and_cleared_rather_than_raising`.
     """
     secret = "Sh6-Dg3_FZq.7Wx~9Yt2Ur5Ip8Ok1Aj4"
 
@@ -4637,11 +4925,11 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
                 raise ValueError("not yet")
             return f"token={secret}"
 
-    class NotAString:
-        """A truthy non-`str` `stack_info`, carrying the credential through `str()`."""
+    class NeverRenders:
+        """Raises on every call, so no layer can read it and none can scan it."""
 
         def __str__(self) -> str:
-            return f"stack info that is not a str, holding {secret}"
+            raise ValueError("never")
 
     sink = io.StringIO()
     handler = logging.StreamHandler(sink)
@@ -4657,6 +4945,10 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
     logger.propagate = False
     install_credential_guard(secret)
     try:
+        logger.info(NeverRenders())
+        never_renders = sink.getvalue()
+        sink.truncate(0)
+        sink.seek(0)
         logger.info(DoubleCall())
         double_call = sink.getvalue()
         sink.truncate(0)
@@ -4667,38 +4959,6 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
         # `formatException` this raises out of `logger.error` instead.
         logger.error("token rejected: %s", secret, exc_info=(TypeError, "not an exception", None))  # type: ignore[arg-type]
         exception_render = sink.getvalue()
-        sink.truncate(0)
-        sink.seek(0)
-        # A truthy non-`str` `stack_info`, set directly because no public call produces one.
-        record = logging.LogRecord(
-            name=logger.name,
-            level=logging.ERROR,
-            pathname=__file__,
-            lineno=0,
-            msg="a clean message",
-            args=(),
-            exc_info=None,
-        )
-        record.stack_info = NotAString()  # type: ignore[assignment]
-        # Reaching the next line at all is half the assertion: without `str()` around this field the
-        # substring test raises `TypeError` out of the filter, out of `handle`, and into this frame.
-        handler.handle(record)
-        non_string_stack = sink.getvalue()
-        sink.truncate(0)
-        sink.seek(0)
-        # The SAME shape in the other raw-appended field, which nothing drove for a commit.
-        cached = logging.LogRecord(
-            name=logger.name,
-            level=logging.ERROR,
-            pathname=__file__,
-            lineno=0,
-            msg="a clean message with a cached rendering",
-            args=(),
-            exc_info=None,
-        )
-        cached.exc_text = NotAString()  # type: ignore[assignment]
-        handler.handle(cached)
-        non_string_exc_text = sink.getvalue()
     finally:
         install_credential_guard(None)
         logger.handlers = previous
@@ -4706,9 +4966,14 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
         logger.propagate = previous_propagate
         handler.close()
 
+    assert UNSCANNABLE_ALARM in never_renders, (
+        f"a record no layer could read went out unscanned rather than refused: {never_renders!r}"
+    )
     assert secret not in double_call, f"the double-call bypass still leaks: {double_call!r}"
-    assert UNSCANNABLE_ALARM in double_call, (
-        f"a record the guard could not read went out unscanned rather than refused: {double_call!r}"
+    assert CREDENTIAL_ALARM in double_call, (
+        f"the second rendering of a double-call `msg` was not scanned. It is covered as an "
+        f"ATTRIBUTE as well as through `getMessage()`, so the call that reveals the credential is "
+        f"the one the walk makes: {double_call!r}"
     )
     assert secret not in exception_render, (
         f"an unrenderable exception took the whole scan with it: {exception_render!r}"
@@ -4717,25 +4982,62 @@ def test_the_guard_refuses_a_record_whose_rendering_it_could_not_complete() -> N
         f"the credential in `msg` was not refused when the exception render failed: "
         f"{exception_render!r}"
     )
-    # The other half. The field is SCANNED through `str()`, so the record is refused; and it is
-    # CLEARED by the refusal, which is what lets the formatter emit at all - `Formatter.format`
-    # concatenates `stack_info` onto the line, so a surviving non-`str` there would raise inside
-    # `format` and `handleError` would swallow the whole emission. An alarm in the sink therefore
-    # proves both halves at once.
-    assert secret not in non_string_stack, (
-        f"a non-str stack_info carried the credential past the scan: {non_string_stack!r}"
-    )
-    assert CREDENTIAL_ALARM in non_string_stack, (
-        f"a non-str stack_info was not scanned, or was not cleared by the refusal: "
-        f"{non_string_stack!r}"
-    )
-    assert secret not in non_string_exc_text, (
-        f"a non-str exc_text carried the credential past the scan: {non_string_exc_text!r}"
-    )
-    assert CREDENTIAL_ALARM in non_string_exc_text, (
-        f"a non-str exc_text was not scanned, or was not cleared by the refusal: "
-        f"{non_string_exc_text!r}"
-    )
+
+
+def test_a_non_string_traceback_field_is_scanned_and_cleared_rather_than_raising() -> None:
+    """`exc_text` and `stack_info` were appended RAW while the docstring said otherwise.
+
+    A truthy non-`str` in either made the substring test raise `TypeError` out of the filter, out of
+    `Handler.handle`, and into the `logger.*` call site - where logging itself had previously
+    contained the same input. Both go through `str()` now.
+
+    BOTH are driven, each carrying the credential, and only one was for a commit: reverting the
+    `exc_text` half left the whole suite green. Each assertion proves two things at once. The field
+    is SCANNED, because the record is refused; and it is CLEARED by the refusal, because
+    `Formatter.format` concatenates both fields onto the line, so a surviving non-`str` would raise
+    inside `format` and `handleError` would discard the whole emission. An alarm in the sink is only
+    possible if both happened.
+    """
+    secret = "9Yt-2Ur_5Ip.8Ok~1Aj4Sh6Dg3FZq7Wx"
+
+    class NotAString:
+        """A truthy non-`str` field, carrying the credential through `str()`."""
+
+        def __str__(self) -> str:
+            return f"a field that is not a str, holding {secret}"
+
+    def emit_with(field: str) -> str:
+        sink = io.StringIO()
+        handler = logging.StreamHandler(sink)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        record = logging.LogRecord(
+            name="non.string.field",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=0,
+            msg="a clean message",
+            args=(),
+            exc_info=None,
+        )
+        setattr(record, field, NotAString())
+        install_credential_guard(secret)
+        try:
+            # Reaching the next line at all is part of the assertion: a `TypeError` out of the
+            # filter would propagate through `handle` into this frame.
+            handler.handle(record)
+        finally:
+            install_credential_guard(None)
+            handler.close()
+        return sink.getvalue()
+
+    for field in ("stack_info", "exc_text"):
+        emitted = emit_with(field)
+        assert secret not in emitted, (
+            f"a non-str {field} carried the credential past the scan: {emitted!r}"
+        )
+        assert CREDENTIAL_ALARM in emitted, (
+            f"a non-str {field} was not scanned, or was not cleared by the refusal: {emitted!r}"
+        )
 
 
 def test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only() -> None:

@@ -2592,9 +2592,14 @@ enumerated a set the adversary could step outside of.
 credential and refuses any line containing it, on the audit logger and on stdout and stderr - the
 pod-log channels the platform aggregates. It does not care how a leak obtained the value, which is
 exactly what the enumerations were not. Fail-closed by SUBSTITUTION, not by raising or dropping: a
-raise inside a logging filter is swallowed and the line goes out anyway, and a dropped line is a
-control whose success looks like nothing happening. The record is replaced with a fixed alarm
-carrying no caller input.
+raise inside a logging filter propagates to the `logger.*` call site and the record is emitted
+nowhere, so it converts a leak into a fault in the caller the guard was protecting, and a dropped
+line is a control whose success looks like nothing happening. The record is replaced with a fixed
+alarm carrying no caller input. (This paragraph said "a raise inside a logging filter is swallowed
+and the line goes out anyway" until a later round measured it. It was the FOURTH live copy of that
+claim: two in the module, one in a test docstring, and this one, which the commit correcting the
+other three said it had corrected everywhere. Correcting a claim means finding every copy, and
+"everywhere" is a claim of its own.)
 
 Measured: twelve leak routes printed to a wrapped stream and one to the audit logger, secret absent
 from both, one alarm per leak, and every benign line passing through untouched - because a guard
