@@ -1456,16 +1456,18 @@ the review found green: eleven red.
 ● **The boundary held.** The security round re-attacked auth, the token compare, route gating,
   boundary validation, the body cap, the framing guard, CSP, CORS fail-closed, both limiter tiers,
   the sanitisers, the store's merge rules and the container contract, and defeated none of them.
-  Seventy-five mutations, seventy-one red. No secret in any body, header, log line, the tree, or 75
-  revisions of history.
+  Seventy-five mutations, seventy-one red, quoted as the reviewer's count rather than re-run here.
+  No secret in any body, header, log line, the tree, or 75 revisions of history.
 ● **The reduction's cost was wrong by one handler.** The uncovered set was enumerated by "does not
   emit `Handler.format`'s return value", and `QueueHandler` DOES emit it and pickles
   `record.__dict__` anyway, so it read as covered while carrying an `extra=` attribute across an IPC
   queue. The criterion is now "serialises `record.__dict__`", which makes it four, with
   `QueueHandler`'s split status stated: message half covered, every other attribute not.
-● **Three guarantees outside the credential guard were held by nothing.** `_first_refused`'s charge-every-key
-  invariant, whose short-circuiting mutant ADMITS requests the code refuses; both CORS allowlists;
-  and the audit `reason` cap. All three now driven, the last on the second attempt after my own
+● **Three guarantees outside the credential guard were held by nothing.** `_first_refused`'s
+  charge-every-key invariant - measured here as the shared bucket losing one charge where it should
+  lose two, with the reviewer's stronger "admits what the code refuses" figure recorded as theirs
+  because I could not reproduce it in three attempts; both CORS allowlists; and the audit `reason`
+  cap. All three now driven, the last on the second attempt after my own
   canary caught the first version entering no code path.
 
 Four new regression tests, 360 passing, coverage 99%.

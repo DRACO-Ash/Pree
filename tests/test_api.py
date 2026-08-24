@@ -4883,15 +4883,24 @@ def test_the_cors_method_and_header_allowlists_are_the_narrow_ones(tmp_path: Pat
 
 
 def test_a_refused_key_still_charges_every_other_bucket() -> None:
-    """`_first_refused` charges EVERY key, and short-circuiting admits what the code refuses.
+    """`_first_refused` charges EVERY key, so a peer over one limit cannot ride free on the rest.
 
-    The docstring says short-circuiting "would leave the others uncounted, so a caller who is over
-    one limit would ride free on the rest", and a review found nothing held it: inverting the loop
-    to `return key` on the first refusal left all 356 tests green. It is not cosmetic. Over 400
-    randomised sequences on the shipped two-key space the mutant diverged 19 times, and it diverged
-    in the direction that matters - it ADMITTED requests the shipped code refuses - because a peer
-    already over its socket bucket stops charging the shared `forwarded` bucket, so the fold's
-    aggregate cap never bites.
+    The function's own docstring says short-circuiting "would leave the others uncounted, so a
+    caller over one limit would ride free on the rest", and a review found nothing held it:
+    inverting the loop to `return key` on the first refusal left all 356 tests green.
+
+    It is not cosmetic, and the measured part is the CHARGE. With one key already over, the shipped
+    code leaves one charge on the shared `forwarded` bucket and the short-circuiting version leaves
+    two, so a peer over its socket limit stops charging the fold. That is what this asserts.
+
+    The stronger consequence a review reported - the mutant ADMITTING requests the shipped code
+    refuses, 19 divergences in 400 randomised sequences - I could not reproduce in three attempts
+    with three traffic shapes, and it is recorded in `docs/SECURITY.md` as their measurement rather
+    than restated here as fact. The reason looks structural: `RateLimiter` applies one capacity per
+    key, so the socket bucket is charged identically by both paths and only the shared bucket
+    drifts, leaving a divergence window about one request wide. Asserting the charge rather than a
+    divergence count is the right level anyway: an uncharged shared bucket is a defect whether or
+    not a particular trace exposes it.
 
     Driven on the mechanism rather than through a saturation sequence, because a test that admits a
     limiter's worth of requests to observe one divergence is slow and reads as a coincidence when it
