@@ -119,10 +119,19 @@ MAX_LOGGED_PATH = 160
 # most 64 characters and the colon between them.
 STORE_KEY_MAX_LENGTH = 129
 STORE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-# The reason string is composed server-side in both handlers that log one: AuthError carries a
-# fixed literal, and StoreError embeds a configured path, never caller input. Truncating it to
-# the actor length cut "could not acquire the store lock at /proc/.../.assessments.json" off
-# mid-path and lost the errno, so the bound is generous and exists only as a backstop.
+# The reason string is composed server-side in all THREE handlers that log one, and this comment
+# said "both" while three sites applied the cap. `AuthError` carries a fixed literal, the rate-limit
+# `HTTPException` carries a fixed detail, and `StoreError` embeds a configured path - never caller
+# input. Truncating to the actor length cut "could not acquire the store lock at
+# /proc/.../.assessments.json" off mid-path and lost the errno, so the bound is generous and exists
+# as a backstop.
+#
+# Only the StoreError site can reach the cap today, because the other two messages are literals. The
+# slices there stay anyway, and the delete-if-unreachable rule that removed three defensive branches
+# from `audit.py` does NOT apply to them: those were branches that never EXECUTED, while a slice on
+# a short string executes and returns the string. What would be unsafe is a bound applied at two of
+# three sites, because the next dynamic message added at the unslashed one would leave the bound
+# behind. `test_the_audit_reason_field_is_bounded` drives the reachable site.
 MAX_LOGGED_REASON = 512
 # The interactive documentation paths. FastAPI serves all three by default, which made the
 # whole route table, every field range and the token header name readable by an unauthenticated

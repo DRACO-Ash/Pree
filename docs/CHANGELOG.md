@@ -1494,3 +1494,26 @@ no secret reachable anywhere - and failed the commit on one table row.
   function now, and an unmarked wrapper turns it red.
 
 360 passing, coverage 99%.
+
+### The premise under the removed layer, and a false claim about a commit's own diff
+
+● **`install_credential_guard`'s cost argument rests on "this app builds nothing but
+  `StreamHandler`s", and nothing held it.** True by grep, and it justified deleting a security layer.
+  Now asserted over the real source against every handler class `logging` and `logging.handlers`
+  offer; a `QueueHandler` or `SocketHandler` construction turns it red, so whoever adds one revisits
+  the cost statement rather than editing a list.
+● **A stale-prose sweep was declared complete for the third time.** Six more sites named the deleted
+  filter or constructor patch as the live mechanism, and one was FALSE rather than stale: a docstring
+  claiming a malformed record is refused "with a distinct alarm", when that alarm no longer exists and
+  the record is emitted nowhere.
+● **A commit message claimed its own diff wrongly.** The previous commit said an attribution now
+  appeared in "both documents"; `git show --stat` shows it never touched `docs/SECURITY.md`. Applied
+  here, along with the rule: a completeness claim needs evidence, which for a commit message means
+  `git show --stat` before writing it.
+● **Two comment corrections**: three handlers log a `reason`, not two; and two of the three cannot
+  reach the cap, which does not make those slices dead code, because a slice on a short string
+  executes where a dead branch does not.
+● The `_first_refused` divergence direction I could not reproduce was reproduced by a second review at
+  78 of 78, so it is recorded as measured rather than as an open caveat.
+
+One new regression test, 361 passing, coverage 99%.

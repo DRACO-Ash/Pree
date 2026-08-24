@@ -167,6 +167,7 @@ the assessment store.
 | Arming calls no caller code the disarmed process would not, so the invariant holds by mechanism and not by observation | `src/pree/audit.py` | `test_arming_calls_no_caller_code_the_disarmed_process_would_not` |
 | The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the finished-line scan at `Handler.format` still covers what it emits | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
 | No credential-bearing line reaches any logging handler, scanned as the FINISHED LINE at `logging.Handler.format` so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant; nor a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that SERIALISES `record.__dict__` - FOUR stock handlers, and the criterion is the load-bearing part rather than the list: `HTTPHandler` urlencodes it, `SocketHandler` and `DatagramHandler` pickle it, and `QueueHandler` hands the record on so an IPC queue pickles it, its message half covered because `prepare` takes `format`'s return and every other attribute not. This row said "a handler that does not emit `Handler.format`'s return value" for two commits, under which `QueueHandler` reads as COVERED because it does emit it, which is how the next engineer adding async logging ships a leak. No subclassing is needed for any of the four; since the record-scanning layer was removed they are WHOLLY uncovered, acceptable only because this app builds nothing but `StreamHandler`s on stdout, NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_finished_line_is_scanned_whatever_produced_it`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
+| The package constructs NO logging handler that serialises `record.__dict__`, which is the premise the removed layer's cost argument rests on | `src/pree/audit.py` | `test_the_package_constructs_no_handler_that_serialises_a_record` |
 | The introspection guard has NO exemptions, the one it carried having left with the layer that needed it | `tests/test_api.py` | `test_the_introspection_guard_has_no_exemptions` |
 | A refused write reports the CALLER's length, so a caller looping until everything is written does not re-submit the credential-bearing tail | `src/pree/audit.py` | `test_the_guard_reports_the_callers_length_when_it_refuses_a_write` |
 | A handler that captured a stream before arming is re-pointed at the wrapper, WHERE `stream` is assignable; where it is not, the finished-line scan at `Handler.format` still covers what it emits and only a direct write to its captured stream is uncovered | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming`, `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
@@ -3205,8 +3206,9 @@ gating on all three cost-incurring routes, boundary validation against prototype
 numeric edge cases, the body cap, the framing guard, CSP, CORS fail-closed, both rate-limit tiers at
 their shipped constants, all three sanitisers, the store's anti-shrink merge and newest-kept cap, and
 the container contract. No secret reachable from a log line, an error body, a response header, the
-tree, or seventy-five revisions of history. Seventy-five mutations, seventy-one red. That was the
-half of this project nobody had re-attacked in several rounds, and it held.
+tree, or seventy-five revisions of history. Seventy-five mutations, seventy-one red - the REVIEWER's
+count of their own set, quoted as theirs, since I did not re-run it. That was the half of this
+project nobody had re-attacked in several rounds, and it held.
 
 **The reduction's stated cost was wrong by one handler, and the criterion was the reason.** The
 uncovered set said "a handler that does not emit `Handler.format`'s return value", and
@@ -3227,10 +3229,18 @@ their severity suggests, because they had been in the register for many rounds w
 elsewhere:
 
 ● **`_first_refused`'s charge-every-key invariant.** Short-circuiting on the first refusal left the
-  suite green, and the mutant does not merely lose an audit detail - it ADMITS requests the shipped
-  code refuses, because a peer already over its socket bucket stops charging the shared `forwarded`
-  bucket and the fold's aggregate cap never bites. Nineteen divergences in four hundred randomised
-  sequences. Now held on the mechanism, with a limiter whose remaining capacity is observable.
+  suite green. The MECHANISM is measured here: with one key already over, the shipped code leaves one
+  charge on the shared `forwarded` bucket and the mutant leaves two, so a peer over its socket limit
+  stops charging the fold. That under-charge is what the test asserts, and it is the right level to
+  assert at - an uncharged shared bucket is a defect whether or not a given trace exposes it.
+
+  The end-to-end consequence is measured by two independent reviews and not by me. The first reported
+  the mutant ADMITTING requests the shipped code refuses, nineteen divergences in four hundred
+  randomised sequences; I could not reproduce it in three attempts with three traffic shapes; a
+  second review then reproduced it with its own generator at SEVENTY-EIGHT divergences, the mutant
+  admitting more in seventy-eight of seventy-eight. The direction is confirmed and my failure to
+  reproduce it was my generator rather than their finding - worth recording, because "I could not
+  reproduce it" is evidence about the harness before it is evidence about the claim.
 ● **Both CORS allowlists.** `allow_methods=["*"]` and `allow_headers=["*"]` each left the suite
   green. Read off the constructed middleware now rather than the module constants, so the wiring is
   covered too.
@@ -3280,6 +3290,53 @@ Three smaller corrections, each a mechanism rather than a wording preference:
   module's own marker on `Handler.__init__`, so an unmarked wrapper passed - a review added one and
   the suite stayed green. It asserts the stock function now, by module, and the unmarked re-add turns
   it red.
+
+### The premise under a removed layer, and a completeness claim about a commit
+
+Two gates ran on the same commit. Both found the register row corrected in the section above, which
+is corroboration rather than repetition. They also found three things that round had not, and I found
+a fourth in myself while acting on them.
+
+**The premise under the removed layer had no test.** `install_credential_guard` says four stock
+handlers are wholly uncovered and that the trade is acceptable "only because this app builds nothing
+but `StreamHandler`s on `sys.stdout`". True by grep, and it was the justification for DELETING a
+security layer with nothing holding it. A review put this project's own argument back to it: a
+published list nothing reads is a claim, not a control - made here about `GUARDED_STREAM_ATTRIBUTES`,
+and it applies with more force to a premise than to a constant. Adding `QueueHandler` for async
+logging is a routine container change, the import allowlist cannot see it (`from logging.handlers
+import QueueHandler` records the top-level name `logging`, already permitted), and nothing would
+have gone red.
+
+It is asserted now, over the real source. Every `logging` handler class the standard library offers is
+enumerated from `logging` and `logging.handlers`, and constructing any of them outside
+`{StreamHandler}` fails. Whoever adds one has to return to the cost statement and decide whether the
+record scan needs to come back. A `QueueHandler` and a `SocketHandler` construction each turn it red.
+
+**A stale-prose sweep was declared complete for the third time.** The previous round said "seven
+sentences" and treated the sweep as closed; six more sites still named the deleted filter or the
+deleted constructor patch as the live mechanism. One was not stale but FALSE: a test docstring saying
+a malformed record "now REFUSES the record, with a distinct alarm", when that alarm no longer exists
+and such a record is emitted nowhere at all. Two test docstrings eight hundred lines apart
+contradicted each other about whether the construction patch exists.
+
+**And the fourth failure was mine, found while fixing the third.** The commit before this one claimed
+in its own message that an attribution now appeared in "both documents". It appeared in one:
+`git show --stat` shows that commit never touched `docs/SECURITY.md` at all, and the edit I believed I
+had made to it was not on disk. So the message asserted the contents of its own diff, wrongly, when
+one command would have checked it.
+
+The rule out of all four is the same and it is now written down rather than intended. A completeness
+claim - "everywhere", "both", "all of them", "the sweep is closed" - is a claim like any other and
+needs the same evidence. For prose that means a mechanical search for the claim's own vocabulary
+returning nothing. For a commit message it means `git show --stat` before the message is written, not
+after. Three of the four failures cost a round each; none of them cost anything to prevent.
+
+Two smaller corrections. A comment said the reason string is composed server-side "in both handlers
+that log one" while three sites apply the cap. And two of those three cannot reach it, because their
+messages are literals - which does NOT make the slices dead code under the rule that removed three
+branches from `audit.py`: those never executed, while a slice on a short string executes and returns
+the string. What would be unsafe is a bound applied at two of three sites, because the next dynamic
+message added at the third would leave the bound behind.
 
 ## Not accepted, and why it is not a risk here
 

@@ -10,6 +10,7 @@ import inspect
 import io
 import json
 import logging
+import logging.handlers
 import os
 import re
 import secrets
@@ -4057,14 +4058,15 @@ def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
     silent pass waits. So each is driven.
 
     A record whose `%`-formatting raises (wrong argument count) must not become an emitted secret
-    and must not take the process down. Both halves of that used to be described wrongly here: the
-    filter was said to let such a record "through unscrubbed" because "logging would otherwise
-    swallow the exception and emit it anyway". It now REFUSES the record instead, with a distinct
-    alarm, because a part of the default rendering that the guard could not read is a line going out
-    unscanned; and a raise inside a filter is not swallowed at all - it propagates to the `logger.*`
-    call site and the record is emitted nowhere, which is why the guard substitutes rather than
-    raises. The `isatty` and `encoding` fallbacks exist because the wrapper forwards only what a
-    stream user actually touches, and something asking a wrapped stream for either must not get an
+    and must not take the process down. What happens to it has now been described wrongly here
+    TWICE, so this states the measured behaviour rather than a remembered design. The first version
+    said a per-handler filter let such a record "through unscrubbed"; the second said the filter
+    "REFUSES the record with a distinct alarm". Neither is true now: there is no filter, and no
+    second alarm - both went with the record-scanning layer. `guarded_format` calls the underlying
+    `Handler.format`, `%`-formatting raises inside `Formatter.format`, and `handleError` discards
+    the emission. So the record is emitted NOWHERE, which is what this asserts: no secret, and no
+    process death. The `isatty` and `encoding` fallbacks exist because the wrapper forwards only
+    what a stream user touches, and something asking a wrapped stream for either must not get an
     AttributeError.
     """
     secret = "Ip8Ok1Aj4Sh6Dg3F-Zq7-Wx9_Yt2.Ur5"
@@ -4085,9 +4087,10 @@ def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
     audit_logger.propagate = False
     install_credential_guard(secret)
     try:
-        # Two format placeholders, one argument: `getMessage()` raises inside the filter. The
-        # lint rule that flags this is exactly right in production code, and this is the one place
-        # the malformed record IS the input under test, so it is silenced here and nowhere else.
+        # Two format placeholders, one argument, so `getMessage()` raises inside `Formatter.format`
+        # - not inside a filter, which is where an earlier version of this comment put it. The lint
+        # rule that flags this is exactly right in production code, and this is the one place the
+        # malformed record IS the input under test, so it is silenced here and nowhere else.
         audit_logger.info("a broken record %s %s", "only-one")  # noqa: PLE1206
     finally:
         audit_logger.handlers = previous
@@ -4157,9 +4160,10 @@ def test_the_runtime_guard_covers_handlers_it_was_never_told_about() -> None:
     Three lines in a handler then put the credential in the aggregated pod log on an unauthenticated
     401 with 343 tests and both linters green.
 
-    So the filter attaches to handlers, existing and future, and a handler holding the pre-wrap
-    stream is re-pointed at the wrapper. `Handler.handle` runs handler filters for every record that
-    reaches it, whatever logger emitted it, which removes the name enumeration.
+    The per-handler filter that answered this is gone; `logging.Handler.format` is patched instead,
+    which every stock handler routes through whatever logger emitted the record, so the name
+    enumeration stays removed and nothing has to be attached to anything. A handler holding the
+    pre-wrap stream is still re-pointed at the wrapper, which is the byte-channel half.
 
     Every channel below is a logger this module was NEVER told about, with its handler built BEFORE
     arming, which is exactly gunicorn's ordering.
@@ -4193,7 +4197,10 @@ def test_the_runtime_guard_covers_handlers_it_was_never_told_about() -> None:
         for name in unknown_names:
             logging.getLogger(name).error("leak via %s: %s", name or "root", secret)
         child.info("leak via a propagated descendant: %s", secret)
-        # A handler built AFTER arming, which the construction patch must cover.
+        # A handler built AFTER arming. The construction patch that used to cover this is deleted -
+        # `test_arming_twice_does_not_stack_the_stdlib_patches` asserts it stays deleted - and the
+        # patched `Handler.format` covers it instead, for every handler rather than the ones a walk
+        # happened to find.
         later = logging.getLogger("made.after.arming")
         restore.append((later, later.handlers, later.level, later.propagate))
         later_handler = logging.StreamHandler(sink)
@@ -4230,8 +4237,8 @@ def test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming() -
     plaintext. Replacing the `sys.stdout` OBJECT does nothing for a handler holding the old one.
 
     Driven through `emit` directly rather than through a logger, because that is the path a
-    re-pointed stream is the only defence on: the filter would catch a record routed through
-    `handle`, so a test that only logs cannot tell the two halves apart.
+    re-pointed stream is the only defence on: `guarded_format` scans anything routed through
+    `Handler.format`, so a test that only logs cannot tell the two halves apart.
     """
     secret = "Ur5~Ip8Ok1Aj4Sh6Dg3F-Zq7-Wx9_Yt2"
     sink = io.StringIO()
@@ -4470,7 +4477,13 @@ class _HostileAdd(str):
 
 
 class _Enricher(logging.Filter):
-    """The ordinary context-enricher pattern, attached AFTER the guard's own filter."""
+    """The ordinary context-enricher pattern.
+
+    Historically the decisive bypass: the deleted construction patch made the record-scanning filter
+    the FIRST filter on every handler, so anything attached later ran after it and whatever it put
+    on the record went unscanned. The finished-line scan is downstream of every filter, which is why
+    this is now a case that passes rather than one that leaked.
+    """
 
     def __init__(self, secret: str) -> None:
         super().__init__()
@@ -5241,6 +5254,74 @@ EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
         }
     ),
 }
+
+
+# The only `logging` handler class this package may construct. `StreamHandler` and nothing else, and
+# this constant is the premise the credential guard's whole cost argument rests on rather than a
+# style preference.
+PERMITTED_HANDLER_CLASSES = frozenset({"StreamHandler"})
+
+
+def test_the_package_constructs_no_handler_that_serialises_a_record() -> None:
+    """The premise under the removed security layer, held by a test instead of by a grep.
+
+    `install_credential_guard` states that four stock handlers serialise `record.__dict__` and are
+    WHOLLY uncovered since the record-scanning layer was removed, and says the trade is acceptable
+    "only because this app builds nothing but `StreamHandler`s on `sys.stdout`". That sentence is
+    true today, and it was the justification for deleting a security layer with nothing holding it.
+
+    A review put the point in my own words back to me: a published list nothing reads is a claim,
+    not a control. That argument was made here about `GUARDED_STREAM_ATTRIBUTES`, and it applies
+    with more force to a PREMISE than to a constant. Adding `QueueHandler` for async logging is a
+    routine container change, `test_every_module_imports_exactly_what_it_is_permitted_to` cannot see
+    it (`from logging.handlers import QueueHandler` records the top-level name `logging`, which
+    `audit.py` is already permitted), and nothing else would have gone red.
+
+    So the premise is asserted over the real source. Any construction of a `logging` handler class
+    outside `PERMITTED_HANDLER_CLASSES` fails here, and whoever adds one has to come back to
+    `install_credential_guard`'s cost statement and decide whether the record scan needs to return.
+    """
+    package = Path(app_module.__file__ or "").resolve().parent
+    modules = sorted(package.glob("*.py"))
+    assert modules, "no package modules found, so this test would pass vacuously"
+
+    # Every `logging` handler class the standard library offers, so the check is a denylist of what
+    # `logging` PROVIDES rather than a guess at what someone might type.
+    handler_names = {
+        name
+        for module in (logging, logging.handlers)
+        for name, value in vars(module).items()
+        if isinstance(value, type) and issubclass(value, logging.Handler)
+    }
+    assert "QueueHandler" in handler_names and "SocketHandler" in handler_names, (
+        f"the handler-class sweep found {sorted(handler_names)}, which does not include the "
+        f"classes this test exists to refuse, so it would pass vacuously"
+    )
+
+    constructed: dict[str, list[str]] = {}
+    for module_path in modules:
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            called = node.func
+            name = (
+                called.attr
+                if isinstance(called, ast.Attribute)
+                else called.id
+                if isinstance(called, ast.Name)
+                else None
+            )
+            if name in handler_names and name not in PERMITTED_HANDLER_CLASSES:
+                constructed.setdefault(module_path.name, []).append(name)
+
+    assert constructed == {}, (
+        f"the package constructs {constructed}, outside {sorted(PERMITTED_HANDLER_CLASSES)}. Four "
+        f"stock handlers serialise `record.__dict__` and are wholly uncovered by the credential "
+        f"guard since the record-scanning layer was removed; `install_credential_guard` justifies "
+        f"that removal on this package building nothing but `StreamHandler`s. Adding one of these "
+        f"means revisiting that decision, not editing this list"
+    )
 
 
 def test_every_module_imports_exactly_what_it_is_permitted_to() -> None:
