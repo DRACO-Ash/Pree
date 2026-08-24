@@ -52,6 +52,7 @@ from pree.app import (
 )
 from pree.audit import (
     CREDENTIAL_ALARM,
+    GUARDED_STREAM_ATTRIBUTES,
     _GuardedStream,
     audit,
     build_logger,
@@ -3914,6 +3915,66 @@ _MEASURED_LEAK_ROUTES = (
 )
 
 
+def test_every_named_stream_attribute_is_wrapped_and_restored() -> None:
+    """All FOUR `sys` text streams, driven from the list the module publishes.
+
+    The register claimed a write through any of `sys.stdout`, `sys.stderr`, `sys.__stdout__` or
+    `sys.__stderr__`, and only the stdout pair was ever driven. A review deleted the `sys.stderr`
+    wrap, then the `sys.__stderr__` wrap, then the stderr restore, and the full suite stayed green
+    for all three.
+
+    That is live in the shipped image rather than theoretical. `Dockerfile` launches gunicorn with
+    `--error-logfile -`, and gunicorn builds that as a `StreamHandler` on `ext://sys.stderr` in
+    `Arbiter.setup` - before the worker imports the app factory, so it holds the PRE-WRAP object and
+    depends on both the wrap and the re-point. The one channel the deployment is most likely to leak
+    a boot-time error through was the one channel with no test.
+
+    Driven by ITERATING `GUARDED_STREAM_ATTRIBUTES`, which is the other half of this fix: that
+    constant's own comment said it documented "what a test asserts the code handles", and nothing
+    referenced it anywhere in the repository. A published list nothing reads is a claim, not a
+    control. Now a new attribute added to it must be wrapped, refused and restored, or this fails.
+    """
+    secret = "Ur5-Ip8_Ok1.Aj4~Sh6Dg3FZq7Wx9Yt5"
+    assert set(GUARDED_STREAM_ATTRIBUTES) == {"stdout", "stderr", "__stdout__", "__stderr__"}, (
+        f"the published stream list changed: {GUARDED_STREAM_ATTRIBUTES}. Every member needs the "
+        f"wrap, the refusal and the restore, which is what this test drives"
+    )
+
+    for name in GUARDED_STREAM_ATTRIBUTES:
+        sink = io.StringIO()
+
+        # Untyped accessors, because typeshed marks the dunder pair `Final` and assigning them
+        # directly makes mypy treat every following line as unreachable, silently deleting the
+        # assertions. The same reason the dunder test uses one.
+        def read_stream(attribute: str = name) -> Any:
+            return getattr(sys, attribute)
+
+        def set_stream(value: Any, attribute: str = name) -> None:
+            setattr(sys, attribute, value)
+
+        original = read_stream()
+        set_stream(sink)
+        install_credential_guard(secret)
+        try:
+            wrapped = read_stream()
+            assert isinstance(wrapped, _GuardedStream), f"sys.{name} was not wrapped"
+            wrapped.write(f"a leak through sys.{name}: {secret}\n")
+            wrapped.write(f"a benign line through sys.{name}\n")
+            emitted = sink.getvalue()
+        finally:
+            install_credential_guard(None)
+            restored = read_stream()
+            set_stream(original)
+
+        assert secret not in emitted, f"sys.{name} passed the credential through: {emitted!r}"
+        assert emitted.count(CREDENTIAL_ALARM) == 1, f"sys.{name}: expected one alarm: {emitted!r}"
+        assert f"a benign line through sys.{name}" in emitted, (
+            f"sys.{name} suppressed a line carrying no credential, which is a denial of service on "
+            f"the log rather than a control on it"
+        )
+        assert restored is sink, f"disarming did not restore sys.{name}: {restored!r}"
+
+
 def test_the_runtime_guard_refuses_the_channels_it_covers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4203,16 +4264,21 @@ def test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming() -
 
 
 def test_the_guard_finds_a_handler_the_private_registry_has_forgotten() -> None:
-    """Why the handler walk has TWO sources, asserted rather than asserted-in-prose.
+    """Why the handler walk has TWO sources, asserted on what the walk still feeds.
 
-    The docstring says "either alone has a gap" and nothing exercised the second source: coverage
-    reported the manager walk as a miss on a green run, and deleting it left 344 passed.
+    The walk's only consumer now is the stream RE-POINT, and this test had quietly stopped measuring
+    it. It used to assert that a record through such a handler was refused, which the per-handler
+    filter delivered; when that layer was removed, the patched `Handler.format` satisfied the same
+    assertion, so the test passed whether or not the walk found the handler. A review confirmed it:
+    stubbing `_existing_handlers` to return nothing left this test green and only the re-point test
+    red. That is the exact state the docstring here used to record as the reason it was written.
 
-    It is genuinely load-bearing. `logging.config.dictConfig({"version": 1})` clears
-    `logging._handlerList`, so a handler still attached to a logger becomes invisible to the private
-    registry and is found only by walking the manager's loggers.
+    So it asserts the re-point directly, with `logging._handlerList` cleared exactly as
+    `logging.config.dictConfig({"version": 1})` clears it, leaving the handler attached to a NAMED
+    logger where only the manager walk can reach it. Deleting either source of `_existing_handlers`
+    now fails something.
     """
-    secret = "Ip8Ok1Aj4Sh6Dg3F-Ur5-Zq7-Wx9_Yt2x"
+    secret = "Ip8-Ok1_Aj4.Sh6~Dg3FZq7Wx9Yt2Ur6"
     sink = io.StringIO()
     logger = logging.getLogger("forgotten.by.the.registry")
     previous, previous_level, previous_propagate = (
@@ -4220,12 +4286,15 @@ def test_the_guard_finds_a_handler_the_private_registry_has_forgotten() -> None:
         logger.level,
         logger.propagate,
     )
+    # Built while `sys.stdout` IS this sink, so the handler captures the PRE-WRAP object and the
+    # re-point is what has to find it.
+    saved_stdout = sys.stdout
+    sys.stdout = sink
     handler = logging.StreamHandler(sink)
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.handlers = [handler]
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    # Clear the private registry, exactly as dictConfig does, leaving the handler attached.
     registry = getattr(logging, "_handlerList", None)
     saved = list(registry) if registry is not None else []
     if registry is not None:
@@ -4237,18 +4306,26 @@ def test_the_guard_finds_a_handler_the_private_registry_has_forgotten() -> None:
         ], "the private registry still knows the handler, so this test proves nothing"
         install_credential_guard(secret)
         try:
-            logger.error("leak via a forgotten handler: %s", secret)
+            repointed = handler.stream
+            direct = handler.stream.write(f"a direct write past the formatter: {secret}\n")
             emitted = sink.getvalue()
         finally:
             install_credential_guard(None)
     finally:
         if registry is not None:
             registry.extend(saved)
+        sys.stdout = saved_stdout
         logger.handlers = previous
         logger.setLevel(previous_level)
         logger.propagate = previous_propagate
+        handler.close()
 
-    assert secret not in emitted, f"a handler missing from the private registry leaked: {emitted!r}"
+    assert isinstance(repointed, _GuardedStream), (
+        "a handler missing from the private registry was not re-pointed, so the manager walk did "
+        "not find it and a DIRECT write to its captured stream is unguarded"
+    )
+    assert isinstance(direct, int)
+    assert secret not in emitted, f"the re-pointed handler leaked on a direct write: {emitted!r}"
     assert emitted.count(CREDENTIAL_ALARM) == 1, f"expected one alarm: {emitted!r}"
 
 
@@ -4361,14 +4438,20 @@ class _LyingStrValue(str):
 
     `__contains__` defeats `x in text`. `__str__` defeats `str(text)`, which is the one that
     mattered: a coercion written as `str(text)` reads THIS method, so it scanned "harmless"
-    while the characters held the credential. Only `str.__str__(text)` reads the object.
-    characters held the credential. Only `str.__str__(text)` reads the underlying object.
+    while the characters held the credential. Only `str.__str__(text)` reads the underlying object,
+    and `value[:]` is defeated the same way, through `__getitem__`.
     """
 
     def __contains__(self, item: object) -> bool:
         return False
 
     def __str__(self) -> str:
+        return "harmless"
+
+    def __getitem__(self, item: object) -> str:
+        # `value[:]` was the other coercion a docstring claimed was defended against, and a canary
+        # found it survived: nothing overrode this, so slicing returned the real characters and the
+        # mutation looked harmless. Overriding it makes the claim true or the test red.
         return "harmless"
 
 
@@ -4429,7 +4512,9 @@ def _emit_one(
     if armed:
         install_credential_guard(secret)
     if enrich:
-        # AFTER arming, so the guard's own filter is already first and this one runs after it.
+        # AFTER arming. This was the historical bypass: the deleted construction patch made the
+        # record-scanning filter first, so anything added later ran after it and went unscanned. The
+        # finished-line scan is downstream of every filter, which is why the case is closed now.
         handler.addFilter(_Enricher(secret))
     try:
         logger.handle(
@@ -4456,8 +4541,8 @@ def test_the_finished_line_is_scanned_whatever_produced_it() -> None:
 
     `logging.Handler.format` is where a stock handler turns a record into the string it emits, so
     scanning its return value is indifferent to which attribute, conversion, formatter default,
-    filter, or `__str__` produced the text. The record scan is kept for early refusal and
-    field-level redaction; it is no longer what makes the guarantee.
+    filter, or `__str__` produced the text. The record-scanning layer that these cases used to be
+    checked against is gone; this is now the only layer covering the log channel.
 
     Each case runs DISARMED first. A case whose channel does not reach the line unguarded proves
     nothing about the guard, and this suite has been caught by exactly that kind of vacuous pass.
@@ -4744,11 +4829,16 @@ def test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces() -> None:
 def test_arming_twice_does_not_stack_the_stdlib_patches() -> None:
     """The idempotence guards on two permanent stdlib patches, held rather than assumed.
 
-    `install_credential_guard` patches `logging.Handler.format` and `logging.Handler.__init__`, and
-    each patch checks a marker before wrapping. Neither check was held by anything: a review deleted
-    the one on `format` and measured the wrapper depth going 1, then 11, then 61 as arming repeated,
-    with the per-line cost rising by a third. This suite arms roughly thirty times, so it is a
-    reachable defect rather than a speculative one.
+    `install_credential_guard` patches `logging.Handler.format`, and the patch checks a marker
+    before wrapping. That check was held by nothing: a review deleted it and measured the wrapper
+    depth going 1, then 11, then 61 as arming repeated, with the per-line cost rising by a third.
+    This
+    suite arms roughly thirty times, so it is a reachable defect rather than a speculative one.
+
+    ONE patch, not two. This asserted both `format` and `__init__` for a commit after the
+    construction patch was deleted, so half of it compared the stock `logging.Handler.__init__` with
+    itself and could not fail. An assertion that cannot fail is worse than no assertion, because it
+    reads as coverage.
 
     Asserted by IDENTITY, which is the only thing that distinguishes "checked the marker" from
     "wrapped again with an identical closure".
@@ -4756,20 +4846,20 @@ def test_arming_twice_does_not_stack_the_stdlib_patches() -> None:
     secret = "4Sh-6Dg_3FZ.q7W~x9Yt2Ur5Ip8Ok1Aj4"
     install_credential_guard(secret)
     try:
-        after_first = (logging.Handler.format, logging.Handler.__init__)
+        after_first = logging.Handler.format
         for _ in range(5):
             install_credential_guard(secret)
-        after_more = (logging.Handler.format, logging.Handler.__init__)
+        after_more = logging.Handler.format
     finally:
         install_credential_guard(None)
 
-    assert after_more[0] is after_first[0], (
+    assert after_more is after_first, (
         "arming again wrapped `Handler.format` a second time, so every line in the process pays "
         "for one wrapper per arming and the depth grows without bound"
     )
-    assert after_more[1] is after_first[1], (
-        "arming again wrapped `Handler.__init__` a second time, so a handler built later carries "
-        "one duplicate filter per arming"
+    assert getattr(logging.Handler.__init__, "_pree_guarded", False) is False, (
+        "`Handler.__init__` is patched, but the construction patch was deleted with the filter "
+        "layer. Something has re-added it without re-adding a test for it"
     )
 
 
@@ -4783,8 +4873,9 @@ def test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_onl
     control that takes the process down is one an operator removes.
 
     Both halves are asserted, because the soft failure is only acceptable if the other half holds:
-    arming completes, and the record is still alarmed by the FILTER even though the stream could not
-    be re-pointed.
+    arming completes, and what the handler emits is still alarmed - by the finished-line scan at
+    `Handler.format`, since the per-handler filter that used to do it has been removed - even though
+    the stream could not be re-pointed.
     """
     secret = "Yt2-Ur5_Ip8.Ok1~Aj4Sh6Dg3FZq7Wx9"
     sink = io.StringIO()
@@ -4835,7 +4926,8 @@ def test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_onl
 
     assert handler.stream is sink, "the read-only stream was somehow reassigned"
     assert secret not in emitted, (
-        f"the filter half did not cover a handler whose stream could not be re-pointed: {emitted!r}"
+        f"the finished-line scan did not cover a handler whose stream could not be re-pointed: "
+        f"{emitted!r}"
     )
     assert emitted.count(CREDENTIAL_ALARM) == 1, f"expected one alarm: {emitted!r}"
 

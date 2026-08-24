@@ -155,17 +155,17 @@ the assessment store.
 | The output guard covers handlers it was never told about, including propagated records and handlers built before arming | `src/pree/audit.py` | `test_the_runtime_guard_covers_handlers_it_was_never_told_about` |
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
-| Arming twice does not stack either stdlib patch | `src/pree/audit.py` | `test_arming_twice_does_not_stack_the_stdlib_patches` |
+| Arming twice does not stack the `Handler.format` patch, and the deleted `Handler.__init__` patch stays deleted | `src/pree/audit.py` | `test_arming_twice_does_not_stack_the_stdlib_patches` |
 | The SHIPPED rate limits are the ones a deployed pod enforces, driven with no limiter injected | `src/pree/ratelimit.py` | `test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces` |
 | The finished line is scanned whatever produced it: `%(args)s` the message never consumed, a `repr` conversion, a formatter default, a lying `str` subclass, a filter running after the guard's | `src/pree/audit.py` | `test_the_finished_line_is_scanned_whatever_produced_it` |
 | ARMING THE GUARD NEVER EMITS WHAT THE DISARMED PROCESS WOULD NOT | `src/pree/audit.py` | `test_the_armed_guard_never_emits_what_the_disarmed_process_would_not` |
 | The value EMITTED is the value that was scanned, at all three comparison points: a lying `__str__`, a credential-bearing `__add__`, and the type the stream wrapper passes on | `src/pree/audit.py` | `test_the_value_that_is_emitted_is_the_value_that_was_scanned` |
 | Arming calls no caller code the disarmed process would not, so the invariant holds by mechanism and not by observation | `src/pree/audit.py` | `test_arming_calls_no_caller_code_the_disarmed_process_would_not` |
-| The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the filter half still covers it | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
+| The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the finished-line scan at `Handler.format` still covers what it emits | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
 | No credential-bearing line reaches any logging handler, scanned as the FINISHED LINE at `logging.Handler.format` so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant; nor a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that does not emit `Handler.format`'s return value (`HTTPHandler` urlencodes `record.__dict__`; `SocketHandler` and `DatagramHandler` pickle it; no subclassing needed and since the record-scanning layer was removed these are WHOLLY uncovered, which is acceptable only because this app builds nothing but `StreamHandler`s on stdout), NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_finished_line_is_scanned_whatever_produced_it`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
 | The introspection guard has NO exemptions, the one it carried having left with the layer that needed it | `tests/test_api.py` | `test_the_introspection_guard_has_no_exemptions` |
 | A refused write reports the CALLER's length, so a caller looping until everything is written does not re-submit the credential-bearing tail | `src/pree/audit.py` | `test_the_guard_reports_the_callers_length_when_it_refuses_a_write` |
-| A handler that captured a stream before arming is re-pointed at the wrapper, WHERE `stream` is assignable; where it is not, the filter half alone covers it and a direct write to its captured stream is uncovered | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming`, `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
+| A handler that captured a stream before arming is re-pointed at the wrapper, WHERE `stream` is assignable; where it is not, the finished-line scan at `Handler.format` still covers what it emits and only a direct write to its captured stream is uncovered | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming`, `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
 | A handler the private registry has forgotten is still found | `src/pree/audit.py` | `test_the_guard_finds_a_handler_the_private_registry_has_forgotten` |
 | No representation of a `Config` can print the credential | `src/pree/config.py` | `test_the_config_never_prints_the_credential_in_any_representation` |
 | The HTTP layer is handed a config with no token field and a callable, so the secret is not in its object graph | `src/pree/app.py` | `test_the_service_config_the_http_layer_receives_carries_no_credential` |
@@ -3104,14 +3104,22 @@ was reachable from the unauthenticated edge. All were self-inflicted.
 
 **What removing it bought, measured.** `audit.py` fell from 212 statements to 152, a 28% reduction.
 
-One figure needs reconciling before anyone reads it as wrong. The counts here are the LOOP's, run in
+One figure was WRONG and is withdrawn. "The suite went from 37 seconds to 27" did not reproduce: a
+review measured five runs on the same hardware and venv at 28.35, 26.36, 26.92, 26.73 and 27.69
+seconds, base and head statistically indistinguishable. The 37-second reading was taken while two
+reviewer subagents were working on the same machine, so it measured contention rather than the
+change. The statement count and the near-zero per-line delta hold and carry the argument without it.
+A figure asserted from one contaminated reading is exactly what this project's own hard rules forbid,
+and the reviewer was right to refuse it.
+
+One further figure needs reconciling before anyone reads it as wrong. The counts here are the LOOP's, run in
 the repository: 366 tests before, 356 after. A reviewer working from a `git archive` export sees one
 fewer passing and one skipped, because `test_boot_contract.py`'s gitignore check skips where there is
 no work tree ("no git work tree: nothing can be committed here, so nothing to ignore"). Both numbers
 are right for their environment. Recorded because two reviewers now work from exports, by request,
 after a canary run in the working tree polluted one of their measurements.
-The suite went from 366 tests to 356 and from 37 seconds to 27. The guard's per-line cost is now the
-finished-line scan alone, which a review measured at 0.00 microseconds against a 8.76 microsecond
+The suite went from 366 tests to 356. The guard's per-line cost is now the finished-line scan
+alone, which a review measured at 0.00 microseconds against an 8.76 microsecond
 baseline - the removed layer was the whole of the armed overhead. And the introspection guard is back
 to ZERO exemptions: the one it carried existed solely because the record scan needed `vars(record)`,
 and it left with the layer that needed it. Needing no exemption is strictly better than having a
@@ -3130,6 +3138,58 @@ produced them was the one that reasoned about what output WOULD contain instead 
 did. A control that models its subject accumulates the model's gaps. Two controls in this codebase
 now read the actual artefact - the finished log line, and the bytes going to a stream - and neither
 has been defeated. The right response to a control that keeps failing is not always a better model.
+
+### The stderr half of the byte channel, asserted for two rounds and driven for none
+
+The engineering gate failed the reduction, and its findings split cleanly into one real hole, one
+false figure of mine, and seven sentences describing machinery that no longer exists. The hole is the
+one worth reading.
+
+**The register claimed four `sys` streams and the suite drove two.** Deleting the `sys.stderr` wrap,
+then the `sys.__stderr__` wrap, then the stderr restore each left the full suite green. The channels
+test drove stdout and the audit logger; `grep` for `stderr` across the guard tests found nothing.
+
+That is not theoretical in the shipped image. The `Dockerfile` launches gunicorn with
+`--error-logfile -`, and gunicorn builds that as a `StreamHandler` on `ext://sys.stderr` inside
+`Arbiter.setup` - before the worker imports the app factory, so it holds the PRE-WRAP object and
+depends on both the wrap and the re-point. The channel most likely to carry a boot-time error out of
+the pod was the one channel with no test behind it.
+
+The fix drives all four by ITERATING `GUARDED_STREAM_ATTRIBUTES`, which closes a second finding in the
+same stroke: that constant's own comment said it documented "what a test asserts the code handles",
+and nothing in the repository referenced it. A published list nothing reads is a claim, not a control.
+Now an attribute added to it must be wrapped, refused and restored or the test fails.
+
+**Two tests had gone vacuous as a side effect of the reduction, which is a shape worth naming.**
+Neither was wrong when written; both were satisfied by a different layer once the filter was removed.
+
+● `test_arming_twice_does_not_stack_the_stdlib_patches` asserted identity on both patched methods.
+  The `Handler.__init__` patch was deleted with the filter layer, so that half compared the stock
+  method with itself and could not fail. It now asserts the surviving patch by identity and that the
+  deleted one has NOT come back.
+● `test_the_guard_finds_a_handler_the_private_registry_has_forgotten` asserted that a record through
+  a forgotten handler was refused. The per-handler filter used to deliver that; afterwards the
+  patched `Handler.format` delivered it instead, so the test passed whether or not the walk found the
+  handler. Stubbing `_existing_handlers` to return nothing left it green. It now asserts the
+  RE-POINT, which is the only thing the walk still feeds, and both sources of the walk are held
+  again.
+
+**A figure of mine was wrong and is withdrawn.** "The suite went from 37 seconds to 27" did not
+reproduce: five runs on the same hardware measured base and head as indistinguishable. The
+37-second reading was taken while two reviewer subagents were running on the same machine, so it
+measured contention. Removing 17% of a module and ten tests had no measurable wall-clock effect, and
+the honest version of the claim is the statement count and the near-zero per-line delta, both of
+which reproduce. A figure from one contaminated reading is precisely what this project's hard rules
+forbid.
+
+**And seven sentences still described the deleted layer as live** - two in `audit.py` saying the
+three serialising handlers still had the record scan, one saying "the record scan is KEPT", two
+register rows crediting "the filter half", one present-tense bullet about the deleted constructor
+patch, plus four in test prose and an orphaned comment fragment left ending in "and". None changed
+behaviour. All of them would have told the next reader that a layer exists which does not, which is
+the failure mode this project has paid for more than any other.
+
+Eleven mutations re-run afterwards, including every one the review found green: all eleven red.
 
 ## Not accepted, and why it is not a risk here
 

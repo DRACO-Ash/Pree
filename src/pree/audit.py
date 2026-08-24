@@ -149,7 +149,6 @@ _GUARDED_CREDENTIAL: str | None = None
 CREDENTIAL_ALARM = '{"kind":"credential_guard","outcome":"refused_a_line_carrying_the_credential"}'
 
 
-# There was a second alarm here, for a record whose default rendering the guard could not read, and
 def _exact_text(value: str) -> str:
     """The characters a value actually holds, as a `str` with builtin behaviour.
 
@@ -341,9 +340,11 @@ def install_credential_guard(expected: str | None) -> None:
         pickle it - and a `Handler` subclass overriding `format` is a fourth way. No subclassing is
         required for the first three, which is why this is listed here and not folded into the
         same-privilege class: a review put the credential on the wire from a stock handler plus an
-        ordinary context-enricher filter. For those handlers the record scan is the only layer, so
-        `str` attributes are redacted and whatever a later filter adds is not. This project's own
-        handlers are `StreamHandler`s on `sys.stdout`, so none of it is live here.
+        ordinary context-enricher filter. NOTHING covers those three now: the record-scanning
+        filter that was their only layer has been removed, so they are wholly uncovered rather than
+        partly. This project's own handlers are `StreamHandler`s on `sys.stdout` - the only handler
+        construction anywhere in `src/` - so none of it is live here, and in a service that ships
+        logs over a socket this trade would be the wrong one.
       ● **Any channel that is not a log line.** The reach above is "a write through a wrapped `sys`
         text stream, and a record passing a `logging.Handler`". A credential put in a RESPONSE BODY,
         written to a file on the data volume, used as a FILENAME, or passed in a child process's
@@ -525,9 +526,11 @@ def _patch_handler_format() -> None:
       ● `Formatter(defaults={...})`, where the value never touches the record, so no record scan can
         see it however complete.
       ● A `str` subclass whose `__contains__` lies, kept verbatim by an `isinstance` check.
-      ● A filter added AFTER this guard's, which is the ordinary context-enricher pattern: the
-        patched constructor makes the guard the first filter, so every later one runs after it and
-        whatever it puts on the record is unscanned.
+      ● A filter added AFTER the record-scanning one, which is the ordinary context-enricher
+        pattern: the patched constructor MADE that guard the first filter, so every later one ran
+        after it and whatever it put on the record was unscanned. Both the constructor patch and the
+        filter are gone; this bullet is one of the six historical bypasses that forced the move to
+        scanning the finished line, not a live description.
       ● An attribute whose `__str__` raises on the first call and returns the credential on the
         second. This was the worst of the six, because it made the guard actively harmful: DISARMED,
         the formatter's first call raises and `handleError` discards the emission, so nothing is
@@ -550,14 +553,9 @@ def _patch_handler_format() -> None:
     `exc_text` side effect, throw the return away, and pickle `record.__dict__`. A review measured a
     675-byte pickle and a 533-byte POST body carrying the credential from stock handlers with no
     subclassing at all. For those three the finished-line scan does not apply and the RECORD scan is
-    the only layer, so its reach is their reach: `str` attributes are redacted, anything a later
-    filter adds is not. Named in the uncovered set below, where the residual was previously
-    described as needing a `Handler` subclass - which understated it, since none of this needs one.
-
-    The record scan is KEPT, and its job has changed rather than gone: it refuses early and redacts
-    the individual field that carried the credential, so a refused record stays diagnosable. It is
-    no longer the guarantee, which is why its remaining gaps are a loss of redaction fidelity rather
-    than a leak.
+    their only layer, and that layer has since been removed, so those three are WHOLLY uncovered.
+    Named in the uncovered set below, where the residual was once described as needing a `Handler`
+    subclass - which understated it, since none of this needs one.
 
     What this does NOT cover, named because being exact about it is the whole discipline here: a
     `Handler` subclass that overrides `format`, or that emits without calling it. That is the

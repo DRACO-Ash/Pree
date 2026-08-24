@@ -1418,12 +1418,35 @@ writes through the four `sys` text streams.
   field. And `HTTPHandler`, `SocketHandler` and `DatagramHandler` lose their only layer, since none
   emits `Handler.format`'s return - acceptable here only because this app builds nothing but
   `StreamHandler`s on stdout.
-● **What it bought.** `audit.py` from 212 statements to 152; the suite from 366 tests to 356 and from
-  37 seconds to 27; the guard's per-line overhead reduced to the finished-line scan, measured at zero
-  against the baseline. And the introspection guard is back to NO exemptions, the one it carried
+● **What it bought.** `audit.py` from 212 statements to 152; the suite from 366 tests to 356; the
+  guard's per-line overhead reduced to the finished-line scan, measured at effectively zero against
+  the baseline. A "37 seconds to 27" claim in the first version of this row is WITHDRAWN: it did not
+  reproduce, because the slower reading was taken while two reviewer subagents were running on the
+  same machine and measured contention rather than the change. And the introspection guard is back to NO exemptions, the one it carried
   having existed only for the removed layer's `vars(record)`.
 
 `securityContext.fsGroup=10001` is CONFIRMED by the owner and recorded in `docs/DEPLOYMENT.md` as a
 required deployment parameter rather than an open decision.
 
 356 passing, coverage 99% against the gate's 80%, no missed statements.
+
+### The stderr half of the byte channel, and seven sentences describing a deleted layer
+
+The engineering gate failed the reduction. One real hole, one false figure, seven stale sentences.
+
+● **The register claimed four `sys` streams and the suite drove two.** Deleting the `sys.stderr`
+  wrap, the `sys.__stderr__` wrap, or the stderr restore each left the suite green - and it is live
+  in the shipped image, since the `Dockerfile` passes `--error-logfile -` and gunicorn builds that as
+  a `StreamHandler` on the pre-wrap `sys.stderr`. All four are now driven by iterating
+  `GUARDED_STREAM_ATTRIBUTES`, which also gives that published constant its first reader.
+● **Two tests went vacuous as a side effect of the reduction**, each satisfied by a surviving layer
+  rather than by the thing it named: the idempotence test asserted a patch that had been deleted, and
+  the forgotten-handler test passed whether or not the handler walk found anything. Both re-pointed
+  at what they are for.
+● **A figure is WITHDRAWN.** "37 seconds to 27" did not reproduce; the slower reading was taken with
+  two reviewer subagents on the same machine and measured contention.
+● **Seven sentences described the removed layer as live**, across the module, the register and the
+  test prose, plus an orphaned comment fragment ending in "and".
+
+Two new tests, one rewritten, 357 passing, coverage 99%. Eleven mutations re-run including every one
+the review found green: eleven red.
