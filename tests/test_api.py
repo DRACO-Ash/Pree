@@ -43,10 +43,12 @@ from pree.app import (
     LIVENESS_PATHS,
     MAX_BODY_BYTES,
     MAX_LOGGED_PATH,
+    MAX_LOGGED_REASON,
     MAX_VALIDATION_ERRORS_LOGGED,
     STORAGE_PROBE_PATH,
     STORE_KEY_PATTERN,
     UNMETERED_PATHS,
+    _first_refused,
     _limit_keys,
     create_app,
 )
@@ -4778,6 +4780,149 @@ def test_the_armed_guard_never_emits_what_the_disarmed_process_would_not() -> No
         f"ARMING THE GUARD CAUSED THE LEAK. The disarmed process emitted {disarmed!r} and the "
         f"armed one emitted {armed!r}. A control that leaks what its absence would have contained "
         f"is worse than no control"
+    )
+
+
+def test_the_audit_reason_field_is_bounded(tmp_path: Path, prober: StorageProber) -> None:
+    """`MAX_LOGGED_REASON` truncation, driven through the handler that applies it.
+
+    A review found removing `[:MAX_LOGGED_REASON]` left the suite green, and a first attempt at
+    fixing that asserted the CONSTANT and a synthetic slice - which held nothing, because the code
+    path was never entered. My own canary caught it: the mutation stayed green.
+
+    The input is reachable, which is why the cap is worth keeping rather than deleting like the
+    three dead defensive branches this module has shed. `app.py` records that both reason strings
+    are server-composed, and that is true of the CLIENT: `AuthError` carries a fixed literal and
+    `StoreError` embeds the configured data path. But the configured path is operator-supplied, so a
+    long `PREE_DATA_DIR` - or any future store message that grows - reaches this bound without a
+    caller doing anything. A `StoreError` whose message exceeds the cap is exactly that shape.
+    """
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    overlong = "a store failure whose text runs past the cap " + "x" * (MAX_LOGGED_REASON * 2)
+
+    class VerboseStore(JsonStore):
+        def upsert(self, key: str, record: dict[str, Any]) -> dict[str, Any]:
+            raise StoreError(overlong)
+
+    store = VerboseStore(config.data_dir)
+    store.seed()
+    buffer = io.StringIO()
+    app = create_app(
+        config.for_service(),
+        store,
+        verify_token=token_verifier(config),
+        logger=build_logger(buffer),
+        prober=prober,
+    )
+    with TestClient(app) as failing:
+        response = failing.post(
+            "/v1/assess",
+            json={"protected_asset_id": "a1", "candidate_id": "b1", "indicators": {}},
+            headers=AUTH,
+        )
+
+    assert response.status_code == 503
+    records = [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+    store_errors = [record for record in records if record.get("kind") == "store_error"]
+    assert len(store_errors) == 1, f"expected one store_error record: {records}"
+    reason = store_errors[0]["reason"]
+    assert len(overlong) > MAX_LOGGED_REASON, "the fixture does not exceed the cap"
+    assert len(reason) == MAX_LOGGED_REASON, (
+        f"the audit reason is {len(reason)} characters against a cap of {MAX_LOGGED_REASON}, so an "
+        f"operator-supplied path length reaches the audit line unbounded"
+    )
+    assert reason == overlong[:MAX_LOGGED_REASON], "the reason is not the head of the message"
+
+
+def test_the_cors_method_and_header_allowlists_are_the_narrow_ones(tmp_path: Path) -> None:
+    """Both CORS allowlists, pinned as VALUES on the built middleware.
+
+    A review found each replaceable by `["*"]` with the whole suite green. Exposure is small,
+    because `allow_credentials=True` limits the widening to the one configured origin, but neither
+    narrowing was held by anything, and the register counts a narrow CORS surface as a control.
+
+    Read off the constructed middleware rather than the module constants, so the assertion covers
+    the wiring as well as the values: a correct list passed to the wrong keyword would still fail.
+    """
+    config = make_config(
+        tmp_path,
+        PREE_ENV="production",
+        PREE_TEAM_TOKEN=PRODUCTION_TOKEN,
+        PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
+    )
+    store = JsonStore(config.data_dir)
+    store.seed()
+    prober = StorageProber(cache_seconds=0.0)
+    try:
+        app = create_app(
+            config.for_service(),
+            store,
+            verify_token=token_verifier(config),
+            logger=build_logger(io.StringIO()),
+            prober=prober,
+        )
+        # Matched by NAME, not identity: starlette types `Middleware.cls` as a factory protocol,
+        # so mypy rejects both `is` and an attribute read on it. The name is the stable property.
+        cors = [
+            m for m in app.user_middleware if getattr(m.cls, "__name__", "") == "CORSMiddleware"
+        ]
+    finally:
+        prober.shutdown()
+
+    assert len(cors) == 1, f"expected exactly one CORS middleware, found {len(cors)}"
+    options = cors[0].kwargs
+    assert options["allow_methods"] == ["GET", "POST"], (
+        f"the CORS method allowlist widened to {options['allow_methods']}. A wildcard admits every "
+        f"method the routes do not implement, from the one origin allowed to send credentials"
+    )
+    assert options["allow_headers"] == ["x-pree-token", "x-pree-actor", "content-type"], (
+        f"the CORS header allowlist widened to {options['allow_headers']}"
+    )
+    assert options["allow_credentials"] is True
+    assert options["allow_origins"] == [config.allowed_origin]
+
+
+def test_a_refused_key_still_charges_every_other_bucket() -> None:
+    """`_first_refused` charges EVERY key, and short-circuiting admits what the code refuses.
+
+    The docstring says short-circuiting "would leave the others uncounted, so a caller who is over
+    one limit would ride free on the rest", and a review found nothing held it: inverting the loop
+    to `return key` on the first refusal left all 356 tests green. It is not cosmetic. Over 400
+    randomised sequences on the shipped two-key space the mutant diverged 19 times, and it diverged
+    in the direction that matters - it ADMITTED requests the shipped code refuses - because a peer
+    already over its socket bucket stops charging the shared `forwarded` bucket, so the fold's
+    aggregate cap never bites.
+
+    Driven on the mechanism rather than through a saturation sequence, because a test that admits a
+    limiter's worth of requests to observe one divergence is slow and reads as a coincidence when it
+    fails. `_first_refused` is called with a limiter of capacity one and two keys, both already
+    saturated: the return value names the FIRST refusal, and the second key must have been charged
+    anyway, which is observable because a third call for that key alone must also refuse.
+    """
+    limiter = RateLimiter(1, 60.0)
+    # Both buckets spent, so both refuse on the next charge.
+    assert limiter.allow("socket:peer-a") is True
+    assert limiter.allow("forwarded") is True
+
+    refused = _first_refused(limiter, ("socket:peer-a", "forwarded"))
+    assert refused == "socket:peer-a", (
+        f"the first refusing key is not reported, so the audit record names the wrong bucket: "
+        f"{refused!r}"
+    )
+
+    # The load-bearing half. A fresh limiter, ONE key over and one with room: the second must still
+    # be charged even though the first already refused.
+    fresh = RateLimiter(2, 60.0)
+    assert fresh.allow("socket:peer-b") is True
+    assert fresh.allow("socket:peer-b") is True  # peer-b now spent
+    assert _first_refused(fresh, ("socket:peer-b", "forwarded")) == "socket:peer-b"
+    # `forwarded` had capacity 2 and must have been charged once by the call above, so exactly one
+    # charge remains. Under a short-circuiting `_first_refused` it was never charged, two remain,
+    # and this admits one request too many - the free ride the docstring warns about.
+    assert fresh.allow("forwarded") is True, "the shared bucket lost more than the one charge"
+    assert fresh.allow("forwarded") is False, (
+        "the shared `forwarded` bucket was NOT charged while another key was refusing, so a peer "
+        "over its socket limit rides free on the fold and the aggregate cap never bites"
     )
 
 

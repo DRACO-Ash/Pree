@@ -156,6 +156,10 @@ the assessment store.
 | Every module imports exactly what it is permitted to, so the library spelling of attribute access needs a visible change | `src/pree/app.py` | `test_every_module_imports_exactly_what_it_is_permitted_to` |
 | The named introspection spellings and an `os.environ` attribute read outside `load_config` are refused (NOT every route: see the nine-route entry) | `src/pree/app.py` | `test_no_module_reaches_the_credential_by_introspection_or_the_environment` |
 | Arming twice does not stack the `Handler.format` patch, and the deleted `Handler.__init__` patch stays deleted | `src/pree/audit.py` | `test_arming_twice_does_not_stack_the_stdlib_patches` |
+| A refused key still CHARGES every other bucket, so a peer over its socket limit cannot ride free on the shared fold | `src/pree/app.py` | `test_a_refused_key_still_charges_every_other_bucket` |
+| The CORS method and header allowlists are the narrow ones, read off the constructed middleware | `src/pree/app.py` | `test_the_cors_method_and_header_allowlists_are_the_narrow_ones` |
+| The audit `reason` field is bounded, driven through the handler that applies the bound | `src/pree/app.py` | `test_the_audit_reason_field_is_bounded` |
+| Every one of the four named `sys` stream attributes is wrapped, refuses, and is restored | `src/pree/audit.py` | `test_every_named_stream_attribute_is_wrapped_and_restored` |
 | The SHIPPED rate limits are the ones a deployed pod enforces, driven with no limiter injected | `src/pree/ratelimit.py` | `test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces` |
 | The finished line is scanned whatever produced it: `%(args)s` the message never consumed, a `repr` conversion, a formatter default, a lying `str` subclass, a filter running after the guard's | `src/pree/audit.py` | `test_the_finished_line_is_scanned_whatever_produced_it` |
 | ARMING THE GUARD NEVER EMITS WHAT THE DISARMED PROCESS WOULD NOT | `src/pree/audit.py` | `test_the_armed_guard_never_emits_what_the_disarmed_process_would_not` |
@@ -3190,6 +3194,53 @@ behaviour. All of them would have told the next reader that a layer exists which
 the failure mode this project has paid for more than any other.
 
 Eleven mutations re-run afterwards, including every one the review found green: all eleven red.
+
+### A fourth serialising handler, and three guarantees the boundary sweep found unpinned
+
+The security gate failed the reduction, and its verdict is worth reading in two halves, because they
+point in opposite directions.
+
+**The boundary itself defeated every attack it brought.** Auth, the constant-time compare, route
+gating on all three cost-incurring routes, boundary validation against prototype pollution and
+numeric edge cases, the body cap, the framing guard, CSP, CORS fail-closed, both rate-limit tiers at
+their shipped constants, all three sanitisers, the store's anti-shrink merge and newest-kept cap, and
+the container contract. No secret reachable from a log line, an error body, a response header, the
+tree, or seventy-five revisions of history. Seventy-five mutations, seventy-one red. That was the
+half of this project nobody had re-attacked in several rounds, and it held.
+
+**The reduction's stated cost was wrong by one handler, and the criterion was the reason.** The
+uncovered set said "a handler that does not emit `Handler.format`'s return value", and
+`logging.handlers.QueueHandler` **does** emit it - `prepare()` calls `format` - and then pickles
+`record.__dict__` onto the queue anyway. So it satisfied the criterion, read as covered, and carried
+an `extra=` attribute across an IPC queue verbatim. Measured on both commits: redacted before the
+reduction, in the clear after it.
+
+The list was right about three members and wrong about the property that decides membership. The
+property is SERIALISES `record.__dict__`, and by that criterion there are four: `HTTPHandler`
+urlencodes it, `SocketHandler` and `DatagramHandler` pickle it, `QueueHandler` pickles it after
+formatting - with a split status worth stating exactly, since its message half IS covered and every
+other attribute is not. Enumerating by the wrong property is how a list that looks complete stays
+incomplete, which is the same failure this module's history is made of at a different altitude.
+
+**And the sweep found three guarantees outside the credential guard held by nothing.** These matter more than
+their severity suggests, because they had been in the register for many rounds while attention was
+elsewhere:
+
+● **`_first_refused`'s charge-every-key invariant.** Short-circuiting on the first refusal left the
+  suite green, and the mutant does not merely lose an audit detail - it ADMITS requests the shipped
+  code refuses, because a peer already over its socket bucket stops charging the shared `forwarded`
+  bucket and the fold's aggregate cap never bites. Nineteen divergences in four hundred randomised
+  sequences. Now held on the mechanism, with a limiter whose remaining capacity is observable.
+● **Both CORS allowlists.** `allow_methods=["*"]` and `allow_headers=["*"]` each left the suite
+  green. Read off the constructed middleware now rather than the module constants, so the wiring is
+  covered too.
+● **The audit `reason` cap.** Held on the second attempt: the first asserted the constant and a
+  synthetic slice, which entered no code path, and my own canary caught it staying green. It is
+  driven through the `StoreError` handler now. The cap survives the delete-if-unreachable rule that
+  removed three defensive branches from `audit.py`, because its input IS reachable - `StoreError`
+  embeds the configured data path, which is operator-supplied.
+
+Four mutations re-run: four red.
 
 ## Not accepted, and why it is not a risk here
 

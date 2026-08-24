@@ -320,12 +320,19 @@ def install_credential_guard(expected: str | None) -> None:
 
     What is lost is real and is named here rather than in a footnote. FIELD-LEVEL REDACTION: a
     refused line now reads as one alarm instead of naming the field that carried the credential, so
-    diagnosis of a refusal is coarser. And COVERAGE OF THREE STOCK HANDLERS: `HTTPHandler`
-    urlencodes `record.__dict__`, `SocketHandler` and `DatagramHandler` pickle it, and none of the
-    three emits `Handler.format`'s return value, so the removed filter was their only layer. They
-    are now wholly uncovered. This application constructs `StreamHandler`s on `sys.stdout` and
-    nothing else, which is why that trade is acceptable HERE and would not be in a service that
-    ships logs over a socket.
+    diagnosis of a refusal is coarser. And COVERAGE OF EVERY HANDLER THAT SERIALISES
+    `record.__dict__`: `HTTPHandler` urlencodes it, `SocketHandler` and `DatagramHandler` pickle it,
+    and `QueueHandler` pickles it after formatting. The removed filter was the only layer for all
+    four.
+
+    That count was THREE for two commits, and the fourth is the finding worth keeping. The set was
+    enumerated by "does not emit `Handler.format`'s return value", and `QueueHandler` does emit it -
+    so it satisfied the criterion, read as covered, and pickled every attribute the formatted line
+    had not rendered. Measured across an IPC queue. Enumerating by the wrong property is how a
+    complete-looking list stays incomplete.
+
+    This application constructs `StreamHandler`s on `sys.stdout` and nothing else, which is why the
+    trade is acceptable HERE and would not be in a service that queues or ships its logs.
 
     WHAT IT DOES NOT COVER, named because the previous version of this docstring said "every channel
     that leaves this process" and a review then took seven of them:
@@ -335,16 +342,25 @@ def install_credential_guard(expected: str | None) -> None:
         `open("/dev/stdout", "w")` and `os.fdopen(1)` are INSTANCES of that class, not the set:
         a new handle on the same descriptor is a new instance, and enumerating them would be the
         same mistake this module's history is made of.
-      ● **A handler that does not emit `Handler.format`'s return value.** THREE STOCK HANDLERS do
-        this - `HTTPHandler` urlencodes `record.__dict__`, `SocketHandler` and `DatagramHandler`
-        pickle it - and a `Handler` subclass overriding `format` is a fourth way. No subclassing is
-        required for the first three, which is why this is listed here and not folded into the
-        same-privilege class: a review put the credential on the wire from a stock handler plus an
-        ordinary context-enricher filter. NOTHING covers those three now: the record-scanning
-        filter that was their only layer has been removed, so they are wholly uncovered rather than
-        partly. This project's own handlers are `StreamHandler`s on `sys.stdout` - the only handler
-        construction anywhere in `src/` - so none of it is live here, and in a service that ships
-        logs over a socket this trade would be the wrong one.
+      ● **A handler that SERIALISES `record.__dict__`.** Four stock handlers do, and the criterion
+        matters more than the list: this bullet said "a handler that does not emit
+        `Handler.format`'s return value", and a review found that criterion admits a handler which
+        does BOTH. `QueueHandler.prepare` calls `format`, so it read as covered, and then pickles
+        the record's dictionary onto the queue - measured carrying an `extra=` attribute across an
+        IPC queue verbatim, where the removed filter had redacted it. Enumerating by the wrong
+        property is the same mistake as enumerating instances instead of a class, which is what most
+        of this module's history is.
+
+        `HTTPHandler` urlencodes the dictionary, `SocketHandler` and `DatagramHandler` pickle it,
+        and `QueueHandler` pickles it after formatting. For the first three nothing is covered. For
+        `QueueHandler` the split is worth being exact about: the MESSAGE half is covered, because
+        `prepare` takes `format`'s return, and every OTHER attribute is not. A `Handler` subclass
+        overriding `format` is a fifth route and does need code in the process; these four do not.
+
+        None is live here. This application constructs `StreamHandler`s on `sys.stdout` and nothing
+        else - the only handler construction anywhere in `src/` - which is the whole reason the
+        record scan could be removed. In a service that queues or ships its logs the trade would be
+        the wrong one.
       ● **Any channel that is not a log line.** The reach above is "a write through a wrapped `sys`
         text stream, and a record passing a `logging.Handler`". A credential put in a RESPONSE BODY,
         written to a file on the data volume, used as a FILENAME, or passed in a child process's
@@ -554,8 +570,10 @@ def _patch_handler_format() -> None:
     675-byte pickle and a 533-byte POST body carrying the credential from stock handlers with no
     subclassing at all. For those three the finished-line scan does not apply and the RECORD scan is
     their only layer, and that layer has since been removed, so those three are WHOLLY uncovered.
-    Named in the uncovered set below, where the residual was once described as needing a `Handler`
-    subclass - which understated it, since none of this needs one.
+    A FOURTH, `QueueHandler`, calls `format` and then pickles the dictionary anyway, so it passes
+    the criterion this paragraph first used and still carries every attribute the formatted line did
+    not render. Named in the uncovered set below, by the property that actually decides it -
+    serialising `record.__dict__` - rather than by the one that let `QueueHandler` read as covered.
 
     What this does NOT cover, named because being exact about it is the whole discipline here: a
     `Handler` subclass that overrides `format`, or that emits without calling it. That is the
