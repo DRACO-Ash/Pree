@@ -5011,7 +5011,10 @@ def test_arming_twice_does_not_stack_the_stdlib_patches() -> None:
         "arming again wrapped `Handler.format` a second time, so every line in the process pays "
         "for one wrapper per arming and the depth grows without bound"
     )
-    assert getattr(logging.Handler.__init__, "_pree_guarded", False) is False, (
+    # Asserted on the STOCK function, not on this module's marker. A review re-added an UNMARKED
+    # `Handler.__init__` wrapper and the whole suite stayed green: a marker check only catches a
+    # re-add that politely labels itself, which is not the case worth defending against.
+    assert logging.Handler.__init__.__module__ == "logging", (
         "`Handler.__init__` is patched, but the construction patch was deleted with the filter "
         "layer. Something has re-added it without re-adding a test for it"
     )

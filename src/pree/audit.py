@@ -165,10 +165,16 @@ def _exact_text(value: str) -> str:
     credential in the sink after passing the scan. What is scanned has to be what is emitted.
 
     Takes a `str` and nothing wider. A branch for non-`str` input sat here for a draft and coverage
-    reported it as dead: both callers are typed `str`, and a formatter that returns something else
-    is already broken for `StreamHandler.emit`, which concatenates the result. Third dead defensive
-    branch removed on that argument in this module, which is starting to look like the useful rule
-    rather than an incident.
+    reported it as dead: both callers are typed `str`. Third dead defensive branch removed on that
+    argument in this module, which is starting to look like the useful rule rather than an incident.
+
+    The reason first given for removing it was wrong and is corrected here, because it understated a
+    cost. It said a formatter returning a non-`str` "is already broken for `StreamHandler.emit`,
+    which concatenates the result". It is not: unarmed, such a formatter emits fine. Under the
+    permanently installed `Handler.format` patch - armed OR disarmed, since the patch only goes
+    inert - `str.__str__` raises `TypeError`, `emit` falls to `handleError`, and the LINE IS LOST.
+    Fail-closed in direction, so not an exposure, but it is a third standing cost of ever arming and
+    it belongs in the list `install_credential_guard` keeps.
     """
     return str.__str__(value)
 
@@ -322,8 +328,8 @@ def install_credential_guard(expected: str | None) -> None:
     refused line now reads as one alarm instead of naming the field that carried the credential, so
     diagnosis of a refusal is coarser. And COVERAGE OF EVERY HANDLER THAT SERIALISES
     `record.__dict__`: `HTTPHandler` urlencodes it, `SocketHandler` and `DatagramHandler` pickle it,
-    and `QueueHandler` pickles it after formatting. The removed filter was the only layer for all
-    four.
+    and `QueueHandler` hands the record on, so an IPC queue pickles it. The removed filter was the
+    only layer for all four.
 
     That count was THREE for two commits, and the fourth is the finding worth keeping. The set was
     enumerated by "does not emit `Handler.format`'s return value", and `QueueHandler` does emit it -
@@ -352,9 +358,13 @@ def install_credential_guard(expected: str | None) -> None:
         of this module's history is.
 
         `HTTPHandler` urlencodes the dictionary, `SocketHandler` and `DatagramHandler` pickle it,
-        and `QueueHandler` pickles it after formatting. For the first three nothing is covered. For
-        `QueueHandler` the split is worth being exact about: the MESSAGE half is covered, because
-        `prepare` takes `format`'s return, and every OTHER attribute is not. A `Handler` subclass
+        and `QueueHandler` hands the record on, so an IPC queue pickles it. The wording matters:
+        `QueueHandler.enqueue` calls `put_nowait(record)` - the HANDLER pickles nothing, the queue
+        does - so an in-process `queue.Queue` with a `QueueListener` on a `StreamHandler` leaves
+        nothing unredacted, measured. It is a multiprocessing or managed queue that carries the
+        dictionary out. For the first three nothing is covered. For `QueueHandler` the split is
+        worth being exact about: the MESSAGE half is covered, because `prepare` takes `format`'s
+        return, and every OTHER attribute is not. A `Handler` subclass
         overriding `format` is a fifth route and does need code in the process; these four do not.
 
         None is live here. This application constructs `StreamHandler`s on `sys.stdout` and nothing
@@ -412,6 +422,11 @@ def install_credential_guard(expected: str | None) -> None:
       ● A re-pointed handler's writes still pass through `_GuardedStream`, which forwards only the
         attributes listed on it, so something asking that handler's stream for an attribute outside
         that list gets an `AttributeError` where it previously got a value.
+      ● A formatter that returns a NON-`str` stops emitting at all. `_exact_text` calls
+        `str.__str__` on it, which raises `TypeError`, and `handleError` discards the line. Unarmed
+        such a formatter works; the patch is permanent, so this holds after disarming too.
+        Fail-closed rather than a leak, and stated because it is a behaviour change the process
+        keeps for its life.
 
     Reached only in tests and when no token is configured, so it is recorded rather than engineered
     away - but "irreversible mutation of three stdlib attributes" is what arming actually buys, and

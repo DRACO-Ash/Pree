@@ -166,7 +166,7 @@ the assessment store.
 | The value EMITTED is the value that was scanned, at all three comparison points: a lying `__str__`, a credential-bearing `__add__`, and the type the stream wrapper passes on | `src/pree/audit.py` | `test_the_value_that_is_emitted_is_the_value_that_was_scanned` |
 | Arming calls no caller code the disarmed process would not, so the invariant holds by mechanism and not by observation | `src/pree/audit.py` | `test_arming_calls_no_caller_code_the_disarmed_process_would_not` |
 | The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the finished-line scan at `Handler.format` still covers what it emits | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
-| No credential-bearing line reaches any logging handler, scanned as the FINISHED LINE at `logging.Handler.format` so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant; nor a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that does not emit `Handler.format`'s return value (`HTTPHandler` urlencodes `record.__dict__`; `SocketHandler` and `DatagramHandler` pickle it; no subclassing needed and since the record-scanning layer was removed these are WHOLLY uncovered, which is acceptable only because this app builds nothing but `StreamHandler`s on stdout), NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_finished_line_is_scanned_whatever_produced_it`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
+| No credential-bearing line reaches any logging handler, scanned as the FINISHED LINE at `logging.Handler.format` so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant; nor a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that SERIALISES `record.__dict__` - FOUR stock handlers, and the criterion is the load-bearing part rather than the list: `HTTPHandler` urlencodes it, `SocketHandler` and `DatagramHandler` pickle it, and `QueueHandler` hands the record on so an IPC queue pickles it, its message half covered because `prepare` takes `format`'s return and every other attribute not. This row said "a handler that does not emit `Handler.format`'s return value" for two commits, under which `QueueHandler` reads as COVERED because it does emit it, which is how the next engineer adding async logging ships a leak. No subclassing is needed for any of the four; since the record-scanning layer was removed they are WHOLLY uncovered, acceptable only because this app builds nothing but `StreamHandler`s on stdout, NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_finished_line_is_scanned_whatever_produced_it`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
 | The introspection guard has NO exemptions, the one it carried having left with the layer that needed it | `tests/test_api.py` | `test_the_introspection_guard_has_no_exemptions` |
 | A refused write reports the CALLER's length, so a caller looping until everything is written does not re-submit the credential-bearing tail | `src/pree/audit.py` | `test_the_guard_reports_the_callers_length_when_it_refuses_a_write` |
 | A handler that captured a stream before arming is re-pointed at the wrapper, WHERE `stream` is assignable; where it is not, the finished-line scan at `Handler.format` still covers what it emits and only a direct write to its captured stream is uncovered | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming`, `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
@@ -3241,6 +3241,45 @@ elsewhere:
   embeds the configured data path, which is operator-supplied.
 
 Four mutations re-run: four red.
+
+### One row, and the difference between a narrative and a register
+
+The security round found the code sound - 49 of 50 mutations red, every boundary attack fail-closed,
+no secret reachable from a body, a header, a log line, the tree, or seventy-seven revisions of
+history - and failed the commit on a single table row. It was right to.
+
+**I reported the `QueueHandler` criterion fixed "in both the module and the register", and it was
+fixed in one.** The module said four handlers and named the property that decides membership; the
+live register row still said three, by the criterion measurement had already defeated - "a handler
+that does not emit `Handler.format`'s return value" - under which `QueueHandler` reads as COVERED,
+because it does emit it. The consequence is not abstract: the next engineer adding a queue for async
+logging, which is a routine container change, reads the register, finds their handler satisfies the
+covered criterion, and ships it.
+
+The distinction that matters here is one this document had not been explicit about. The dated round
+write-ups in this file are HISTORY and are allowed to be superseded; the register is a LIVE claim
+table and is not. Two sections above this one describe the three-handler criterion accurately as what
+was believed at the time, and they need no change. The row does, because someone reads it to decide
+what is safe today.
+
+Three smaller corrections, each a mechanism rather than a wording preference:
+
+● **"`QueueHandler` pickles it after formatting" attributed the pickling to the wrong component.**
+  `QueueHandler.enqueue` calls `put_nowait(record)`; the HANDLER pickles nothing, the queue does. So
+  an in-process `queue.Queue` with a `QueueListener` on a `StreamHandler` leaves nothing unredacted -
+  measured - and it is a multiprocessing or managed queue that carries the dictionary out. The error
+  over-stated exposure, which is the safe direction, but a wrong mechanism does not survive the first
+  engineer who tests it.
+● **"A formatter that returns a non-`str` is already broken for `StreamHandler.emit`" was false**, and
+  it was the reason given for deleting a defensive branch. Unarmed, such a formatter emits fine. Under
+  the permanently installed `Handler.format` patch - armed or disarmed, since the patch only goes
+  inert - `str.__str__` raises `TypeError`, `emit` falls to `handleError`, and the line is LOST. The
+  deletion still stands on the coverage argument; what was missing is that this is a THIRD standing
+  cost of ever arming the guard, and it is now in the list that keeps them.
+● **The arming-twice test only caught a re-add that labelled itself.** It asserted the absence of this
+  module's own marker on `Handler.__init__`, so an unmarked wrapper passed - a review added one and
+  the suite stayed green. It asserts the stock function now, by module, and the unmarked re-add turns
+  it red.
 
 ## Not accepted, and why it is not a risk here
 

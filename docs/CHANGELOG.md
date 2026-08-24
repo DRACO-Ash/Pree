@@ -1471,3 +1471,26 @@ the review found green: eleven red.
   canary caught the first version entering no code path.
 
 Four new regression tests, 360 passing, coverage 99%.
+
+### One register row, and the difference between a narrative and a live claim
+
+The security round found the code sound - 49 of 50 mutations red, every boundary attack fail-closed,
+no secret reachable anywhere - and failed the commit on one table row.
+
+● **The `QueueHandler` criterion was fixed in the module and not in the register.** I had reported it
+  fixed in both. The live row still said three handlers, by the criterion under which `QueueHandler`
+  reads as covered because it DOES emit `format`'s return - so an engineer adding a queue for async
+  logging would read the register and ship a leak. Rewritten to the property that decides membership.
+  The dated round write-ups keep the old criterion because they are history; the register is a live
+  claim table and cannot.
+● **`QueueHandler` "pickles it after formatting"** attributed the pickling to the handler.
+  `enqueue` calls `put_nowait(record)`; the queue pickles, so an in-process `queue.Queue` leaks
+  nothing and a multiprocessing queue does. Over-stated exposure, corrected mechanism.
+● **"A non-`str` formatter return is already broken for `StreamHandler.emit`" was false**, and it was
+  the stated reason for deleting a defensive branch. Unarmed it emits fine; under the permanent
+  `Handler.format` patch it raises and the line is lost. The deletion stands on coverage; the missing
+  part was that this is a third standing cost of arming, now listed.
+● **The arming-twice test caught only a re-add carrying this module's marker.** It asserts the stock
+  function now, and an unmarked wrapper turns it red.
+
+360 passing, coverage 99%.
