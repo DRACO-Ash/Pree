@@ -3103,6 +3103,13 @@ was reachable from the unauthenticated edge. All were self-inflicted.
   nothing else. In a service that ships logs over a socket the same trade would be wrong.
 
 **What removing it bought, measured.** `audit.py` fell from 212 statements to 152, a 28% reduction.
+
+One figure needs reconciling before anyone reads it as wrong. The counts here are the LOOP's, run in
+the repository: 366 tests before, 356 after. A reviewer working from a `git archive` export sees one
+fewer passing and one skipped, because `test_boot_contract.py`'s gitignore check skips where there is
+no work tree ("no git work tree: nothing can be committed here, so nothing to ignore"). Both numbers
+are right for their environment. Recorded because two reviewers now work from exports, by request,
+after a canary run in the working tree polluted one of their measurements.
 The suite went from 366 tests to 356 and from 37 seconds to 27. The guard's per-line cost is now the
 finished-line scan alone, which a review measured at 0.00 microseconds against a 8.76 microsecond
 baseline - the removed layer was the whole of the armed overhead. And the introspection guard is back
