@@ -1517,3 +1517,23 @@ no secret reachable anywhere - and failed the commit on one table row.
   78 of 78, so it is recorded as measured rather than as an open caveat.
 
 One new regression test, 361 passing, coverage 99%.
+
+### A BLOCKER on the tripwire written to protect the premise
+
+● **The premise tripwire walked the top level only.** `glob("*.py")` instead of `rglob`, so a
+  `QueueHandler` in a subpackage left the whole suite green - and this project had already recorded
+  fixing the identical defect in the reader allowlist a few tests away. A recorded lesson is not a
+  control.
+● **The fix needed a synthetic tree to be holdable at all**, because `glob` and `rglob` are the same
+  function on a flat package. The walker is extracted and proved against nested offenders at two
+  depths; reverting to `glob` now turns that test red.
+● **The scan's own detection branch was unheld** - deleting the half that sees
+  `logging.handlers.X(...)` left the suite green - and now a positive canary proves the scan sees the
+  one construction this package makes before it refuses anything.
+● **A no-secret assertion was a tautology**: the malformed-record test never put the credential on
+  the record, so it passed with the guard un-armed. The credential is the argument now.
+● **A test docstring contradicted the security policy** about the same control's evidence. A third
+  independent harness measured the limiter divergence at 46 of 46 in the admitting direction, so the
+  direction is confirmed by three harnesses and my structural conjecture is withdrawn.
+
+Two new tests, 362 passing, coverage 99%. Five mutations re-run: five red.

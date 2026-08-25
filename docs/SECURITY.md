@@ -167,7 +167,7 @@ the assessment store.
 | Arming calls no caller code the disarmed process would not, so the invariant holds by mechanism and not by observation | `src/pree/audit.py` | `test_arming_calls_no_caller_code_the_disarmed_process_would_not` |
 | The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the finished-line scan at `Handler.format` still covers what it emits | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
 | No credential-bearing line reaches any logging handler, scanned as the FINISHED LINE at `logging.Handler.format` so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant; nor a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that SERIALISES `record.__dict__` - FOUR stock handlers, and the criterion is the load-bearing part rather than the list: `HTTPHandler` urlencodes it, `SocketHandler` and `DatagramHandler` pickle it, and `QueueHandler` hands the record on so an IPC queue pickles it, its message half covered because `prepare` takes `format`'s return and every other attribute not. This row said "a handler that does not emit `Handler.format`'s return value" for two commits, under which `QueueHandler` reads as COVERED because it does emit it, which is how the next engineer adding async logging ships a leak. No subclassing is needed for any of the four; since the record-scanning layer was removed they are WHOLLY uncovered, acceptable only because this app builds nothing but `StreamHandler`s on stdout, NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_finished_line_is_scanned_whatever_produced_it`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
-| The package constructs NO logging handler that serialises `record.__dict__`, which is the premise the removed layer's cost argument rests on | `src/pree/audit.py` | `test_the_package_constructs_no_handler_that_serialises_a_record` |
+| The package constructs NO logging handler that serialises `record.__dict__` - asserted over EVERY module under `src/pree`, subpackages included - which is the premise the removed layer's cost argument rests on | `src/pree/` | `test_the_package_constructs_no_handler_that_serialises_a_record` |
 | The introspection guard has NO exemptions, the one it carried having left with the layer that needed it | `tests/test_api.py` | `test_the_introspection_guard_has_no_exemptions` |
 | A refused write reports the CALLER's length, so a caller looping until everything is written does not re-submit the credential-bearing tail | `src/pree/audit.py` | `test_the_guard_reports_the_callers_length_when_it_refuses_a_write` |
 | A handler that captured a stream before arming is re-pointed at the wrapper, WHERE `stream` is assignable; where it is not, the finished-line scan at `Handler.format` still covers what it emits and only a direct write to its captured stream is uncovered | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming`, `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
@@ -3337,6 +3337,49 @@ messages are literals - which does NOT make the slices dead code under the rule 
 branches from `audit.py`: those never executed, while a slice on a short string executes and returns
 the string. What would be unsafe is a bound applied at two of three sites, because the next dynamic
 message added at the third would leave the bound behind.
+
+### A BLOCKER on the tripwire, and the same mistake this file already records fixing
+
+The engineering gate blocked the release, on the test written one commit earlier to protect the
+premise under the removed layer. The tripwire walked `glob("*.py")` - the top level only - so a
+`logging.handlers.QueueHandler` in `src/pree/logsub/audit.py` left the ENTIRE suite green. Measured.
+Nothing else caught it either, because the import allowlist keys on basenames and a duplicate
+basename carrying a matching import set slips through that too.
+
+The part worth writing down is not the bug. It is that this file already records the identical defect
+being found and fixed in the reader allowlist a few tests away, in those words: the allowlist walked
+only the top level while its docstring said every module, so the first subpackage would have been
+outside it silently. The lesson was written, published, and then not applied by its own author to the
+next scanner he wrote. A recorded lesson is not a control either.
+
+**And the fix could not be held by mutation.** With no subpackages present, `glob` and `rglob` return
+the same files, so reverting the fix changes nothing observable - the same category as re-adding dead
+code. So the walker was extracted and pointed at a SYNTHETIC nested tree with known offenders at two
+depths, which is now what makes the recursion assertable. Reverting to `glob` turns that test red.
+
+Three more findings in the same round, each a claim ahead of its code:
+
+● **The scan's own detection branch was held by nothing.** Deleting the `ast.Attribute` half - the
+  half that sees `logging.handlers.X(...)`, which is the routine spelling the test exists for - left
+  the whole suite green. A tripwire a refactor can disarm while every message still reads as enforced
+  is worse than no tripwire. It now proves it can see the one construction this package really makes
+  before it refuses anything.
+● **A no-secret assertion was a tautology.** `test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream`
+  passed `"only-one"` as the malformed record's argument, so the credential was never on the record
+  and `secret not in logged` could not fail - it passed with the guard un-armed, and the test appeared
+  in no mutation's kill set. Its docstring had been rewritten three times and the claim was still
+  ahead of the code. The credential is the argument now.
+● **Two live documents disagreed about the same control's evidence.** A test docstring kept the
+  withdrawn "I could not reproduce it" explanation, including a structural conjecture about why the
+  divergence would be rare, after this document had been corrected. A third independent harness then
+  measured it at 46 divergences in 400 sequences, 46 of 46 in the admit-what-the-code-refuses
+  direction. Three harnesses, none of them mine, all agreeing: the direction is confirmed, my
+  conjecture was wrong, and the docstring now says so.
+
+The overclaim in the same test is narrowed rather than defended: the scan catches a direct call on the
+class name, bare or attribute, anywhere under `src/pree`. An alias, a `getattr` spelling and a
+subclass each escape it, measured, and are named as out of scope - the threat model is the routine
+addition, not someone hiding a handler.
 
 ## Not accepted, and why it is not a risk here
 

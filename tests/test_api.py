@@ -4091,7 +4091,11 @@ def test_the_runtime_guard_survives_a_broken_record_and_a_bare_stream(
         # - not inside a filter, which is where an earlier version of this comment put it. The lint
         # rule that flags this is exactly right in production code, and this is the one place the
         # malformed record IS the input under test, so it is silenced here and nowhere else.
-        audit_logger.info("a broken record %s %s", "only-one")  # noqa: PLE1206
+        # The CREDENTIAL as the argument, not a placeholder string. With `"only-one"` here the
+        # record carried the secret nowhere, so `secret not in logged` was a tautology that passed
+        # with the guard un-armed - measured - and this test appeared in no mutation's kill set. The
+        # docstring had been rewritten three times and the claim was still ahead of the code.
+        audit_logger.info("a broken record %s %s", secret)  # noqa: PLE1206
     finally:
         audit_logger.handlers = previous
         audit_logger.setLevel(previous_level)
@@ -4533,7 +4537,16 @@ def _emit_one(
         handler.addFilter(_Enricher(secret))
     try:
         logger.handle(
-            logger.makeRecord(logger.name, logging.INFO, __file__, 0, msg, args, None, extra=extra)  # type: ignore[arg-type]
+            logger.makeRecord(
+                logger.name,
+                logging.INFO,
+                __file__,
+                0,
+                msg,
+                args,  # type: ignore[arg-type]
+                None,
+                extra=extra,
+            )
         )
     finally:
         if armed:
@@ -4906,14 +4919,18 @@ def test_a_refused_key_still_charges_every_other_bucket() -> None:
     code leaves one charge on the shared `forwarded` bucket and the short-circuiting version leaves
     two, so a peer over its socket limit stops charging the fold. That is what this asserts.
 
-    The stronger consequence a review reported - the mutant ADMITTING requests the shipped code
-    refuses, 19 divergences in 400 randomised sequences - I could not reproduce in three attempts
-    with three traffic shapes, and it is recorded in `docs/SECURITY.md` as their measurement rather
-    than restated here as fact. The reason looks structural: `RateLimiter` applies one capacity per
-    key, so the socket bucket is charged identically by both paths and only the shared bucket
-    drifts, leaving a divergence window about one request wide. Asserting the charge rather than a
-    divergence count is the right level anyway: an uncharged shared bucket is a defect whether or
-    not a particular trace exposes it.
+    The stronger consequence is CONFIRMED, by three independent harnesses and none of them mine.
+    The mutant ADMITS requests the shipped code refuses: 19 divergences in 400 sequences on the
+    first, 78 of 78 in that direction on the second, 46 of 46 on the third. I failed to reproduce it
+    in three attempts and briefly wrote a structural explanation for why it would be rare; that was
+    wrong, and my non-reproduction was my generator rather than their finding. This docstring kept
+    the withdrawn version for a commit after `docs/SECURITY.md` had been corrected, so the two live
+    documents disagreed about the same control's evidence - which is the failure class this project
+    keeps paying for, appearing here as a stale copy rather than a false claim.
+
+    The test still asserts the CHARGE rather than a divergence count, and that remains the right
+    level: an uncharged shared bucket is a defect whether or not a particular trace exposes it, and
+    a count depends on a traffic shape the assertion should not encode.
 
     Driven on the mechanism rather than through a saturation sequence, because a test that admits a
     limiter's worth of requests to observe one divergence is slow and reads as a coincidence when it
@@ -5262,44 +5279,34 @@ EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
 PERMITTED_HANDLER_CLASSES = frozenset({"StreamHandler"})
 
 
-def test_the_package_constructs_no_handler_that_serialises_a_record() -> None:
-    """The premise under the removed security layer, held by a test instead of by a grep.
+def _stdlib_handler_class_names() -> set[str]:
+    """Every `logging` handler class the standard library offers, read from the modules themselves.
 
-    `install_credential_guard` states that four stock handlers serialise `record.__dict__` and are
-    WHOLLY uncovered since the record-scanning layer was removed, and says the trade is acceptable
-    "only because this app builds nothing but `StreamHandler`s on `sys.stdout`". That sentence is
-    true today, and it was the justification for deleting a security layer with nothing holding it.
-
-    A review put the point in my own words back to me: a published list nothing reads is a claim,
-    not a control. That argument was made here about `GUARDED_STREAM_ATTRIBUTES`, and it applies
-    with more force to a PREMISE than to a constant. Adding `QueueHandler` for async logging is a
-    routine container change, `test_every_module_imports_exactly_what_it_is_permitted_to` cannot see
-    it (`from logging.handlers import QueueHandler` records the top-level name `logging`, which
-    `audit.py` is already permitted), and nothing else would have gone red.
-
-    So the premise is asserted over the real source. Any construction of a `logging` handler class
-    outside `PERMITTED_HANDLER_CLASSES` fails here, and whoever adds one has to come back to
-    `install_credential_guard`'s cost statement and decide whether the record scan needs to return.
+    A denylist of what `logging` PROVIDES rather than a guess at what someone might type.
     """
-    package = Path(app_module.__file__ or "").resolve().parent
-    modules = sorted(package.glob("*.py"))
-    assert modules, "no package modules found, so this test would pass vacuously"
-
-    # Every `logging` handler class the standard library offers, so the check is a denylist of what
-    # `logging` PROVIDES rather than a guess at what someone might type.
-    handler_names = {
+    return {
         name
         for module in (logging, logging.handlers)
         for name, value in vars(module).items()
         if isinstance(value, type) and issubclass(value, logging.Handler)
     }
-    assert "QueueHandler" in handler_names and "SocketHandler" in handler_names, (
-        f"the handler-class sweep found {sorted(handler_names)}, which does not include the "
-        f"classes this test exists to refuse, so it would pass vacuously"
-    )
 
-    constructed: dict[str, list[str]] = {}
-    for module_path in modules:
+
+def _handler_constructions(root: Path) -> dict[str, list[str]]:
+    """Every stdlib logging-handler class constructed under `root`, keyed by relative module path.
+
+    Takes a ROOT rather than reading the package directly, so the walker can be pointed at a
+    synthetic tree and proved to behave. That is not decoration: `rglob` and `glob` are
+    indistinguishable on a flat package, so the only way to hold the recursive walk is to give it
+    something nested and check that it looks there.
+
+    Keyed by the path RELATIVE to root, because a bare basename cannot tell `audit.py` from
+    `logsub/audit.py` - and a duplicate basename is exactly how the measured escape slipped past
+    the import allowlist as well.
+    """
+    handler_names = _stdlib_handler_class_names()
+    found: dict[str, list[str]] = {}
+    for module_path in sorted(root.rglob("*.py")):
         tree = ast.parse(module_path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -5312,15 +5319,108 @@ def test_the_package_constructs_no_handler_that_serialises_a_record() -> None:
                 if isinstance(called, ast.Name)
                 else None
             )
-            if name in handler_names and name not in PERMITTED_HANDLER_CLASSES:
-                constructed.setdefault(module_path.name, []).append(name)
+            if name in handler_names:
+                found.setdefault(str(module_path.relative_to(root)), []).append(name)
+    return found
 
-    assert constructed == {}, (
-        f"the package constructs {constructed}, outside {sorted(PERMITTED_HANDLER_CLASSES)}. Four "
-        f"stock handlers serialise `record.__dict__` and are wholly uncovered by the credential "
-        f"guard since the record-scanning layer was removed; `install_credential_guard` justifies "
-        f"that removal on this package building nothing but `StreamHandler`s. Adding one of these "
-        f"means revisiting that decision, not editing this list"
+
+def test_the_handler_scan_looks_inside_subpackages(tmp_path: Path) -> None:
+    """The walker, proved on a nested synthetic tree before it is trusted on the real one.
+
+    This exists because of a BLOCKER. The premise test below walked `glob("*.py")` - the top level
+    only - so a `logging.handlers.QueueHandler` in `src/pree/logsub/audit.py` left the entire
+    suite green. Worse, this file already records the identical defect being fixed in the reader
+    allowlist a few tests down: the allowlist walked only the top level while its docstring said
+    every module, so the first subpackage would have been outside it silently. I wrote it again.
+
+    The fix cannot be held by mutation on the real package: with no subpackages present, `glob` and
+    `rglob` return the same files, so reverting it changes nothing observable. That is the same
+    category as re-adding dead code - invisible to a suite, visible to a synthetic input. So the
+    walker gets a nested tree with known offenders, and reverting to `glob` turns THIS red.
+    """
+    package = tmp_path / "pkg"
+    (package / "deep" / "deeper").mkdir(parents=True)
+    (package / "flat.py").write_text(
+        "import logging\n\nh = logging.StreamHandler()\n", encoding="utf-8"
+    )
+    (package / "deep" / "__init__.py").write_text("", encoding="utf-8")
+    (package / "deep" / "audit.py").write_text(
+        "import logging.handlers\n\nh = logging.handlers.QueueHandler(None)\n",
+        encoding="utf-8",
+    )
+    (package / "deep" / "deeper" / "sock.py").write_text(
+        "from logging.handlers import SocketHandler\n\nh = SocketHandler('h', 1)\n",
+        encoding="utf-8",
+    )
+
+    found = _handler_constructions(package)
+
+    assert found.get("flat.py") == ["StreamHandler"], f"the top level was not scanned: {found}"
+    assert found.get("deep/audit.py") == ["QueueHandler"], (
+        f"a subpackage was not scanned, so a handler one directory down is invisible: {found}"
+    )
+    assert found.get("deep/deeper/sock.py") == ["SocketHandler"], (
+        f"a nested subpackage was not scanned: {found}"
+    )
+
+
+def test_the_package_constructs_no_handler_that_serialises_a_record() -> None:
+    """The premise under the removed security layer, held by a test instead of by a grep.
+
+    `install_credential_guard` states that four stock handlers serialise `record.__dict__` and are
+    WHOLLY uncovered since the record-scanning layer was removed, and says the trade is acceptable
+    "only because this app builds nothing but `StreamHandler`s on `sys.stdout`". That sentence is
+    true today, and it was the justification for deleting a security layer with nothing holding it.
+
+    A review put the point in my own words back to me: a published list nothing reads is a claim,
+    not a control. That was said here about `GUARDED_STREAM_ATTRIBUTES`, and it applies with more
+    force to a PREMISE than to a constant. Adding `QueueHandler` for async logging is a routine
+    container change, `test_every_module_imports_exactly_what_it_is_permitted_to` cannot see it
+    (`from logging.handlers import QueueHandler` records the permitted top-level name `logging`),
+    and nothing else would have gone red.
+
+    What the scan SEES is worth stating exactly rather than overstating. It catches a direct call on
+    the class name, spelled bare or as an attribute, anywhere under `src/pree` including
+    subpackages. It does NOT catch an aliased import, a `getattr` spelling, or a subclass built
+    under its own name - each measured green - which is the same shape of residual
+    `install_credential_guard` records for its own same-privilege class. The threat model is the
+    routine direct addition, which is caught; someone deliberately hiding a handler is not what a
+    tripwire is for.
+
+    The walker itself is proved by `test_the_handler_scan_looks_inside_subpackages`, because its
+    recursion cannot be held against a flat package. Whoever trips this returns to
+    `install_credential_guard`'s cost statement and decides whether the record scan needs to return.
+    """
+    package = Path(app_module.__file__ or "").resolve().parent
+    handler_names = _stdlib_handler_class_names()
+    assert {"QueueHandler", "SocketHandler", "DatagramHandler", "HTTPHandler"} <= handler_names, (
+        f"the handler-class sweep found {sorted(handler_names)}, which does not include the four "
+        f"serialising classes this test exists to refuse, so it would pass vacuously"
+    )
+
+    found = _handler_constructions(package)
+    # POSITIVE CANARY. The scan's own detection branch was held by nothing: deleting the
+    # `ast.Attribute` half - the half that sees `logging.handlers.X(...)`, the routine spelling -
+    # left the whole suite green. A tripwire a refactor can disarm while every message still reads
+    # as enforced is worse than no tripwire, so the scan first proves it sees the one construction
+    # this package really makes.
+    assert found.get("audit.py") == ["StreamHandler"], (
+        f"the scan did not find the `StreamHandler` construction in audit.py, so it cannot see a "
+        f"handler call at all and the refusal below is vacuous: found {found}"
+    )
+
+    offenders = {
+        module: [name for name in names if name not in PERMITTED_HANDLER_CLASSES]
+        for module, names in found.items()
+    }
+    offenders = {module: names for module, names in offenders.items() if names}
+    assert offenders == {}, (
+        f"the package constructs {offenders}, outside {sorted(PERMITTED_HANDLER_CLASSES)}. Four "
+        f"of the stock handlers serialise `record.__dict__` and are wholly uncovered by the "
+        f"credential guard since the record-scanning layer was removed, and "
+        f"`install_credential_guard` justifies that removal on this package building nothing but "
+        f"`StreamHandler`s. If what you added is one of those four, revisiting that decision is "
+        f"the work; if it is not, it still needs a reason rather than an edit to this list"
     )
 
 
