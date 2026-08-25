@@ -168,13 +168,22 @@ def _exact_text(value: str) -> str:
     reported it as dead: both callers are typed `str`. Third dead defensive branch removed on that
     argument in this module, which is starting to look like the useful rule rather than an incident.
 
-    The reason first given for removing it was wrong and is corrected here, because it understated a
-    cost. It said a formatter returning a non-`str` "is already broken for `StreamHandler.emit`,
-    which concatenates the result". It is not: unarmed, such a formatter emits fine. Under the
-    permanently installed `Handler.format` patch - armed OR disarmed, since the patch only goes
-    inert - `str.__str__` raises `TypeError`, `emit` falls to `handleError`, and the LINE IS LOST.
-    Fail-closed in direction, so not an exposure, but it is a third standing cost of ever arming and
-    it belongs in the list `install_credential_guard` keeps.
+    The reason given for removing it has now been written twice and was WRONG THE SECOND TIME, which
+    is worth recording in full because the second version was a correction of a correct statement.
+
+    The first version said a formatter returning a non-`str` "is already broken for
+    `StreamHandler.emit`, which concatenates the result". True, and measured: unarmed, such a
+    formatter makes `msg + self.terminator` raise `TypeError`, `handleError` discards the line, and
+    the sink receives the empty string. The second version claimed "unarmed, such a formatter emits
+    fine" and billed the lost line as a THIRD standing cost of arming. That is false for every
+    handler this application builds - the behaviour is identical armed and unarmed - and the cost
+    does not exist here. The divergence appears only for a handler that does NOT concatenate:
+    `QueueHandler` with a listener emits `'42\n'` unarmed and loses the line armed, and that is the
+    one class `test_every_handler_the_package_installs_is_exactly_a_stream_handler` forbids.
+
+    So the original reasoning stands, the invented cost is withdrawn, and the lesson is the one this
+    module keeps relearning at a new altitude: a correction needs the same evidence as the claim it
+    replaces. This one had none.
     """
     return str.__str__(value)
 
@@ -422,11 +431,6 @@ def install_credential_guard(expected: str | None) -> None:
       ● A re-pointed handler's writes still pass through `_GuardedStream`, which forwards only the
         attributes listed on it, so something asking that handler's stream for an attribute outside
         that list gets an `AttributeError` where it previously got a value.
-      ● A formatter that returns a NON-`str` stops emitting at all. `_exact_text` calls
-        `str.__str__` on it, which raises `TypeError`, and `handleError` discards the line. Unarmed
-        such a formatter works; the patch is permanent, so this holds after disarming too.
-        Fail-closed rather than a leak, and stated because it is a behaviour change the process
-        keeps for its life.
 
     Reached only in tests and when no token is configured, so it is recorded rather than engineered
     away - but "irreversible mutation of three stdlib attributes" is what arming actually buys, and

@@ -167,7 +167,8 @@ the assessment store.
 | Arming calls no caller code the disarmed process would not, so the invariant holds by mechanism and not by observation | `src/pree/audit.py` | `test_arming_calls_no_caller_code_the_disarmed_process_would_not` |
 | The guard's boot-path stream re-point cannot crash the worker on a handler whose `stream` is read-only, and the finished-line scan at `Handler.format` still covers what it emits | `src/pree/audit.py` | `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
 | No credential-bearing line reaches any logging handler, scanned as the FINISHED LINE at `logging.Handler.format` so whatever attribute, conversion, formatter default, filter or `__str__` produced the text is irrelevant; nor a write through `sys.stdout`/`sys.stderr`/`sys.__stdout__`/`sys.__stderr__`, in plaintext. NOT a channel that is not the log (a response body, a file on the data volume, a filename, a child's argv), NOT anything reaching fd 1 or 2 without a wrapped object, NOT any encoding but plaintext, NOT a credential split across two writes or two records, NOT a handler that SERIALISES `record.__dict__` - FOUR stock handlers, and the criterion is the load-bearing part rather than the list: `HTTPHandler` urlencodes it, `SocketHandler` and `DatagramHandler` pickle it, and `QueueHandler` hands the record on so an IPC queue pickles it, its message half covered because `prepare` takes `format`'s return and every other attribute not. This row said "a handler that does not emit `Handler.format`'s return value" for two commits, under which `QueueHandler` reads as COVERED because it does emit it, which is how the next engineer adding async logging ships a leak. No subclassing is needed for any of the four; since the record-scanning layer was removed they are WHOLLY uncovered, acceptable only because this app builds nothing but `StreamHandler`s on stdout, NOT the window before arming (closed by `config.py`, which renders the token's length and repetition count only), NOT an adversary with the same privilege as the guarded code | `src/pree/audit.py` | `test_the_runtime_guard_refuses_the_channels_it_covers`, `test_the_finished_line_is_scanned_whatever_produced_it`, `test_the_guard_covers_the_pre_wrap_dunder_streams` |
-| The package constructs NO logging handler that serialises `record.__dict__` - asserted over EVERY module under `src/pree`, subpackages included - which is the premise the removed layer's cost argument rests on | `src/pree/` | `test_the_package_constructs_no_handler_that_serialises_a_record` |
+| EVERY handler the package CONSTRUCTS is exactly `logging.StreamHandler` by type, which is the premise the removed layer's cost argument rests on, and closes an alias, a `getattr`, a class held in a variable and a SUBCLASS in one check | `src/pree/audit.py` | `test_every_handler_the_package_installs_is_exactly_a_stream_handler` |
+| The static sweep names the offending file for the two spellings it can see, calls and subclass BASES, over every module under the package including subpackages | `tests/test_api.py` | `test_the_package_constructs_no_handler_that_serialises_a_record`, `test_the_handler_scan_looks_inside_subpackages` |
 | The introspection guard has NO exemptions, the one it carried having left with the layer that needed it | `tests/test_api.py` | `test_the_introspection_guard_has_no_exemptions` |
 | A refused write reports the CALLER's length, so a caller looping until everything is written does not re-submit the credential-bearing tail | `src/pree/audit.py` | `test_the_guard_reports_the_callers_length_when_it_refuses_a_write` |
 | A handler that captured a stream before arming is re-pointed at the wrapper, WHERE `stream` is assignable; where it is not, the finished-line scan at `Handler.format` still covers what it emits and only a direct write to its captured stream is uncovered | `src/pree/audit.py` | `test_the_guard_repoints_a_handler_that_captured_the_stream_before_arming`, `test_the_guard_does_not_crash_the_boot_on_a_handler_whose_stream_is_read_only` |
@@ -3380,6 +3381,49 @@ The overclaim in the same test is narrowed rather than defended: the scan catche
 class name, bare or attribute, anywhere under `src/pree`. An alias, a `getattr` spelling and a
 subclass each escape it, measured, and are named as out of scope - the threat model is the routine
 addition, not someone hiding a handler.
+
+### Checking the spelling when the artefact was the thing
+
+The security gate defeated the tripwire four ways and then handed over a better instrument than the
+one I had reached for, which makes this the most useful finding of the release.
+
+**The static sweep was the wrong tool.** It matched an `ast.Call` whose function names a stdlib
+handler class. Four spellings walked past it, all using imports `audit.py` is already permitted: an
+alias import, `getattr`, the class held in a variable, and - the realistic one - `class
+_AsyncAuditHandler(logging.handlers.QueueHandler)` followed by constructing it. A subclass BASE is an
+`ast.ClassDef` entry, not a call, so the sweep was structurally blind to the spelling a maintainer
+adding async log shipping actually writes. Measured with that subclass in place: the whole
+verification loop green, and the credential crossing a multiprocessing queue in the clear with no
+alarm.
+
+**The fix is one identity check on the object.** `type(handler) is logging.StreamHandler`, over the
+handlers the package CONSTRUCTS. Every one of those four spellings produces a handler whose type is
+not `StreamHandler`, so a single check closes all four and any fifth nobody has thought of. The
+static sweep is kept as the cheap half - it names the offending file and line, which an identity
+check cannot - and it now sees subclass bases as well as calls. `type` and not `isinstance`,
+deliberately: a subclass IS an instance, and a subclass of `StreamHandler` overriding `emit` to
+serialise the record is exactly the object this refuses.
+
+The lesson generalises past this test and is the one worth keeping from the whole release: I was
+checking the SPELLING when the ARTEFACT was the thing. That is the same error as scanning a model of
+a log line instead of the line, which cost this project seven rounds. Twice now the answer has been
+to stop reasoning about how something would be written and look at what exists.
+
+**And one correction of mine was a correction of a true statement.** A docstring had said a formatter
+returning a non-`str` "is already broken for `StreamHandler.emit`, which concatenates the result". I
+replaced that with "unarmed, such a formatter emits fine" and billed the lost line as a third
+standing cost of arming. The original was right: measured, an unarmed `StreamHandler` emits the empty
+string because `msg + self.terminator` raises and `handleError` discards the line, identically to
+armed. The divergence exists only for a handler that does not concatenate - `QueueHandler` with a
+listener - which is the one class the check above forbids. The invented cost is withdrawn. A
+correction needs the same evidence as the claim it replaces, and that one had none.
+
+Also narrowed: `_limit_keys` claimed a saturated peer "is refused identically whether its token is
+right or wrong". True at the COARSE tier, which sits above authentication and is where the
+guessing-oracle argument lives. False at the fine tier, whose charge sits behind
+`Depends(require_token)`, so a saturated peer with the correct token gets 429 and a wrong one gets
+401. No new capability - 200 versus 401 already distinguishes a valid token - but not what the code
+does.
 
 ## Not accepted, and why it is not a risk here
 

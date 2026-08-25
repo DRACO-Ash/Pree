@@ -417,11 +417,20 @@ def _peer_key(request: Request) -> str:
 def _limit_keys(request: Request) -> tuple[str, ...]:
     """Every bucket this request must fit inside. Refused if ANY of them is over.
 
-    ONE key space, and the token plays no part in choosing it: a saturated peer is refused
-    identically whether its token is right or wrong, which is what removes the guessing oracle
-    and restores the premise the token-length floor is calculated from. The socket key is
-    unconditional and the forwarded fold is ADDITIONAL, so a forwarding header can only ever add
-    a constraint, never grant a fresh bucket.
+    ONE key space, and the token plays no part in choosing it. That removes the guessing oracle at
+    the COARSE tier, which is where it matters: the coarse charge sits above authentication, so a
+    peer saturated there is refused identically whether its token is right or wrong, and the
+    premise the token-length floor is calculated from holds.
+
+    NOT at the fine tier, and this comment claimed otherwise. The fine charge sits inside
+    `create_assessment`, behind `Depends(require_token)`, so a rejected token never reaches it: a
+    saturated peer presenting the CORRECT token gets 429 and a wrong one gets 401. Measured. That
+    grants no new capability - a caller already tells valid from invalid by 200 versus 401 - and
+    guessing stays bounded by the coarse 240 a minute that `config.py` reasons from. But the
+    sentence as written was not what the code does.
+
+    The socket key is unconditional and the forwarded fold is ADDITIONAL, so a forwarding header can
+    only ever add a constraint, never grant a fresh bucket.
 
     Three earlier designs are recorded in docs/SECURITY.md with their measurements, and the
     regression test for each is

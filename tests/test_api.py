@@ -5321,6 +5321,24 @@ def _handler_constructions(root: Path) -> dict[str, list[str]]:
             )
             if name in handler_names:
                 found.setdefault(str(module_path.relative_to(root)), []).append(name)
+        # SUBCLASS BASES too, because a base is an `ast.ClassDef` entry and not a `Call`, so the
+        # sweep above is structurally blind to `class _Sink(logging.handlers.QueueHandler)` - the
+        # spelling a maintainer adding async log shipping actually writes. A review measured that
+        # escaping the whole verification loop, with the credential crossing a multiprocessing
+        # queue in the clear and no alarm.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for base in node.bases:
+                base_name = (
+                    base.attr
+                    if isinstance(base, ast.Attribute)
+                    else base.id
+                    if isinstance(base, ast.Name)
+                    else None
+                )
+                if base_name in handler_names:
+                    found.setdefault(str(module_path.relative_to(root)), []).append(base_name)
     return found
 
 
@@ -5352,6 +5370,10 @@ def test_the_handler_scan_looks_inside_subpackages(tmp_path: Path) -> None:
         "from logging.handlers import SocketHandler\n\nh = SocketHandler('h', 1)\n",
         encoding="utf-8",
     )
+    (package / "deep" / "sub.py").write_text(
+        "import logging.handlers\n\n\nclass _Sink(logging.handlers.QueueHandler):\n    pass\n",
+        encoding="utf-8",
+    )
 
     found = _handler_constructions(package)
 
@@ -5361,6 +5383,61 @@ def test_the_handler_scan_looks_inside_subpackages(tmp_path: Path) -> None:
     )
     assert found.get("deep/deeper/sock.py") == ["SocketHandler"], (
         f"a nested subpackage was not scanned: {found}"
+    )
+    assert found.get("deep/sub.py") == ["QueueHandler"], (
+        f"a SUBCLASS base was not seen. A base is an `ast.ClassDef` entry rather than a call, so "
+        f"the call sweep alone is blind to the spelling a maintainer writes: {found}"
+    )
+
+
+def test_every_handler_the_package_installs_is_exactly_a_stream_handler() -> None:
+    """The premise held on the ARTEFACT rather than on the spelling, which is the whole point.
+
+    A security review defeated the static sweep four ways, using only imports `audit.py` is already
+    permitted: an alias import, `getattr`, the class held in a variable, and - the realistic one -
+    `class _AsyncAuditHandler(logging.handlers.QueueHandler)` then constructing it. A subclass base
+    is an `ast.ClassDef` entry rather than a call, so the call sweep was structurally blind to it,
+    and the whole verification loop stayed green while the credential crossed a multiprocessing
+    queue in the clear.
+
+    The reviewer's fix is better than the one I reached for, and the reason generalises past this
+    test: I was checking the SPELLING and the thing that matters is the OBJECT. Every one of those
+    four spellings yields a handler whose type is not `logging.StreamHandler`, so a single identity
+    check on what the package actually installs closes all four at once and any fifth spelling
+    nobody has thought of. The static sweep is kept as the cheap half - it names the offending file
+    and line, which an identity check cannot - but this is the half that makes the premise true.
+
+    `type(handler) is logging.StreamHandler`, not `isinstance`: a subclass IS an instance, and a
+    subclass of `StreamHandler` that overrides `emit` to serialise the record is exactly the object
+    this exists to refuse.
+    """
+    # Handlers the PACKAGE CONSTRUCTS, which is a narrower and more honest set than "handlers
+    # present in the process". A first version of this test walked the access loggers too and failed
+    # on pytest's own `LogCaptureHandler` - a false positive that made the test fail for a reason
+    # unrelated to its subject. Those loggers' handlers are installed by gunicorn, uvicorn or the
+    # test harness; the package attaches only FILTERS to them, via `bound_access_log`. What covers
+    # a handler this package did not build is the `Handler.format` patch, not its class.
+    installed: list[logging.Handler] = list(build_logger(io.StringIO()).handlers)
+    process_logger = logging.getLogger("pree.audit")
+    previous, previous_propagate = process_logger.handlers, process_logger.propagate
+    process_logger.handlers = []
+    try:
+        installed.extend(build_logger().handlers)
+    finally:
+        process_logger.handlers = previous
+        process_logger.propagate = previous_propagate
+
+    assert len(installed) >= 2, (
+        f"expected a handler from each way `build_logger` can be called, got {installed}, so this "
+        f"test would pass vacuously"
+    )
+    offenders = [handler for handler in installed if type(handler) is not logging.StreamHandler]
+    assert offenders == [], (
+        f"the package installs {[type(h).__name__ for h in offenders]}, and the credential guard's "
+        f"cost statement in `install_credential_guard` rests on it installing nothing but "
+        f"`StreamHandler`s. Four stock handlers serialise `record.__dict__` and are wholly "
+        f"uncovered since the record-scanning layer was removed; a SUBCLASS of one of them is the "
+        f"spelling that defeats a static sweep, which is why this check is on the object's type"
     )
 
 

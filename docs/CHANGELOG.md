@@ -1537,3 +1537,23 @@ One new regression test, 361 passing, coverage 99%.
   direction is confirmed by three harnesses and my structural conjecture is withdrawn.
 
 Two new tests, 362 passing, coverage 99%. Five mutations re-run: five red.
+
+### The artefact, not the spelling
+
+● **The static tripwire was defeated four ways** - an alias import, `getattr`, the class held in a
+  variable, and a SUBCLASS, which is an `ast.ClassDef` base rather than a call and so structurally
+  invisible to a call sweep. With the subclass in place the whole loop stayed green while the
+  credential crossed a multiprocessing queue in the clear.
+● **The fix is one identity check on the object**: every handler the package constructs must be
+  exactly `logging.StreamHandler` by type. All four spellings yield a non-`StreamHandler` type, so
+  one check closes them and any fifth. The static sweep stays as the cheap half, now seeing subclass
+  bases too, because it names the offending file where an identity check cannot.
+● **A correction of mine had corrected a true statement.** "Unarmed, a non-`str` formatter return
+  emits fine" is false - it emits the empty string, identically to armed - so the "third standing
+  cost of arming" I invented is withdrawn. The divergence exists only for `QueueHandler`, the class
+  now forbidden.
+● **`_limit_keys`'s no-oracle claim is narrowed** to the coarse tier, which sits above
+  authentication. At the fine tier a saturated peer with the right token gets 429 and a wrong one
+  401.
+
+Three new tests, 363 passing, coverage 99%. Four evasive spellings canaried: four red.
