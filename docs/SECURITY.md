@@ -3425,6 +3425,87 @@ guessing-oracle argument lives. False at the fine tier, whose charge sits behind
 401. No new capability - 200 versus 401 already distinguishes a valid token - but not what the code
 does.
 
+## What the App Store supply-chain gate does not cover
+
+Recorded before submission, from the `appstore-python-gate` skill's gap register, checked against
+THIS package rather than inherited. Confidence markers are the skill's and are load-bearing: FACT is
+observed here, INFERENCE is reasoned from observation, UNKNOWN is not established. Do not let an
+UNKNOWN be promoted quietly.
+
+The platform runs nine stages. Five are supply-chain stages that have never fired on any Bluestaq
+upload, and a gate that has never fired says almost nothing about where its threshold sits.
+
+### The contract, checked against the built archive
+
+**FACT.** `scripts/preflight.py` from the skill reports 0 blocking and 0 advisory findings against
+both the working tree and the extracted `pree-upload.zip`: `pyproject.toml` with a `[project]` table,
+`requirements.txt` exactly pinned with a hash on every entry, no resolver hazards, `Dockerfile` at
+the root, every base image digest-pinned. The tool's own self-test passes 10 assertions first, which
+is the same discipline this project applies to its own guards.
+
+**FACT.** Three differences from the skill's reference shape, all in this package's favour:
+
+● **No `requirements-runtime.txt` split.** The skill names this the single largest gap: stage 4 scans
+  `requirements.txt` and never reads the runtime lockfile, so what is scanned is not what is
+  installed, safe only "by coincidence of subset identity". Pree has no split - the `Dockerfile`
+  installs `--require-hashes --no-deps -r requirements.txt`, the same file the analyser reads - so
+  the gap does not exist here rather than being mitigated.
+● **The patch step fails CLOSED.** The reference posture ends its `apt-get upgrade` with `|| true`,
+  which can silently no-op and make an unpatched image indistinguishable from a patched one. Pree's
+  does not.
+● **The base images are digest-pinned already**, two `@sha256:` pins, so two builds of one archive
+  cannot draw different operating system package sets.
+
+### The gaps that DO apply here
+
+● **Digest pinning creates an obligation this project has not met.** FACT: continuous integration
+  runs on push only; there is no scheduled job. INFERENCE: a pinned digest never patches itself, so
+  the longer the pin holds the further the image drifts from the patched upstream, and the gate stays
+  quiet the whole time. The skill's cadence suggestion is weekly: refresh the digest, rebuild,
+  re-scan, open a merge request if it passes. **This is the highest-value item outstanding.**
+● **The shipped image contains a whole Debian userland.** FACT: the ship stage is `FROM scratch`
+  followed by `COPY --from=prep / /`. INFERENCE: `scratch` here is a layer-flattening device chosen so
+  the image-policy scan reads no setuid bit in layer history, not a minimal image - so stage 9 sees
+  every operating system package rather than only the Python ones. A minimal or distroless base
+  routinely cuts scanner-reported counts substantially, and would need testing against the flatten
+  trick rather than adopting on trust.
+● **Pinning makes this package stationary, not safe.** FACT: every runtime entry is `==` with a hash.
+  INFERENCE: that makes a scan reproducible between uploads, and it means a quiet gate today is
+  evidence that nothing in the set has been disclosed YET, not that the set is healthy.
+● **Stage 7, Dockerfile Lint.** FACT: `hadolint` is not run locally. The digest pinning and the
+  environment allowlist are asserted by this project's own boot-contract suite, which is a different
+  instrument from the platform's linter and may hold a different rule set.
+● **Stage 9, Container Scan.** FACT: the image is neither signed nor attested, and no SBOM of the
+  IMAGE exists - only source-level dependency evidence. A scan matches packages against a database
+  and says nothing about provenance.
+● **Stage 2, Dependencies.** UNKNOWN. Nobody has read this stage's output on any upload. Reading one
+  job log would convert it to a FACT and is worth more than any inference about it.
+● **Stage 4 residuals.** Malicious-but-not-yet-disclosed packages, advisory-database ingestion delay,
+  and whether a vulnerable function is reachable at all. No static reachability analysis and no VEX
+  document. FACT, measured here rather than assumed: `pip-audit --strict` is clean on
+  `requirements-dev.txt` as well as `requirements.txt`, though the verification loop only reads the
+  latter - the dev set is what the platform's test stage installs, so it is in scope.
+
+### What is already covered, so it is not re-litigated
+
+**FACT.** Stage 1's cover is allowlist packaging plus history scanning, and security reviews have
+swept eighty revisions for credential patterns. Stage 3's cover is `ruff check --select S`, the
+Bandit rule set, which `pyproject.toml` selects, plus `mypy` over source and tests. Stage 5's cover
+is the 80% coverage floor, met at 99%, plus extensive mutation testing. Stage 8's reproducibility
+cover is the digest-pinned base and the `--require-hashes` install.
+
+**FACT.** The runtime dependency set is THREE direct entries - `fastapi`, `uvicorn`, `gunicorn` -
+each with its reason recorded in `requirements.in`, and no dependency added for the application's own
+purposes at all. The skill's judgement is that this is the cheapest supply-chain control available,
+and it should be defended rather than eroded.
+
+### The sentence to use when someone says a green pipeline means secure
+
+The five supply-chain stages passing is evidence that they had nothing to say about this package, not
+evidence that the package is sound. What supports the latter is the dependency set's size, the hash
+pinning, the digest pinning, the clean `pip-audit` on both lockfiles, and the gaps named above being
+named rather than absent.
+
 ## Not accepted, and why it is not a risk here
 
 A client-side gate is never a boundary. Pree has no browser-side flag, PIN, or hidden field

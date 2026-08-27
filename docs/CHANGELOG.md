@@ -1557,3 +1557,25 @@ Two new tests, 362 passing, coverage 99%. Five mutations re-run: five red.
   401.
 
 Three new tests, 363 passing, coverage 99%. Four evasive spellings canaried: four red.
+
+### The App Store supply-chain gate register, from the `appstore-python-gate` skill
+
+The skill is installed at `.claude/skills/appstore-python-gate/` with its five references and its two
+scripts. Its `preflight.py` reports 0 blocking and 0 advisory against both the working tree and the
+extracted upload archive, after its own self-test passes 10 assertions.
+
+● **Three differences from the skill's reference shape, all in this package's favour.** No
+  `requirements-runtime.txt` split, so the file the analyser scans IS the file the image installs and
+  the skill's "single largest gap" does not exist here; the `apt-get upgrade` step fails closed rather
+  than ending `|| true`; and both base images are already digest-pinned.
+● **The gaps that do apply are recorded in `docs/SECURITY.md`.** The highest-value one is that digest
+  pinning creates an obligation this project has not met: continuous integration runs on push only,
+  so a pinned digest never patches itself. The shipped image also carries a whole Debian userland,
+  since `FROM scratch` here is a layer-flattening device rather than a minimal base.
+● **One UNKNOWN is recorded as an UNKNOWN.** Nobody has read the Dependencies stage's output on any
+  upload; reading one job log would convert it to a fact.
+● **One inference converted to a measurement**: `pip-audit --strict` is clean on
+  `requirements-dev.txt` as well as `requirements.txt`, which matters because the dev set is what the
+  platform's test stage installs while the local loop reads only the runtime set.
+
+No source change. The register exists so a green pipeline is never read as a security verdict.
