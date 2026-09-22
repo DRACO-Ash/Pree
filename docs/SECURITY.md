@@ -3425,6 +3425,49 @@ guessing-oracle argument lives. False at the fine tier, whose charge sits behind
 401. No new capability - 200 versus 401 already distinguishes a valid token - but not what the code
 does.
 
+### The constructor was not the boundary, and an inert plant nearly hid it
+
+Both gates returned PASS on `2f1dc24`, the first round in which neither found a BLOCKER or a MAJOR.
+The security gate's two MINORs are both recorded here, because both were real and both are fixed.
+
+**A serialising handler attached outside `build_logger` was caught by nothing.**
+`test_every_handler_the_package_installs_is_exactly_a_stream_handler` enumerates the handlers
+`build_logger()` installs, and its own comment says so honestly - but `build_logger` is not the only
+place this package can attach a handler. `bound_access_log` also touches loggers, and an aliased
+`DatagramHandler` attached there pickles `record.__dict__` out to a socket, which is precisely the
+channel the `Handler.format` patch does not cover. Three layers each missed it for a different
+reason: the alias defeats the static sweep, `logging` is already a permitted top-level import so the
+import allowlist sees nothing new, and the constructor check never looks at that logger.
+
+The fix is a third artefact check, `test_no_serialising_handler_reaches_the_process_registry`. It
+asks the PROCESS rather than the constructor: after the app is built, is any handler the logging
+module knows about an instance of a class that serialises the record? It reuses
+`_existing_handlers`, the guard's own two-source registry walk, so the test and the guard cannot
+disagree about what a handler in this process is. Measured: with the plant in place it is the only
+failure among 364 tests.
+
+The polarity is deliberate and opposite to the check beside it. For a PERMITTED set, exact type is
+right - a subclass of `StreamHandler` overriding `emit` to serialise is exactly what must not pass.
+For a FORBIDDEN set, `isinstance` is right - a subclass of `DatagramHandler` still pickles. Getting
+it backwards either way reopens the hole.
+
+**And the lesson of the round is how nearly the finding was dismissed.** The first reproduction
+attached the handler to `gunicorn.error`. `ACCESS_LOGGER_NAMES` is `("uvicorn.access",
+"gunicorn.access")`, so the branch never fired, the handler was never attached, and the suite stayed
+green for the one reason that proves nothing. Read without checking, that green says "no gap here"
+and the finding is closed as unreproducible. The plant was only shown to land by printing the
+logger's handler list, after which the real gap appeared immediately. This file already records
+*check a plant landed before drawing a conclusion*; recording a rule is not applying it, which this
+file also already records. An inert mutation and a caught mutation produce the same green.
+
+**A branch that read as a control was held by nothing.** Replacing the wildcard-and-comma refusal at
+`config.py:217` with `if False:` left the whole suite green, because the regex below it refuses `*`,
+`null` and a comma list on its own and the test matched only `PREE_ALLOWED_ORIGIN`, a string both
+messages carry. No hole: every bad origin was still refused. But the branch is not dead code either
+- it executes, and it names WHICH mistake the operator made, and a wildcard is a different fix from
+a typo. So it is pinned rather than deleted: the test now asserts each branch's own diagnostic, and
+the three wildcard cases turn red when the branch goes.
+
 ## What the App Store supply-chain gate does not cover
 
 Recorded before submission, from the `appstore-python-gate` skill's gap register, checked against

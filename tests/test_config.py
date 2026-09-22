@@ -177,13 +177,34 @@ def test_an_unset_environment_defaults_to_production_and_so_refuses_an_open_gate
         load_config({"PREE_DATA_DIR": str(tmp_path)})
 
 
-@pytest.mark.parametrize("bad_origin", ["*", "null", "https://a.b, *", "not-a-url", "ftp://x"])
+@pytest.mark.parametrize(
+    ("bad_origin", "expected"),
+    [
+        ("*", "never an allowed origin"),
+        ("null", "never an allowed origin"),
+        ("https://a.b, *", "never an allowed origin"),
+        ("not-a-url", "must look like"),
+        ("ftp://x", "must look like"),
+    ],
+)
 def test_an_origin_that_is_not_a_concrete_origin_is_refused_in_any_environment(
-    tmp_path: Path, bad_origin: str
+    tmp_path: Path, bad_origin: str, expected: str
 ) -> None:
     """The wildcard guard used to live inside the production branch and match `*` exactly, so
-    development accepted a wildcard with credentials and `null` was accepted anywhere."""
-    with pytest.raises(ConfigError, match="PREE_ALLOWED_ORIGIN"):
+    development accepted a wildcard with credentials and `null` was accepted anywhere.
+
+    The MESSAGE is asserted, not merely the refusal. A security review measured that replacing
+    the wildcard-and-comma branch with `if False:` left the entire suite green: the regex below
+    it refuses `*`, `null` and a comma list on its own, so every input here was still refused
+    and a match on `PREE_ALLOWED_ORIGIN` alone - a string both messages carry - could not tell
+    the two branches apart. That made the branch read as a control while being held by nothing,
+    which is the shape this project deletes elsewhere.
+
+    It is not deleted, because it is not dead: it earns its place by naming WHICH mistake the
+    operator made, and a wildcard is a different fix from a typo. So what is pinned here is the
+    diagnostic rather than the refusal, and the branch now has a test that dies with it.
+    """
+    with pytest.raises(ConfigError, match=expected):
         load_config(
             {
                 "PREE_ENV": "development",

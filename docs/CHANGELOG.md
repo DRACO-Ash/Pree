@@ -1608,3 +1608,33 @@ check red.
   was wrong, which is worth recording: a summary of a control drifts wider than the control.
 
 Documentation only. 363 passing, coverage 99%, `pip-audit` clean.
+
+### Both gates PASS, and the constructor turns out not to be the boundary
+
+The first round in which neither gate found a BLOCKER or a MAJOR. The security gate's two MINORs
+are both fixed rather than noted.
+
+● **A serialising handler attached outside `build_logger` was caught by nothing.** The artefact
+  check enumerates that one constructor, and `bound_access_log` also touches loggers, so an
+  aliased `DatagramHandler` attached there pickles `record.__dict__` to a socket with three layers
+  each missing it for a different reason: the alias defeats the static sweep, `logging` is already
+  a permitted import so the allowlist sees nothing new, and the constructor check never looks at
+  that logger. Fixed by asking the PROCESS instead of the constructor -
+  `test_no_serialising_handler_reaches_the_process_registry` walks the guard's own registry walk
+  and refuses any instance of the four serialising classes. `isinstance` here, deliberately the
+  opposite polarity to the check beside it: for a permitted set exact type is right, for a
+  forbidden set a subclass still pickles.
+● **The finding was nearly dismissed on an inert plant.** The first reproduction attached the
+  handler to `gunicorn.error`; `ACCESS_LOGGER_NAMES` holds `uvicorn.access` and `gunicorn.access`,
+  so nothing was ever attached and the suite stayed green for the one reason that proves nothing.
+  The plant was only shown to land by printing the logger's handler list. An inert mutation and a
+  caught mutation produce the same green, and this project has now written that rule down twice
+  without applying it.
+● **A branch that read as a control was held by nothing.** Replacing the wildcard-and-comma
+  refusal at `config.py:217` with `if False:` left the suite green, because the regex below it
+  refuses `*`, `null` and a comma list anyway and the test matched a string both messages carry.
+  Not a hole, and not dead code either: the branch names WHICH mistake was made, and a wildcard is
+  a different fix from a typo. Pinned rather than deleted, so three cases now die with it.
+
+One regression test and one tightened parametrisation. 364 passing, coverage 99%, `pip-audit`
+clean. No source change.

@@ -56,6 +56,7 @@ from pree.app import (
 from pree.audit import (
     CREDENTIAL_ALARM,
     GUARDED_STREAM_ATTRIBUTES,
+    _existing_handlers,
     _GuardedStream,
     audit,
     build_logger,
@@ -5278,6 +5279,18 @@ EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
 # style preference.
 PERMITTED_HANDLER_CLASSES = frozenset({"StreamHandler"})
 
+# The four stock handlers that serialise `record.__dict__`, which is the property that decides
+# membership - not "does not emit `Handler.format`'s return value", a criterion measurement has
+# already defeated once because `QueueHandler` DOES emit it and still hands the raw record to a
+# queue. `install_credential_guard` names this set as wholly uncovered since the record-scanning
+# layer was removed. Held as CLASSES rather than as names because the check below is on objects.
+SERIALISING_HANDLER_CLASSES: tuple[type[logging.Handler], ...] = (
+    logging.handlers.HTTPHandler,
+    logging.handlers.SocketHandler,
+    logging.handlers.DatagramHandler,
+    logging.handlers.QueueHandler,
+)
+
 
 def _stdlib_handler_class_names() -> set[str]:
     """Every `logging` handler class the standard library offers, read from the modules themselves.
@@ -5438,6 +5451,56 @@ def test_every_handler_the_package_installs_is_exactly_a_stream_handler() -> Non
         f"`StreamHandler`s. Four stock handlers serialise `record.__dict__` and are wholly "
         f"uncovered since the record-scanning layer was removed; a SUBCLASS of one of them is the "
         f"spelling that defeats a static sweep, which is why this check is on the object's type"
+    )
+
+
+def test_no_serialising_handler_reaches_the_process_registry() -> None:
+    """The same premise, held over the whole process rather than over one constructor.
+
+    The security gate defeated the check above without touching it. That check enumerates the
+    handlers `build_logger()` installs, and says so honestly in its own comment - but
+    `build_logger` is not the only place this package can attach a handler. Measured: an aliased
+    `DatagramHandler` attached to `gunicorn.error` inside `bound_access_log` left all 363 tests
+    green while pickling `record.__dict__` out to a UDP socket. The alias defeats the static
+    sweep, `logging` is already a permitted top-level import so
+    `test_every_module_imports_exactly_what_it_is_permitted_to` sees nothing new, and the
+    constructor check never looks at that logger.
+
+    So this asks the process, not the constructor: after the app is built, is any handler the
+    logging module knows about an instance of a class that serialises the record? That is the
+    question the premise actually rests on, and it does not care which function attached the
+    handler or how the class was spelled.
+
+    `isinstance` here, and deliberately the OPPOSITE polarity to the check above. For a PERMITTED
+    set, exact type is right: a subclass of `StreamHandler` overriding `emit` to serialise is
+    exactly what must not pass. For a FORBIDDEN set, `isinstance` is right: a subclass of
+    `DatagramHandler` still pickles. Getting the polarity backwards either way reopens the hole.
+
+    The walk is `_existing_handlers`, the guard's own two-source registry walk, rather than a
+    third one written here. A private-list reader and a manager walk each have a gap the other
+    covers, and reusing the guard's walk means this test and the guard cannot disagree about what
+    a handler in this process is.
+    """
+    with _app_in("production"):
+        present = _existing_handlers()
+        streams = [handler for handler in present if type(handler) is logging.StreamHandler]
+
+    # The canary. A registry walk that returns nothing satisfies the assertion below vacuously,
+    # and this project has shipped a vacuous assertion before. The audit logger's own
+    # `StreamHandler` must be visible for the refusal to mean anything.
+    assert streams, (
+        f"the registry walk found no plain `StreamHandler` among "
+        f"{[type(h).__name__ for h in present]}, so the refusal below would pass against a "
+        f"process with no handlers at all"
+    )
+
+    offenders = [handler for handler in present if isinstance(handler, SERIALISING_HANDLER_CLASSES)]
+    assert offenders == [], (
+        f"{[type(h).__name__ for h in offenders]} is attached somewhere in this process. Those "
+        f"classes serialise `record.__dict__`, which the `Handler.format` patch does not cover, "
+        f"so a credential on a record leaves the process in the clear. Whoever trips this returns "
+        f"to `install_credential_guard`'s cost statement and decides whether the record scan "
+        f"needs to come back"
     )
 
 
