@@ -1569,9 +1569,9 @@ extracted upload archive, after its own self-test passes 10 assertions.
   the skill's "single largest gap" does not exist here; the `apt-get upgrade` step fails closed rather
   than ending `|| true`; and both base images are already digest-pinned.
 ● **The gaps that do apply are recorded in `docs/SECURITY.md`.** The highest-value one is that digest
-  pinning creates an obligation this project has not met: continuous integration runs on push only,
-  so a pinned digest never patches itself. The shipped image also carries a whole Debian userland,
-  since `FROM scratch` here is a layer-flattening device rather than a minimal base.
+  pinning creates an obligation this project has not met: continuous integration has no scheduled
+  job, so a pinned digest never patches itself. The shipped image also carries a whole Debian
+  userland, since `FROM scratch` here is a layer-flattening device rather than a minimal base.
 ● **One UNKNOWN is recorded as an UNKNOWN.** Nobody has read the Dependencies stage's output on any
   upload; reading one job log would convert it to a fact.
 ● **One inference converted to a measurement**: `pip-audit --strict` is clean on
@@ -1579,3 +1579,32 @@ extracted upload archive, after its own self-test passes 10 assertions.
   platform's test stage installs while the local loop reads only the runtime set.
 
 No source change. The register exists so a green pipeline is never read as a security verdict.
+
+### The engineering gate returns PASS, and corrects a FACT marker in the new register
+
+First PASS from either gate since the record-scanning layer came out. 24 mutations, 22 red; the
+`rglob` BLOCKER closed against the REAL package by planting
+`src/pree/logsub/audit.py` rather than only against the synthetic tree, and the division of labour
+between the two handler checks shown by a mutation the static sweep cannot structurally see - a
+`StreamHandler` subclass built through a variable leaves the sweep green and turns the artefact
+check red.
+
+● **A FACT marker was wrong, and a wrong FACT here is the failure this project keeps paying for.**
+  The register said continuous integration "runs on push only". `.github/workflows/verify.yml`
+  triggers on `push` AND on `pull_request` to `main`. The load-bearing half - no cron, so a pinned
+  digest never patches itself and the gate stays quiet while the image drifts - was always true, and
+  the inference built on it stands. The marker did not. Corrected in the register and here.
+● **461 lines of the new skill's tooling are gated by nothing, and that is now recorded.**
+  `scripts/verify.sh` scopes `ruff` and `mypy` to `src` and `tests`, and nothing imports
+  `preflight.py`, so the loop does not stand behind it. It reaches neither shipped artefact:
+  `.dockerignore` excludes `.claude` and the archive allowlist never names it. Recorded rather than
+  gated - pulling a vendored skill's scripts into the loop buys little and drifts when the skill is
+  updated upstream - so the next reader does not mistake a hand-run for a standing control.
+● **My own claim was wider than the code's.** I briefed the gate that `MAX_LOGGED_REASON` is
+  "applied at three sites". Two of the three survive deletion with the suite green, because the
+  only `AuthError` raise carries a literal and the only application `HTTPException` carries a
+  constant, so no test can distinguish them without inventing a raise site. The comment at
+  `src/pree/app.py:129-134` already said exactly this and was accurate. The brief was the thing that
+  was wrong, which is worth recording: a summary of a control drifts wider than the control.
+
+Documentation only. 363 passing, coverage 99%, `pip-audit` clean.

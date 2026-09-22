@@ -3459,10 +3459,11 @@ is the same discipline this project applies to its own guards.
 ### The gaps that DO apply here
 
 ● **Digest pinning creates an obligation this project has not met.** FACT: continuous integration
-  runs on push only; there is no scheduled job. INFERENCE: a pinned digest never patches itself, so
-  the longer the pin holds the further the image drifts from the patched upstream, and the gate stays
-  quiet the whole time. The skill's cadence suggestion is weekly: refresh the digest, rebuild,
-  re-scan, open a merge request if it passes. **This is the highest-value item outstanding.**
+  runs on push and on pull requests to `main`; there is no scheduled job. INFERENCE: a pinned digest
+  never patches itself, so the longer the pin holds the further the image drifts from the patched
+  upstream, and the gate stays quiet the whole time. The skill's cadence suggestion is weekly:
+  refresh the digest, rebuild, re-scan, open a merge request if it passes. **This is the
+  highest-value item outstanding.**
 ● **The shipped image contains a whole Debian userland.** FACT: the ship stage is `FROM scratch`
   followed by `COPY --from=prep / /`. INFERENCE: `scratch` here is a layer-flattening device chosen so
   the image-policy scan reads no setuid bit in layer history, not a minimal image - so stage 9 sees
@@ -3485,6 +3486,15 @@ is the same discipline this project applies to its own guards.
   document. FACT, measured here rather than assumed: `pip-audit --strict` is clean on
   `requirements-dev.txt` as well as `requirements.txt`, though the verification loop only reads the
   latter - the dev set is what the platform's test stage installs, so it is in scope.
+● **The gate skill's own scripts sit outside the verification loop.** FACT: `scripts/verify.sh`
+  scopes `ruff` and `mypy` to `src` and `tests`, and nothing under `src`, `tests` or `scripts`
+  imports `.claude/skills/appstore-python-gate/scripts/preflight.py`, so its 461 lines are linted,
+  type-checked and tested by nothing. FACT: it reaches neither shipped artefact - `.dockerignore`
+  excludes `.claude` from the image, and the archive allowlist never names it, so the upload zip
+  contains no path matching `claude`. It is therefore recorded rather than gated: it is developer
+  tooling run by hand, and a reader must not assume the loop stands behind it. Run manually against
+  this commit it self-tests 10 of 10 and reports 0 blocking and 0 advisory against both the tree and
+  the extracted archive, which is evidence about one run rather than a standing control.
 
 ### What is already covered, so it is not re-litigated
 
