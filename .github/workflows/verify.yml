@@ -44,6 +44,21 @@ jobs:
       - name: the verification loop
         run: sh scripts/verify.sh
 
+      - uses: aquasecurity/setup-trivy@v0.3.1
+        # The image CVE scanner, installed as a BINARY rather than run as a scanning action,
+        # because the scan itself lives in `scripts/simulate-pipeline.sh` beside the other four
+        # image assertions. Restating it here would put a check in the workflow that a developer
+        # with a daemon does not run, which is the split this job's header exists to refuse.
+        #
+        # Deliberately the one thing in this repository that is NOT version-pinned. A
+        # vulnerability scanner pinned to a fixed binary and a fixed database freezes the
+        # knowledge it exists to apply, so a stale pin would report a clean image indefinitely
+        # while the CVEs accumulated. The cost is accepted and recorded rather than implied: a
+        # compromised release of this action would run arbitrary code in this job, exactly as
+        # the tag-pinning note above says of the other two.
+        with:
+          cache: true
+
       - name: prove a Docker daemon is actually reachable
         # BEFORE the pipeline runs, so the exit-2 check below means what the next step says it
         # means. Without this, exit 2 on a runner that happens to have no daemon would read as

@@ -17,6 +17,33 @@ value and the fail-closed boot then rejects it, costing a deploy cycle per varia
 | Never set | `ENV PORT=` in the Dockerfile, and never type `PORT` into the console |
 | Runtime user | `10001:10001`, non-root, numeric |
 
+## Submission listing fields
+
+The console asks for these when the app is created, and a deploy gate blocked the first
+release because this document defined none of them. It bills itself as the single source of
+the platform settings, so a field it does not carry is a field decided at the console by
+whoever happens to be submitting.
+
+Three are facts about the build and are safe to paste. The rest are the owner's words about
+the product, and they are marked `TBC, re-verify` rather than drafted here, because invented
+user-facing copy is the one thing this project never ships. A marked row is a question to the
+owner, not a placeholder to paste.
+
+| Field | Value |
+|---|---|
+| App slug | `pree` (lowercase, alphanumeric at both ends, no double hyphen) |
+| Detected template | `python` |
+| Deployment target | `pree.apps.bluestaq.com` |
+| Display name | `TBC, re-verify` - owner to supply |
+| Short description | `TBC, re-verify` - owner to supply |
+| Full description | `TBC, re-verify` - owner to supply |
+| Category | `TBC, re-verify` - owner to pick from the platform's own list, which is not readable from here |
+| App type | `TBC, re-verify` - the archetype is `server` and the target is a URL, which SUGGESTS the platform's Web App type, but the console's own vocabulary has not been read |
+| Visibility | `TBC, re-verify` - owner to set |
+
+The slug, template and target are carried from `CLAUDE.md` rather than restated independently,
+because a second copy of a fact drifts from the first.
+
 ## Environment variables tab
 
 Pree carries its defaults in code, and every value the platform injects lives at the pod

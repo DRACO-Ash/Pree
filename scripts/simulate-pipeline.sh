@@ -168,13 +168,51 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     exit 1
   fi
   echo "image: runs as $IDENTITY"
+
+  echo "--- image: no HIGH or CRITICAL operating-system package CVE ---"
+  # The one contract item `pip-audit` cannot reach. It reads the PYTHON dependency set, and
+  # the shipped image carries a whole Debian userland underneath it, because `FROM scratch`
+  # here is a layer-flattening device rather than a minimal base. The platform's
+  # container-scan stage STOPS on a High or Critical package CVE and it is the stage
+  # immediately before deploy, so shipping unscanned is a release gambled on the pinned base
+  # being clean. A deploy gate measured this gap: never scanned, on any date.
+  #
+  # A missing scanner is a FAILURE, not a skip. A control that cannot be verified is treated
+  # as failed, and a scan that silently does not run is the worst of both: it reads as a
+  # control while being none.
+  if ! command -v trivy >/dev/null 2>&1; then
+    echo "image: trivy is not installed, so the operating-system CVE scan cannot run" >&2
+    echo "       A control that cannot be verified is treated as failed, so this is a" >&2
+    echo "       failure rather than a skip. Install trivy and re-run." >&2
+    exit 1
+  fi
+  # Two passes, because the two answers call for different actions and merging them would
+  # make one of them unactionable. FIXABLE first, and it fails the build: a patch exists, so
+  # rebuilding is the fix and there is somewhere to go. The scanner itself is deliberately
+  # NOT version-pinned, unlike everything else in this repository - a vulnerability scanner
+  # pinned to a fixed binary and database freezes the knowledge it exists to apply, which is
+  # the opposite of what this check is for.
+  if ! trivy image --quiet --scanners vuln --pkg-types os \
+       --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 pree:simulated; then
+    echo "image: a HIGH or CRITICAL operating-system package CVE WITH A FIX AVAILABLE is" >&2
+    echo "       present (listed above). Refresh the base image digests and rebuild." >&2
+    exit 1
+  fi
+  echo "image: no HIGH or CRITICAL operating-system package CVE with a fix available"
+  # UNFIXED second, and it does NOT fail the build, because no rebuild clears it and a gate
+  # nobody can pass teaches people to disable gates. Recorded rather than ignored: the output
+  # is the evidence for the decision, and the platform may still stop on these.
+  echo "--- image: HIGH or CRITICAL with NO fix available, recorded not ignored ---"
+  trivy image --quiet --scanners vuln --pkg-types os \
+    --severity HIGH,CRITICAL --exit-code 0 pree:simulated || true
 else
   # An honest non-zero skip, never a green pass. Continuous integration is the binding source
   # of truth for this leg, and it is the ONLY place the three image assertions above can run,
   # which means the container hard rules are unverified until CI builds the image.
   echo "container build: NO DOCKER DAEMON AVAILABLE, deferred to CI" >&2
-  echo "         The image assertions (no setuid bits, non-root numeric user, no pip) run" >&2
-  echo "         only with a daemon, so those three rules are UNVERIFIED here." >&2
+  echo "         The image assertions (no setuid bits, non-root numeric user, no pip, and" >&2
+  echo "         no fixable HIGH or CRITICAL operating-system package CVE) run only with a" >&2
+  echo "         daemon, so those four rules are UNVERIFIED here." >&2
   exit 2
 fi
 

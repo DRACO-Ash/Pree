@@ -1638,3 +1638,41 @@ are both fixed rather than noted.
 
 One regression test and one tightened parametrisation. 364 passing, coverage 99%, `pip-audit`
 clean. No source change.
+
+### The deploy gate returns FAIL, and finds the image was never scanned
+
+The gate probed rather than read, and two of the limits it was handed turned out to be wrong in
+its favour: it reached GitHub and confirmed the continuous integration run itself, and it
+reproduced the `fsGroup` failure live by dropping privileges with `setpriv` after its first probe
+was inconclusive for running as root. Two blockers and one major.
+
+● **MAJOR, and the one fixable from here: no operating-system package CVE scan had ever run
+  against this image, on any date.** `pip-audit` reads the PYTHON dependency set and is clean; the
+  shipped image carries a whole Debian userland underneath it, because `FROM scratch` here is a
+  layer-flattening device rather than a minimal base. The platform's container-scan stage stops on
+  a HIGH or CRITICAL package CVE and it is the stage immediately before deploy, so the release was
+  gambled on the pinned base being clean. `trivy` now runs as a fifth image assertion inside
+  `scripts/simulate-pipeline.sh`, not as a workflow step, because the workflow's own header
+  refuses a check a developer with a daemon would not run. Two passes: fixable fails the build,
+  unfixed is printed and recorded, a missing scanner fails rather than skips.
+● **The scanner is deliberately the one unpinned thing here.** A vulnerability scanner frozen to a
+  fixed binary and database freezes the knowledge it exists to apply, and would report a clean
+  image indefinitely while the CVEs accumulated. Recorded rather than implied, alongside the
+  existing note that a compromised action tag runs arbitrary code in the job.
+● **And I invented a version tag while fixing it.** I wrote `aquasecurity/setup-trivy@v0.2.3` from
+  memory. The real tags are `v0.2.6`, `v0.3.0` and `v0.3.1`; the action was pinned to the verified
+  `v0.3.1` only after listing them, and its `action.yaml` was read to confirm `cache` is a real
+  input and that it adds the binary to `$GITHUB_PATH` so `command -v trivy` resolves. A version is
+  a figure, and this project does not assert figures it has not checked.
+● **BLOCKER, owner's: the `fsGroup` operations request is not raised.** Owner confirmation of the
+  VALUE is not the request being raised and applied. `docs/DEPLOYMENT.md` already says the gate
+  treats an unset `fsGroup` as a blocker rather than a warning.
+● **BLOCKER, owner's: six submission listing fields were defined nowhere.** This document bills
+  itself as the single source of the platform settings, so a field it omits is decided at the
+  console by whoever is submitting. A Submission listing fields table now exists. Slug, template
+  and target are carried as facts; display name, short and full description, category, app type
+  and visibility are marked `TBC, re-verify` rather than drafted, because invented user-facing
+  copy is the one thing this project never ships.
+
+Scripts, workflow and documentation. 364 passing in-repo, 363 passing with one artefact-only skip
+against the extracted archive, Cobertura line-rate 1.0 against a gate bar of 80%.

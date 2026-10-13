@@ -3521,7 +3521,17 @@ is the same discipline this project applies to its own guards.
   instrument from the platform's linter and may hold a different rule set.
 ● **Stage 9, Container Scan.** FACT: the image is neither signed nor attested, and no SBOM of the
   IMAGE exists - only source-level dependency evidence. A scan matches packages against a database
-  and says nothing about provenance.
+  and says nothing about provenance. The operating-system package CVE half of this gap is now
+  CLOSED: a deploy gate found that nothing had ever scanned the Debian layer on any date, because
+  `pip-audit` reads the Python dependency set and the shipped image carries a whole Debian userland
+  underneath it. `scripts/simulate-pipeline.sh` now runs `trivy` over the built image as a fifth
+  image assertion, in two passes. A HIGH or CRITICAL with a fix available FAILS the build, because
+  a patch exists and rebuilding is the fix. One with NO fix is printed and recorded rather than
+  failing, because no rebuild clears it and a gate nobody can pass teaches people to disable gates.
+  A missing scanner is a failure rather than a skip, under the rule that a control that cannot be
+  verified is treated as failed. The scanner is deliberately the one unpinned thing in this
+  repository: a vulnerability scanner frozen to a fixed binary and database freezes the knowledge it
+  exists to apply, and would report a clean image indefinitely while the CVEs accumulated.
 ● **Stage 2, Dependencies.** UNKNOWN. Nobody has read this stage's output on any upload. Reading one
   job log would convert it to a FACT and is worth more than any inference about it.
 ● **Stage 4 residuals.** Malicious-but-not-yet-disclosed packages, advisory-database ingestion delay,
