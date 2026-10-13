@@ -3549,6 +3549,46 @@ is the same discipline this project applies to its own guards.
   this commit it self-tests 10 of 10 and reports 0 blocking and 0 advisory against both the tree and
   the extracted archive, which is evidence about one run rather than a standing control.
 
+### What the first image CVE scan found, 2026-10-13
+
+The scan added above ran for the first time in continuous integration run 26, against the image
+built from `47fbe58`. The build PASSED, because no HIGH or CRITICAL operating-system package CVE
+has a fix available. The second pass found that six do exist with **no fix available**, and they
+are recorded here rather than left in a continuous integration log that expires.
+
+**FACT**, read from the run's own output. Base is `python:3.12-slim` digest-pinned to
+`sha256:2c941e86...`, a Debian 13 userland.
+
+| Package | CVE | Trivy status | Installed |
+|---|---|---|---|
+| `perl-base` | CVE-2026-9538 | `fix_deferred` | 5.40.1-6+deb13u1 |
+| `util-linux`, `mount` | CVE-2026-76642 | `affected` | 2.41.5-0+deb13u1 |
+| `util-linux`, `mount` | CVE-2026-78408 | `affected` | 2.41.5-0+deb13u1 |
+| `util-linux`, `mount` | CVE-2026-78409 | `affected` | 2.41.5-0+deb13u1 |
+| `util-linux`, `mount` | CVE-2026-78410 | `affected` | 2.41.5-0+deb13u1 |
+| `ncurses-base`, `ncurses-bin` | CVE-2025-69720 | no fix listed | 6.5+20250216-2 |
+
+**This makes an existing gap concrete rather than theoretical.** Every one of these packages is in
+the image only because the ship stage is `FROM scratch` followed by `COPY --from=prep / /`, which
+flattens the WHOLE filesystem including the Debian userland. `perl`, `mount`, `nsenter` and
+`ncurses` are not used by this application at any point. The register above already names "the
+shipped image contains a whole Debian userland" as a gap; this is its first measured cost.
+
+**INFERENCE, not fact, on exploitability.** The four `util-linux` findings concern `mount`,
+`nsenter --join-cgroup` and `X-mount` helper behaviour, which require privileges to mount or to
+enter namespaces. The container runs as non-root `10001:10001`, the image carries no setuid or
+setgid bits (asserted every run), and nothing in `CMD` invokes any of them. CVE-2026-9538 is a
+denial of service in `Archive-Tar`, which this application never calls. That reasoning lowers the
+practical risk; it does not clear the finding, and it is explicitly NOT a basis for telling anyone
+the image is clean.
+
+**INFERENCE with a real consequence for the upload.** The platform's stage 9 container scan stops
+on a High or Critical package CVE. Whether it distinguishes "fixable" from "no fix available" is
+UNKNOWN - nobody here has read that stage's output, which is the same UNKNOWN the register already
+carries for stage 2. If it does not distinguish, this release fails stage 9 and no amount of
+rebuilding fixes it, because there is nothing to rebuild to. The remedy in that case is a minimal
+or distroless base, which would drop `perl`, `mount` and `ncurses` from the image entirely.
+
 ### What is already covered, so it is not re-litigated
 
 **FACT.** Stage 1's cover is allowlist packaging plus history scanning, and security reviews have

@@ -34,15 +34,49 @@ owner, not a placeholder to paste.
 | App slug | `pree` (lowercase, alphanumeric at both ends, no double hyphen) |
 | Detected template | `python` |
 | Deployment target | `pree.apps.bluestaq.com` |
-| Display name | `TBC, re-verify` - owner to supply |
-| Short description | `TBC, re-verify` - owner to supply |
-| Full description | `TBC, re-verify` - owner to supply |
+| Display name | **DRAFT, awaiting owner sign-off**: `Pree` |
+| Short description | **DRAFT, awaiting owner sign-off**: see below |
+| Full description | **DRAFT, awaiting owner sign-off**: see below |
 | Category | `TBC, re-verify` - owner to pick from the platform's own list, which is not readable from here |
 | App type | `TBC, re-verify` - the archetype is `server` and the target is a URL, which SUGGESTS the platform's Web App type, but the console's own vocabulary has not been read |
 | Visibility | `TBC, re-verify` - owner to set |
 
 The slug, template and target are carried from `CLAUDE.md` rather than restated independently,
 because a second copy of a fact drifts from the first.
+
+### The drafted copy
+
+Drafted at the owner's instruction, from what `README.md` and `CLAUDE.md` already say the product
+does. **Every clause traces to one of those two files; nothing here is a new claim about the
+product, a capability, a customer, an organisation or a figure.** It is a draft until the owner
+signs it off, and it is marked as one in the table above rather than reading as decided.
+
+**Short description**
+
+> An explainable, confidence-tiered threat score that shows Protect and Defend operators which
+> satellites hold their protected assets at risk, and why.
+
+**Full description**
+
+> Pree fuses orbital geometry, manoeuvre-cadence baselining, and photometric and radio-frequency
+> signatures from the Unified Data Library (UDL) into a single explainable, confidence-tiered
+> score, so a Protect and Defend operator can see which satellites hold their protected assets at
+> risk and what the assessment rests on.
+>
+> A threat score is only useful if the operator can see why it says what it says, and only
+> trustworthy if it admits what it does not know. Pree therefore separates the two questions it is
+> usually asked to blend. The score states how threatening the evidence is. The confidence tier
+> states how much of the evidence was actually present, so a high score on thin data is reported
+> as exactly that rather than presented as a finding.
+>
+> A missing indicator is never invented. It is excluded from the weighting and reported as
+> unknown, never defaulted to a zero, a mean or a safe value, because a confident score produced
+> from absent data is worse than no score.
+
+Two things an operator will ask that the drafts deliberately do NOT answer, because neither is
+established anywhere in this repository and a listing is not the place to guess: which UDL
+instance or classification it draws from, and who the named user community is. Add them only when
+the owner states them.
 
 ## Environment variables tab
 
@@ -93,10 +127,20 @@ command directly above it.
 
 ## Operations request required
 
-**CONFIRMED BY THE OWNER.** `securityContext.fsGroup=10001` is agreed and is a required deployment
-parameter, not an open question. Raise the operations request with the value below before the first
-deploy; the deploy gate treats an unset `fsGroup` as a blocker rather than a warning, because the
-failure mode is every write refused.
+**CONFIRMED BY THE OWNER. NOT YET RAISED, as of 2026-10-13.** `securityContext.fsGroup=10001` is
+agreed and is a required deployment parameter, not an open question. The request itself has not
+been raised with operations, which the owner has stated, so this is the **outstanding pre-deploy
+action** and the one thing standing between a passing gate and a deploy. Confirming the VALUE and
+raising the REQUEST are different events, and a gate that accepted the first for the second would
+be reading a decision as an action.
+
+The deploy gate treats an unset `fsGroup` as a blocker rather than a warning, and it has now
+reproduced the failure rather than reasoning about it: running as uid 10001 against a root-owned
+`0555` directory, the write returns `PermissionError errno 13`, and the server itself boots with
+`storage=refused`, holds 200 on all five liveness paths, and returns 503 on `/healthz/storage`
+with `"errno_name": "EACCES"`. The pod stays up and diagnosable while every write fails, which is
+the designed behaviour and also precisely why an unset `fsGroup` cannot be discovered by a
+liveness probe alone.
 
 Pree runs as user `10001` and mounts the FILE_STORAGE volume. The mount arrives root-owned, so
 **`securityContext.fsGroup` must be set to `10001`** or every write returns `EACCES`. This needs

@@ -1676,3 +1676,38 @@ was inconclusive for running as root. Two blockers and one major.
 
 Scripts, workflow and documentation. 364 passing in-repo, 363 passing with one artefact-only skip
 against the extracted archive, Cobertura line-rate 1.0 against a gate bar of 80%.
+
+### The first image scan finds six CVEs with no fix, and the listing copy is drafted
+
+The scan added one commit earlier ran for the first time in continuous integration run 26. The
+build passed, and the pass is the less interesting half.
+
+● **Six HIGH or CRITICAL operating-system CVEs are in the shipped image with NO fix available.**
+  `perl-base` CVE-2026-9538, `util-linux` and `mount` CVE-2026-76642, -78408, -78409 and -78410,
+  and `ncurses` CVE-2025-69720. The first pass found nothing fixable, which is why the build is
+  green; the second pass printed these, which is why they are now in `docs/SECURITY.md` with the
+  date and the installed versions rather than in a log that expires.
+● **This makes an existing gap concrete.** Every one of those packages is in the image only
+  because the ship stage flattens the whole Debian userland, and this application calls none of
+  them. The register has named "the shipped image contains a whole Debian userland" as a gap for
+  some time. This is its first measured cost, and the remedy named there, a minimal or distroless
+  base, would drop all six.
+● **The consequence for the upload is recorded as an inference with its UNKNOWN intact.** The
+  platform's stage 9 stops on a High or Critical. Whether it distinguishes fixable from unfixed is
+  not known, because nobody here has read that stage's output. If it does not, no rebuild clears
+  this, because there is nothing to rebuild to.
+● **Exploitability reasoning is marked as inference and is not a clean bill.** The `util-linux`
+  findings need privileges to mount or enter namespaces; the container runs non-root with no
+  setuid bits and invokes none of them. That lowers practical risk. It is explicitly not a basis
+  for calling the image clean.
+● **The fsGroup request is recorded as NOT RAISED**, on the owner's own statement, as the single
+  outstanding pre-deploy action. Confirming the value and raising the request are different
+  events, and the document now says so rather than letting the first read as the second.
+● **The listing copy is drafted at the owner's instruction**, traced clause by clause to
+  `README.md` and `CLAUDE.md`, and marked DRAFT awaiting sign-off rather than reading as decided.
+  Category, app type and visibility stay `TBC, re-verify`: the platform's own vocabulary is not
+  readable from here. Two questions an operator will ask are named as deliberately unanswered,
+  the UDL instance and the user community, because neither is established anywhere in this
+  repository and a listing is not the place to guess.
+
+Documentation only. 364 passing, coverage 99% by the terminal summary, Cobertura line-rate 1.0.
