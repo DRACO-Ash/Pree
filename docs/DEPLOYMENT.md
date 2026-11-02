@@ -134,12 +134,14 @@ action** and the one thing standing between a passing gate and a deploy. Confirm
 raising the REQUEST are different events, and a gate that accepted the first for the second would
 be reading a decision as an action.
 
-The deploy gate treats an unset `fsGroup` as a blocker rather than a warning, and it has now
+The deploy gate treats an unset `securityContext.fsGroup` as a blocker rather than a warning,
+and it has now
 reproduced the failure rather than reasoning about it: running as uid 10001 against a root-owned
 `0555` directory, the write returns `PermissionError errno 13`, and the server itself boots with
 `storage=refused`, holds 200 on all five liveness paths, and returns 503 on `/healthz/storage`
 with `"errno_name": "EACCES"`. The pod stays up and diagnosable while every write fails, which is
-the designed behaviour and also precisely why an unset `fsGroup` cannot be discovered by a
+the designed behaviour and also precisely why an unset `securityContext.fsGroup` cannot be
+discovered by a
 liveness probe alone.
 
 Pree runs as user `10001` and mounts the FILE_STORAGE volume. The mount arrives root-owned, so
