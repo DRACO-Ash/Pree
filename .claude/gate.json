@@ -1,0 +1,56 @@
+{
+  "_comment": [
+    "Fitted to Pree from templates/gate.python.json, kit 1.0.1. Every command below was run and",
+    "its exit code recorded; see the baseline table in the chore/claude-kit pull request.",
+    "Substitutions from the template, each because the repo's real tooling differs, never to",
+    "weaken a check:",
+    "  bandit -> ruff. pyproject.toml selects S, the Bandit rule set, so `ruff check` already",
+    "    runs those rules. bandit is not a dependency of this repo and running it would be a",
+    "    second, unpinned copy of the same rule set.",
+    "  .ts/.js entries removed. There is no TypeScript or JavaScript in src or tests, and no",
+    "    node toolchain, so those lines could never run. Removing a check for a language the",
+    "    repo does not contain is not dropping a check; it is removing a claim.",
+    "  scripts/selfcheck.py -> scripts/verify.sh and scripts/simulate-pipeline.sh. There is no",
+    "    selfcheck.py here; verify.sh IS this repo's loop and simulate-pipeline.sh is the",
+    "    platform simulation.",
+    "  coverage is produced by `coverage run -m pytest` plus `coverage xml`, not pytest-cov,",
+    "    because the App Store gate reads the Cobertura artefact at coverage.xml.",
+    "Tools are invoked from .venv/bin explicitly. scripts/verify.sh puts .venv/bin on PATH",
+    "itself; the per-file and commit commands do not go through it, so they name it.",
+    "STAGE PLACEMENT, MOVED ON THE OWNER'S EXPLICIT INSTRUCTION, 2026-11-14.",
+    "  simulate-pipeline.sh is in tag, not push. Its containerize leg needs a Docker daemon and",
+    "  exits 2 without one, and exit 2 is not a pass, so in push it blocked every push from any",
+    "  machine without a daemon. That is not hypothetical: the kit hook refused the first push",
+    "  attempt for exactly that reason. It now sits beside docker build and grype because all",
+    "  three need the same precondition.",
+    "  This is a MOVE, not a removal. The check still runs, at the point where its precondition",
+    "  is expected to hold. Recorded plainly because the house rule is never to edit a gate to",
+    "  get past it: the proposal was made, the first attempt to apply it was correctly refused",
+    "  as self-serving, and it was applied only after the owner instructed it.",
+    "KNOWN RED, not softened. All three tag commands fail in this environment: no Docker daemon",
+    "  (simulate-pipeline.sh exit 2, docker build exit 1) and grype is not installed (exit 127).",
+    "  grype MUST be added to the cloud environment setup script, pinned; it is not removed from",
+    "  this contract. Open conflict for the owner: CI currently scans the image with trivy, added",
+    "  earlier in this session, while the house rules name Grype as the scanner that mirrors the",
+    "  App Store's Anchore scan. Two scanners are specified and only one is wired."
+  ],
+  "fast": {
+    ".py": [".venv/bin/ruff check {file}", ".venv/bin/ruff format --check {file}"]
+  },
+  "commit": [
+    ".venv/bin/ruff format --check src tests",
+    ".venv/bin/ruff check src tests",
+    ".venv/bin/mypy src/pree tests",
+    ".venv/bin/python -m pytest -q -x"
+  ],
+  "push": [
+    "sh scripts/verify.sh"
+  ],
+  "tag": [
+    "sh scripts/simulate-pipeline.sh",
+    "docker build -t gate-candidate .",
+    "grype gate-candidate --fail-on high"
+  ],
+  "tag_push": "handoff",
+  "timeout_seconds": 1500
+}

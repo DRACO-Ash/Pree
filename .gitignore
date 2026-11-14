@@ -28,3 +28,6 @@ dist/
 # Packaging output.
 appstore-package/
 *.zip
+
+.claude/settings.local.json
+.release/verify-progress.md
