@@ -60,6 +60,16 @@
             "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/secret-scan.mjs\""
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/bash_guard.py\"",
+            "timeout": 1800
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -71,6 +81,16 @@
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/format-gate.sh\""
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/post_edit_check.py\"",
+            "timeout": 120
+          }
+        ]
       }
     ],
     "SessionStart": [
@@ -79,6 +99,15 @@
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/skills-check.sh\""
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/session_preflight.py\"",
+            "timeout": 30
           }
         ]
       }
