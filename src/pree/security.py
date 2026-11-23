@@ -14,6 +14,51 @@ from collections.abc import Callable
 from .audit import install_credential_guard
 from .config import Config
 
+# --- Platform identity -------------------------------------------------------------------
+#
+# The App Store signs people in before a request reaches a private app, and names the user and
+# their role on it in three headers. The platform REPLACES any copy the client sent, so these
+# cannot be forged from outside; that is the whole reason they can be trusted as a gate at all.
+#
+# Only these three are read. The documentation is explicit that a header the platform does not
+# set, `X-Auth-Request-Groups` among them, passes through from the client unchanged, so reading
+# one would be reading attacker-supplied data under an authoritative-looking name.
+SUB_HEADER = "x-auth-request-sub"
+ROLE_HEADER = "x-auth-request-role"
+
+# The role hierarchy, as the platform defines it. Compared by RANK, never by name, so
+# "EDITOR or above" stays one check and a role added later cannot be mistaken for a peer of one
+# already here.
+ROLE_RANKS = {"VIEWER": 1, "EDITOR": 2, "ADMIN": 3, "OWNER": 4}
+# Reading needs any signed-in role; creating an assessment needs EDITOR or above. EDITOR exists
+# for the app rather than for the App Store, where it can do no more than VIEWER, so this is the
+# distinction the header is there to carry.
+MIN_READ_RANK = ROLE_RANKS["VIEWER"]
+MIN_WRITE_RANK = ROLE_RANKS["EDITOR"]
+# An anonymous caller. On a PUBLIC app the platform sends all three headers empty, so this is
+# what every request looks like there, which is why rank 0 is below every gate rather than
+# equal to VIEWER.
+ANONYMOUS_RANK = 0
+
+
+def role_rank(role: str | None) -> int:
+    """Rank a platform role, failing DOWNWARD on anything unrecognised.
+
+    An empty role is anonymous, not a viewer: on a public app every request carries empty
+    headers, and treating that as the lowest signed-in role would hand an anonymous visitor
+    whatever VIEWER may do.
+
+    An unrecognised non-empty role ranks as VIEWER, which is the documented instruction and the
+    fail-closed direction: a role the platform adds later gets read access at most, never write.
+    Matched exactly rather than case-folded. The documentation says role values are always upper
+    case, so accepting "owner" would widen the gate on the strength of a guess about a format the
+    platform states.
+    """
+    if not role:
+        return ANONYMOUS_RANK
+    return ROLE_RANKS.get(role, ROLE_RANKS["VIEWER"])
+
+
 MAX_ACTOR_LENGTH = 64
 # What a log field carries when its whole value scrubs away. A caller cannot forge it, because the
 # brackets are characters the scrub itself strips, and it is deliberately NOT "anonymous": that is

@@ -46,7 +46,12 @@ from .ratelimit import (
 from .scoring import ThreatIndicators, assess
 from .security import (
     MAX_ACTOR_LENGTH,
+    MIN_READ_RANK,
+    MIN_WRITE_RANK,
+    ROLE_HEADER,
+    SUB_HEADER,
     AuthError,
+    role_rank,
     sanitise_actor,
     sanitise_log_part,
     sanitise_log_path,
@@ -151,7 +156,9 @@ SECURITY_HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
 }
 _TOKEN_HEADER = "x-pree-token"  # noqa: S105 - a header NAME, not a credential
-_ACTOR_HEADER = "x-pree-actor"
+# RETIRED: `x-pree-actor` was a caller-supplied label, so every audit line attributed the action
+# to whatever string the caller typed. The platform's `X-Auth-Request-Sub` is a stable user id the
+# platform overwrites on every request, so the trail now names who actually acted.
 
 
 class FrameGuard:
@@ -623,18 +630,18 @@ def register_api_routes(
 ) -> None:
     """Register the gated scoring and read routes.
 
-    Both sit behind the token gate, the coarse limiter, and the body cap. The scoring
-    route additionally carries the fine per-address limit, because it is the expensive
-    path and the one that writes.
+    The scoring route sits behind the WRITE gate (EDITOR or above on the platform, or the
+    team token off it), the coarse limiter and the body cap, and additionally carries the fine
+    per-address limit because it is the expensive path.
     """
 
     @app.post("/v1/assess", response_model=AssessResponse, dependencies=[Depends(require_token)])
     def create_assessment(
         payload: AssessRequest,
         request: Request,
-        x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
+        x_auth_request_sub: str | None = Header(default=None, alias=SUB_HEADER),
     ) -> AssessResponse:
-        """Score one candidate against one protected asset, then persist and audit it."""
+        """Score one candidate against one protected asset, and audit who asked."""
         refused = _first_refused(fine, _limit_keys(request))
         if refused is not None:
             raise HTTPException(
@@ -643,9 +650,20 @@ def register_api_routes(
                 headers={"Retry-After": str(fine.retry_after_seconds(refused))},
             )
 
-        # The actor label is for the audit trail only. It is caller-supplied, so it is never a
-        # rate-limit key and never an identity claim.
-        actor = sanitise_actor(x_pree_actor)
+        # The actor is now an IDENTITY rather than a label. `X-Auth-Request-Sub` is the user's
+        # stable id, and the platform replaces any copy the client sent, so for the first time
+        # the audit trail names who actually acted instead of whatever string they typed.
+        #
+        # Still sanitised and still capped. Not because the platform is distrusted, but because
+        # this value is interpolated into a JSON audit line, and a bound that depends on another
+        # layer's format holding is a bound that moves when that layer does. Off the platform the
+        # header is absent and the actor is the anonymous sentinel.
+        #
+        # Deliberately NOT a rate-limit key, which is a change worth making later rather than
+        # here: keying the fine limiter on an authenticated user instead of a peer address is a
+        # real improvement the platform now makes possible, and it changes what every limiter
+        # test measures.
+        actor = sanitise_actor(x_auth_request_sub)
         started = time.monotonic()
         result = assess(ThreatIndicators(**payload.indicators.model_dump()))
         body = AssessResponse(
@@ -704,7 +722,7 @@ def register_cors(
             allow_origins=[config.allowed_origin],
             allow_credentials=True,
             allow_methods=["GET", "POST"],
-            allow_headers=[_TOKEN_HEADER, _ACTOR_HEADER, "content-type"],
+            allow_headers=[_TOKEN_HEADER, "content-type"],
         )
 
         @app.middleware("http")
@@ -930,20 +948,52 @@ def create_app(
 
     register_error_handlers(app, audit_log)
 
-    def require_token(
-        x_pree_token: str | None = Header(default=None, alias=_TOKEN_HEADER),
-    ) -> None:
-        """The token gate on every gated route."""
-        verify_token(x_pree_token)
+    def _gate(minimum_rank: int) -> Callable[..., None]:
+        """Build the gate for a minimum platform role, falling back to the team token.
 
-    register_health_routes(app, config, require_token)
+        TWO credentials are accepted, and the order matters. The platform's role header is
+        tried first, because behind the App Store that is the real identity: the platform signs
+        the user in, states their role, and OVERWRITES any copy the client sent, so a caller
+        cannot name a role they do not hold.
+
+        The token is the fallback, for running outside the platform. It is not a second chance
+        at the same gate: a caller whose role is present but too low is refused outright rather
+        than being allowed to present a token instead, or an EDITOR-only route would be open to
+        any VIEWER holding the shared secret.
+
+        An ABSENT role falls through to the token. That is the public-app and local-development
+        case, where the platform supplies no identity at all, and it fails closed because
+        production already refuses to boot without a token.
+        """
+
+        # Named, because the route-inventory pin reads dependency names to decide whether a
+        # route is gated. `require_token` would now be a lie: the token is the fallback, not the
+        # gate. A name that no longer describes what it does is how an ungated route passes a
+        # pin that is still looking for the old name.
+        def require_authorisation(
+            x_pree_token: str | None = Header(default=None, alias=_TOKEN_HEADER),
+            x_auth_request_role: str | None = Header(default=None, alias=ROLE_HEADER),
+        ) -> None:
+            rank = role_rank(x_auth_request_role)
+            if rank:
+                if rank < minimum_rank:
+                    raise AuthError("insufficient role")
+                return
+            verify_token(x_pree_token)
+
+        return require_authorisation
+
+    require_read = _gate(MIN_READ_RANK)
+    require_write = _gate(MIN_WRITE_RANK)
+
+    register_health_routes(app, config, require_read)
 
     register_api_routes(
         app,
         config=config,
         audit_log=audit_log,
         fine=fine,
-        require_token=require_token,
+        require_token=require_write,
     )
 
     return app

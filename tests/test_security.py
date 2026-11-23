@@ -12,9 +12,12 @@ from pree.app import AUDIT_KEY_MAX_LENGTH, MAX_LOGGED_PATH
 from pree.security import (
     _PERMITTED_PATH_BYTES,
     MAX_ACTOR_LENGTH,
+    MIN_READ_RANK,
+    MIN_WRITE_RANK,
     UNPRINTABLE_MARKER,
     AuthError,
     authorise,
+    role_rank,
     sanitise_actor,
     sanitise_log_path,
     token_matches,
@@ -253,3 +256,37 @@ def test_no_truncated_path_record_can_read_as_a_route_this_app_serves() -> None:
 def test_the_path_scrub_marks_an_empty_target_rather_than_logging_nothing() -> None:
     """An empty `path` field reads as an absent one, which is a different fact."""
     assert sanitise_log_path(b"", 160) == UNPRINTABLE_MARKER
+
+
+def test_role_rank_fails_downward_on_everything_it_does_not_recognise() -> None:
+    """The ranking is the whole authorisation decision, so each direction is pinned.
+
+    Three distinct cases, and conflating any two of them is a hole:
+
+    * An EMPTY role is anonymous, rank 0, BELOW every gate. On a public app the platform sends
+      all three headers empty, so ranking empty as VIEWER would hand an anonymous visitor
+      whatever a signed-in viewer may do, on any app whose visibility was later changed.
+    * An UNRECOGNISED role ranks as VIEWER, which is the documented instruction and the
+      fail-closed direction: a role the platform adds later gets read access at most.
+    * Matching is EXACT. The documentation states role values are always upper case, so
+      accepting "owner" would widen the gate on a guess about a format the platform states.
+    """
+    assert role_rank(None) == 0
+    assert role_rank("") == 0
+    assert role_rank("VIEWER") < role_rank("EDITOR") < role_rank("ADMIN") < role_rank("OWNER")
+    assert role_rank("SUPERUSER") == role_rank("VIEWER"), (
+        "an unrecognised role outranks VIEWER, so a role the platform adds later would arrive "
+        "with more than read access"
+    )
+    for lowered in ("owner", "admin", "editor"):
+        assert role_rank(lowered) == role_rank("VIEWER"), (
+            f"{lowered!r} was case-folded into a privileged rank; the platform sends upper case, "
+            f"and accepting anything else widens the gate on a guess"
+        )
+
+
+def test_the_write_gate_sits_above_the_read_gate() -> None:
+    """If these ever converge, every VIEWER can write and nothing else in the suite says so."""
+    assert MIN_WRITE_RANK > MIN_READ_RANK
+    assert role_rank("VIEWER") == MIN_READ_RANK
+    assert role_rank("EDITOR") == MIN_WRITE_RANK

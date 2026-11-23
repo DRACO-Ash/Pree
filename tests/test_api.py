@@ -41,6 +41,7 @@ from pree import main as main_module
 from pree.app import (
     AUDIT_KEY_PATTERN,
     DOC_PATHS,
+    GENERIC_CLIENT_ERROR,
     LIVENESS_PATHS,
     MAX_BODY_BYTES,
     MAX_LOGGED_PATH,
@@ -497,7 +498,7 @@ def test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_
 # The probe identity and the ids the correlation drive uses. Named constants rather than inline
 # literals, because the assertions downstream recompute from these and an inline literal in two
 # places is two places for them to drift apart.
-ACTOR_HEADER = "x-pree-actor"
+ACTOR_HEADER = "x-auth-request-sub"
 # The literal each handler's reason begins with, so the field is recomputed rather than
 # charset-checked. Every surviving reason is a fixed literal. `store_error` was the one that
 # embedded a configured path, and it is gone with the store, which is why the prefix-match
@@ -1625,8 +1626,12 @@ def test_the_expensive_path_is_rate_limited(tmp_path: Path, quiet_logger: loggin
 def test_a_spoofed_actor_header_cannot_reset_the_rate_limit(
     tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
-    """The fine tier was keyed on this caller-supplied header, so a fresh label per request
-    bypassed the tier entirely. It is keyed on the peer address now."""
+    """The fine tier was keyed on a caller-supplied label, so a fresh one per request bypassed
+    the tier entirely. It is keyed on the peer address now.
+
+    The spoofed header is the platform's identity header, which a caller cannot set behind the
+    App Store but can set freely off it. Either way it must not move the limiter.
+    """
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
     statuses = []
     with build_client(config, quiet_logger, actor_limiter=RateLimiter(2, 60.0)) as limited:
@@ -1634,7 +1639,7 @@ def test_a_spoofed_actor_header_cannot_reset_the_rate_limit(
             response = limited.post(
                 "/v1/assess",
                 json=FULL_BODY,
-                headers={**AUTH, "x-pree-actor": f"spoof-{index}"},
+                headers={**AUTH, "x-auth-request-sub": f"spoof-{index}"},
             )
             statuses.append(response.status_code)
     assert statuses == [200, 200, 429, 429, 429]
@@ -2055,7 +2060,7 @@ def _served_inventory(app: Any) -> tuple[tuple[Any, ...], ...]:
                 tuple(sorted((getattr(route, "methods", None) or set()) - {"OPTIONS"})),
                 _endpoint_origin(endpoint),
                 getattr(endpoint, "__qualname__", None),
-                type(route) is APIRoute and "require_token" in _dependency_names(route),
+                type(route) is APIRoute and "require_authorisation" in _dependency_names(route),
             )
         )
     return tuple(rows)
@@ -2512,7 +2517,7 @@ def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestCl
     for route in _all_routes(client.app):
         if type(route) is not APIRoute:
             continue
-        gated = "require_token" in _dependency_names(route)
+        gated = "require_authorisation" in _dependency_names(route)
         if route.path in UNAUTHENTICATED_PATHS:
             assert not gated, (
                 f"{route.path} is a probe or documentation path and must answer without a "
@@ -4405,7 +4410,7 @@ def test_the_cors_method_and_header_allowlists_are_the_narrow_ones(tmp_path: Pat
         f"the CORS method allowlist widened to {options['allow_methods']}. A wildcard admits every "
         f"method the routes do not implement, from the one origin allowed to send credentials"
     )
-    assert options["allow_headers"] == ["x-pree-token", "x-pree-actor", "content-type"], (
+    assert options["allow_headers"] == ["x-pree-token", "content-type"], (
         f"the CORS header allowlist widened to {options['allow_headers']}"
     )
     assert options["allow_credentials"] is True
@@ -5573,4 +5578,118 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(tmp_path: Path) 
     unexercised = sorted((set(AUDIT_STRING_VALUES) | set(AUDIT_NUMERIC_BOUNDS)) - seen)
     assert not unexercised, (
         f"these value rules are never exercised, so they permit rather than pin: {unexercised}"
+    )
+
+
+# --- The platform identity gate ----------------------------------------------------------------
+#
+# Driven through real requests rather than against `role_rank`, because the unit property held
+# while the application still gated on something else: these assert the composition of the two
+# credentials, which is where an authorisation bug actually lives.
+
+_ROLE = "x-auth-request-role"
+_SUB = "x-auth-request-sub"
+_SUB_VALUE = "6005623a-54b5-4d30-989c-5fea7c496128"
+
+
+def test_an_editor_writes_without_presenting_the_team_token(client: TestClient) -> None:
+    """The point of the whole change: behind the platform nobody holds the shared secret.
+
+    No token header at all. If this ever needs one, the platform's own users cannot use the
+    service and the shared token has quietly become mandatory again.
+    """
+    response = client.post("/v1/assess", json=FULL_BODY, headers={_ROLE: "EDITOR"})
+    assert response.status_code == 200, response.text
+
+
+def test_a_viewer_may_read_but_may_not_write(client: TestClient) -> None:
+    """The read and write gates are different, which is the only reason EDITOR exists.
+
+    On the App Store an EDITOR can do no more than a VIEWER; the difference exists solely so
+    the app can make it. If both gates accepted VIEWER the role header would be decorative.
+    """
+    assert client.get("/diagnostics", headers={_ROLE: "VIEWER"}).status_code == 200
+    refused = client.post("/v1/assess", json=FULL_BODY, headers={_ROLE: "VIEWER"})
+    assert refused.status_code == 401, refused.text
+    assert refused.json() == {"error": GENERIC_CLIENT_ERROR}, (
+        "an insufficient role gets a distinct body, which tells an unauthorised caller that "
+        "their credential was valid and only their role was short"
+    )
+
+
+def test_a_role_the_platform_adds_later_cannot_write(client: TestClient) -> None:
+    """An unrecognised role ranks as VIEWER. End to end, because the rank is not the gate."""
+    assert (
+        client.post("/v1/assess", json=FULL_BODY, headers={_ROLE: "SUPERUSER"}).status_code == 401
+    )
+    assert client.post("/v1/assess", json=FULL_BODY, headers={_ROLE: "owner"}).status_code == 401
+
+
+def test_a_valid_role_is_not_a_second_chance_at_a_failed_token(client: TestClient) -> None:
+    """A present-but-insufficient role is refused outright, never allowed to fall back.
+
+    If the fallback ran whenever the role check failed rather than only when no role was sent,
+    any VIEWER holding the shared token could write, and the write gate would be decorative for
+    exactly the people most likely to have the token.
+    """
+    refused = client.post("/v1/assess", json=FULL_BODY, headers={**AUTH, _ROLE: "VIEWER"})
+    assert refused.status_code == 401, (
+        "a VIEWER presenting a valid team token was allowed to write, so the role gate falls "
+        "back instead of refusing"
+    )
+
+
+def test_with_no_role_at_all_the_token_still_gates(client: TestClient) -> None:
+    """The off-platform path. An absent role is not an open door; it is the old gate."""
+    assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
+    assert client.post("/v1/assess", json=FULL_BODY).status_code == 401
+    assert client.post("/v1/assess", json=FULL_BODY, headers={_ROLE: ""}).status_code == 401
+
+
+def test_the_audited_actor_is_the_platform_identity_not_a_caller_label(
+    tmp_path: Path,
+) -> None:
+    """The reason the actor header was retired, asserted rather than described.
+
+    `x-pree-actor` was caller-supplied, so every audit line named whatever string the caller
+    typed. This drives a real request with BOTH the retired header and the platform's, and
+    requires the trail to carry the platform's identity and to ignore the other entirely.
+    """
+    stream = io.StringIO()
+    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
+    with build_client(config, build_logger(stream)) as probe:
+        accepted = probe.post(
+            "/v1/assess",
+            json=FULL_BODY,
+            headers={_ROLE: "EDITOR", _SUB: _SUB_VALUE, "x-pree-actor": "somebody-else"},
+        )
+        assert accepted.status_code == 200, accepted.text
+
+    records = [json.loads(line) for line in stream.getvalue().splitlines() if line.strip()]
+    audited = [r for r in records if r.get("kind") == "audit"]
+    assert audited, f"the write produced no audit record: {records}"
+    assert audited[0]["actor"] == _SUB_VALUE, (
+        f"the audited actor is {audited[0]['actor']!r}; it must be the platform's identity"
+    )
+    assert "somebody-else" not in stream.getvalue(), (
+        "the retired caller-supplied actor header still reaches the audit trail"
+    )
+
+
+def test_an_undocumented_auth_header_is_never_read(client: TestClient) -> None:
+    """Only the headers the platform sets may be trusted.
+
+    The documentation is explicit that a header the platform does NOT set passes through from
+    the client unchanged, naming `X-Auth-Request-Groups` as the example. Reading one would be
+    reading attacker-supplied data under an authoritative-looking name, so the gate must not
+    be movable by any `x-auth-request-*` header other than the role.
+    """
+    refused = client.post(
+        "/v1/assess",
+        json=FULL_BODY,
+        headers={"x-auth-request-groups": "OWNER", "x-auth-request-email": "a@b.test"},
+    )
+    assert refused.status_code == 401, (
+        "an undocumented x-auth-request-* header moved the gate, so a client can name its own "
+        "authority in a header the platform never sets"
     )
