@@ -68,10 +68,11 @@ ENV PATH="/opt/venv/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/
 WORKDIR /app
 USER 10001:10001
 EXPOSE 8080
-# The storage proof, not a liveness path: it performs a real write and races its own hard
-# timeout, so the check either confirms the mount or names the errno.
+# A liveness path. It used to be the storage proof, which performed a real write and raced its
+# own hard timeout; the service holds no state now, so there is no mount to confirm and the
+# check asks only whether the process is serving. See docs/APPSTORE-REDESIGN.md.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD ["/opt/venv/bin/python", "-c", "import os,sys,urllib.request;p=os.environ.get('PORT','8080');sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz/storage',timeout=3).status==200 else 1)"]
+  CMD ["/opt/venv/bin/python", "-c", "import os,sys,urllib.request;p=os.environ.get('PORT','8080');sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/healthz',timeout=3).status==200 else 1)"]
 # No ENV PORT and no ENV PREE_DATA_DIR anywhere in this file, for two DIFFERENT reasons. A
 # runtime value overrides image ENV, so a baked PORT does not defeat the injection: it shadows the
 # code's own default, which is then never reached in the container, and it asserts a port the

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from pree.app import MAX_LOGGED_PATH, STORE_KEY_MAX_LENGTH
+from pree.app import AUDIT_KEY_MAX_LENGTH, MAX_LOGGED_PATH
 from pree.security import (
     _PERMITTED_PATH_BYTES,
     MAX_ACTOR_LENGTH,
@@ -241,7 +241,7 @@ def test_no_truncated_path_record_can_read_as_a_route_this_app_serves() -> None:
     constants that nothing asserted: raising MAX_LOGGED_PATH is a change to the code, but LOWERING
     the gap until they meet is the one that turns a diagnosis cost into a forgery.
     """
-    longest_legitimate = len("/v1/assessments/") + STORE_KEY_MAX_LENGTH
+    longest_legitimate = len("/v1/assessments/") + AUDIT_KEY_MAX_LENGTH
     assert longest_legitimate < MAX_LOGGED_PATH, (
         f"the audit cap ({MAX_LOGGED_PATH}) is not above the longest legitimate path "
         f"({longest_legitimate}), so a truncated record can be made to read as a real route"

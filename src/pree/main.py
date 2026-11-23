@@ -13,11 +13,10 @@ from fastapi import FastAPI
 from .app import create_app
 from .config import load_config
 from .security import arm_output_guard, token_verifier
-from .store import JsonStore, StoreError
 
 
 def build() -> FastAPI:
-    """Resolve the environment, seed the store, and return the wired app.
+    """Resolve the environment and return the wired app.
 
     Boot fails closed and loudly: an unresolvable configuration raises before the app binds,
     so a misconfiguration surfaces as a start-up error rather than a silent runtime fault.
@@ -38,18 +37,6 @@ def build() -> FastAPI:
     # depth, not a replacement for the boundary below: the boundary is what stops the credential
     # being in reach at all.
     arm_output_guard(config)
-    store = JsonStore(config.data_dir)
-    try:
-        store.seed()
-        storage_state = "accepted"
-    except (OSError, StoreError):
-        # StoreError is caught alongside OSError deliberately. The store raises its own
-        # error class for a corrupt or truncated snapshot, which is exactly the state a crash
-        # mid-write or a rollback leaves behind. Catching only OSError let that escape during
-        # module import, so gunicorn could not import the app and the pod never bound: no
-        # liveness path, no diagnostics, just CrashLoopBackOff and one traceback. The pod must
-        # stay up and diagnosable when storage is the thing that is broken.
-        storage_state = "refused"
     # The BOUNDARY, taken BEFORE the boot line rather than after it. `for_service()` drops the
     # credential and `token_verifier` closes over it, so the app is built from a config with no
     # token field and a callable that does the compare. That removes the ATTRIBUTE route, not every
@@ -69,13 +56,12 @@ def build() -> FastAPI:
         # token is invisible on a deployed pod: every client gets 401 and the only read-out
         # that would show it sits behind the very token that is wrong.
         f"pree boot: build={service.build_id} env={service.environment} "
-        f"port={service.port} data_dir={service.data_dir} "
-        f"data_dir_configured={service.data_dir_was_configured} "
+        f"port={service.port} "
         f"auth={'on' if service.auth_enabled else 'off'} "
-        f"token_len={service.token_length} storage={storage_state}",
+        f"token_len={service.token_length} stateless=true",
         flush=True,
     )
-    return create_app(service, store, verify_token=token_verifier(config))
+    return create_app(service, verify_token=token_verifier(config))
 
 
 # No module-level `app = build()`. Booting on import means any import of this module reads the

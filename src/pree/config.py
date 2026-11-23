@@ -2,12 +2,14 @@
 
 Every value is resolved from the environment at boot. Nothing is hard-coded and nothing is baked
 into the image. Not because an image default always beats an injected value, which is false: a
-runtime value overrides image ENV. It is because a baked value shadows the fallback below it, and
-for the data directory the resolution order here means a baked PREE_DATA_DIR is preferred over the
-platform's STORAGE_MOUNT_PATH, which would send every write to the ephemeral layer.
+runtime value overrides image ENV. It is because a baked value shadows the fallback below it, so
+the code's own default is never reached inside the container.
 
-Resolution order for the data directory is explicit variable, then platform-injected
-variable, then a local default. A control that cannot be verified is treated as failed.
+There is no data directory any more. `PREE_DATA_DIR` and the platform's `STORAGE_MOUNT_PATH`
+were resolved here while the service persisted assessments; the service is stateless now, so
+neither is read and neither should be set. See `docs/APPSTORE-REDESIGN.md`.
+
+A control that cannot be verified is treated as failed.
 """
 
 from __future__ import annotations
@@ -15,7 +17,6 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 
 # The shortest string that can be a quoted value: the two quotes themselves.
 _QUOTED_MINIMUM = 2
@@ -36,7 +37,6 @@ _ORIGIN_PATTERN = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
 DEFAULT_PORT = 8080
 MIN_PORT = 1
 MAX_PORT = 65535
-LOCAL_DATA_DIR = "./data"
 
 
 class ConfigError(RuntimeError):
@@ -76,11 +76,9 @@ class ServiceConfig:
     """
 
     port: int
-    data_dir: Path
     allowed_origin: str | None
     environment: str
     build_id: str
-    data_dir_was_configured: bool
     auth_enabled: bool
     token_length: int
 
@@ -99,7 +97,6 @@ class Config:
     """
 
     port: int
-    data_dir: Path
     # `repr=False` removes the credential from the DEFAULT dataclass `__repr__`, and only from
     # there. It was found by a review taking it: `repr()` of a `Config` printed
     # `team_token='Zq7-Wx9_...'` verbatim, so an implicit render - `print(config)`, `f"{config}"`,
@@ -112,7 +109,6 @@ class Config:
     allowed_origin: str | None
     environment: str
     build_id: str
-    data_dir_was_configured: bool
 
     @property
     def is_production(self) -> bool:
@@ -127,11 +123,9 @@ class Config:
         """The token-free view the HTTP layer receives."""
         return ServiceConfig(
             port=self.port,
-            data_dir=self.data_dir,
             allowed_origin=self.allowed_origin,
             environment=self.environment,
             build_id=self.build_id,
-            data_dir_was_configured=self.data_dir_was_configured,
             auth_enabled=self.auth_enabled,
             token_length=len(self.team_token or ""),
         )
@@ -167,29 +161,6 @@ def _resolve_port(env: dict[str, str]) -> int:
     if not MIN_PORT <= port <= MAX_PORT:
         raise ConfigError(f"PORT must be within {MIN_PORT} to {MAX_PORT}, got {port}")
     return port
-
-
-def _resolve_data_dir(env: dict[str, str]) -> Path:
-    """Resolve the data directory: explicit, then platform-injected, then local default.
-
-    The resolved path must be absolute and must not be the filesystem root. Both are
-    rejected at boot rather than discovered on the first write.
-    """
-    explicit = _read(env, "PREE_DATA_DIR") or _read(env, "STORAGE_MOUNT_PATH")
-    raw = explicit or LOCAL_DATA_DIR
-    expanded = Path(raw).expanduser()
-    if explicit is not None and not expanded.is_absolute():
-        # Checked BEFORE resolving, or the check cannot fail: resolve() makes every value
-        # absolute against the working directory, so a relative or quote-wrapped path became a
-        # writable directory inside the container and the store silently missed the volume.
-        raise ConfigError(
-            f"the data directory must be an absolute path, got {raw!r}. A relative value "
-            f"resolves inside the container and is lost on every restart."
-        )
-    path = expanded.resolve()
-    if path == Path(path.anchor):
-        raise ConfigError(f"data directory must not be the filesystem root, got {path}")
-    return path
 
 
 def _smallest_repeating_unit(value: str) -> str:
@@ -291,11 +262,6 @@ def load_config(env: dict[str, str] | None = None) -> Config:
 
     return Config(
         port=_resolve_port(source),
-        data_dir=_resolve_data_dir(source),
-        data_dir_was_configured=(
-            _read(source, "PREE_DATA_DIR") or _read(source, "STORAGE_MOUNT_PATH")
-        )
-        is not None,
         team_token=token,
         allowed_origin=origin,
         environment=environment,

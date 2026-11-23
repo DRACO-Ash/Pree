@@ -19,25 +19,23 @@ arbitrary payload.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
-from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
-from .api_models import AssessRequest, AssessResponse, ContributionOut
+from .api_models import SCHEMA_VERSION, AssessRequest, AssessResponse, ContributionOut
 from .audit import audit, bound_access_log, build_logger
 from .config import ServiceConfig
-from .health import StorageProbe, StorageProber, diagnostics
+from .health import diagnostics
 from .ratelimit import (
     ACTOR_LIMIT,
     ACTOR_WINDOW_SECONDS,
@@ -53,16 +51,14 @@ from .security import (
     sanitise_log_part,
     sanitise_log_path,
 )
-from .store import SCHEMA_VERSION, JsonStore, StoreError
 
 LIVENESS_PATHS = ("/", "/healthz", "/readyz", "/livez", "/ping")
-STORAGE_PROBE_PATH = "/healthz/storage"
 # Exempt from the coarse limiter. The liveness paths touch nothing and the storage probe is
 # bounded by its own hard timeout, so neither can be the expensive path the limiter protects.
 # Leaving the storage probe subject to the limiter let unauthenticated traffic drive the
 # container HEALTHCHECK to 429 and restart the pod, which is a cheaper denial of service than
 # attacking the application itself.
-UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
+UNMETERED_PATHS = LIVENESS_PATHS
 # The methods a platform probe actually uses. The exemption is for the probe, not for the path:
 # any other verb on one of these paths is ordinary traffic and is metered like any other.
 # Per PATH, because the exemption is for the probe and a path that does not serve a method is
@@ -72,13 +68,11 @@ UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
 # GET /healthz, but it contradicts the reasoning used to meter preflights on these same paths.
 _PROBE_METHODS: dict[str, frozenset[str]] = {
     **{path: frozenset({"GET", "HEAD"}) for path in LIVENESS_PATHS},
-    STORAGE_PROBE_PATH: frozenset({"GET"}),
 }
 # Any header by which a proxy claims to speak for someone else. Their PRESENCE collapses the
 # rate-limit key rather than being trusted for its content.
 _FORWARD_HEADERS = frozenset({"x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"})
 GENERIC_CLIENT_ERROR = "request rejected"
-STORE_UNAVAILABLE_ERROR = "could not store the assessment"
 RATE_LIMITED_ERROR = "rate limited"
 # The only detail strings the HTTP handler will echo. Everything else, framework messages
 # included, becomes the generic error: a handler that passes through an arbitrary detail is a
@@ -87,7 +81,7 @@ RATE_LIMITED_ERROR = "rate limited"
 # Statuses that must never carry a body. h11 rejects a Content-Length on these, so returning
 # JSON for one turns the intended status into a 500.
 BODILESS_STATUSES = frozenset({204, 304})
-OWN_ERROR_DETAILS = frozenset({GENERIC_CLIENT_ERROR, STORE_UNAVAILABLE_ERROR, RATE_LIMITED_ERROR})
+OWN_ERROR_DETAILS = frozenset({GENERIC_CLIENT_ERROR, RATE_LIMITED_ERROR})
 # Generous for this schema, which is a handful of numbers and two short identifiers, and small
 # enough that an unauthenticated caller cannot exhaust memory before the token gate runs.
 MAX_BODY_BYTES = 32 * 1024
@@ -115,10 +109,15 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 # separate assertion. An earlier version of this comment claimed the test asserted the byte ratio
 # directly, and it did not.
 MAX_LOGGED_PATH = 160
-# The store key's shape, enforced at the boundary rather than assumed. Two identifiers of at
-# most 64 characters and the colon between them.
-STORE_KEY_MAX_LENGTH = 129
-STORE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+# The AUDIT key's shape. It was the store key until the store was removed; it is now the
+# identifier written to the audit trail, derived server-side from two already-validated ids.
+# Still pinned, and still load-bearing:
+# `test_every_audit_record_matches_its_pinned_shape_and_values` checks every emitted key
+# against this pattern, which is what refuses a credential appended to
+# the key - the exact defect that put a token in the pod log store once before.
+# Two identifiers of at most 64 characters and the colon between them.
+AUDIT_KEY_MAX_LENGTH = 129
+AUDIT_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 # The reason string is composed server-side in all THREE handlers that log one, and this comment
 # said "both" while three sites applied the cap. `AuthError` carries a fixed literal, the rate-limit
 # `HTTPException` carries a fixed detail, and `StoreError` embeds a configured path - never caller
@@ -303,31 +302,6 @@ class BodySizeLimit:
             }
         )
         await send({"type": "http.response.body", "body": body})
-
-
-def _etag_for(payload: dict[str, Any]) -> str:
-    """A strong ETag over the response body. SHA-256 is cryptographic, not a fast digest."""
-    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return f'"{hashlib.sha256(encoded).hexdigest()}"'
-
-
-def _etag_matches(header: str | None, etag: str) -> bool:
-    """Honour If-None-Match properly: a list of validators, a weak prefix, or a wildcard.
-
-    An exact string comparison against the whole header never matched a browser sending
-    `W/"..."` or two validators, so every conditional request re-sent the full body.
-    """
-    if not header:
-        return False
-    for raw in header.split(","):
-        candidate = raw.strip()
-        if candidate == "*":
-            return True
-        if candidate.startswith("W/"):
-            candidate = candidate[2:]
-        if candidate == etag:
-            return True
-    return False
 
 
 def _assessment_key(protected_asset_id: str, candidate_id: str) -> str:
@@ -576,31 +550,10 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         # retry immediately, in a tight loop.
         return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
 
-    @app.exception_handler(StoreError)
-    async def handle_store_error(request: Request, exc: StoreError) -> JSONResponse:
-        """Storage refused. The client gets a generic 503; the cause is logged server-side."""
-        audit_log.error(
-            json.dumps(
-                {
-                    "kind": "store_error",
-                    "path": sanitise_log_path(_raw_path(request), MAX_LOGGED_PATH),
-                    "had_query": _had_query(request),
-                    "reason": str(exc)[:MAX_LOGGED_REASON],
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        )
-        return JSONResponse(
-            {"error": STORE_UNAVAILABLE_ERROR},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
 
 def register_health_routes(
     app: FastAPI,
     config: ServiceConfig,
-    probe_now: Callable[[], StorageProbe],
     require_token: Callable[..., None],
 ) -> None:
     """Register the liveness paths, the storage proof, and the diagnostics read-out."""
@@ -649,18 +602,6 @@ def register_health_routes(
             include_in_schema=False,
         )
 
-    @app.get(STORAGE_PROBE_PATH)
-    def storage_health(response: Response) -> dict[str, Any]:
-        """Prove storage with a real write, racing a hard timeout.
-
-        This is the container HEALTHCHECK target. On failure the 503 body names the resolved
-        directory and the exact errno, so a screenshot of it is a full diagnosis.
-        """
-        probe = probe_now()
-        if not probe.writable:
-            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return probe.as_body()
-
     @app.get("/diagnostics", dependencies=[Depends(require_token)])
     def read_diagnostics() -> dict[str, Any]:
         """A secret-free read-out: each critical input as a boolean and a length only.
@@ -669,14 +610,13 @@ def register_health_routes(
         exact token length narrows an attacker's search space for free. Before a token is set,
         which is when a first deploy needs it most, the gate is open by construction.
         """
-        return diagnostics(config, probe_now())
+        return diagnostics(config)
 
 
 def register_api_routes(
     app: FastAPI,
     *,
     config: ServiceConfig,
-    store: JsonStore,
     audit_log: logging.Logger,
     fine: RateLimiter,
     require_token: Callable[..., None],
@@ -727,21 +667,10 @@ def register_api_routes(
             schema_version=SCHEMA_VERSION,
         )
         key = _assessment_key(payload.protected_asset_id, payload.candidate_id)
-        try:
-            store.upsert(key, body.model_dump())
-        except StoreError:
-            # A privileged action that failed is still a privileged action: it gets its own
-            # audit line, or the trail records successes only and an operator who acted and
-            # failed leaves no trace.
-            audit(
-                audit_log,
-                action="assess",
-                actor=actor,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                outcome="error",
-                key=key,
-            )
-            raise
+        # No persistence: scoring is a pure function of the request, so there is no failure
+        # path between computing the result and returning it. The key is still derived and
+        # audited, because the audit trail's job is to record which asset and candidate were
+        # assessed, not where the answer was filed.
         audit(
             audit_log,
             action="assess",
@@ -754,44 +683,6 @@ def register_api_routes(
             evidence_coverage=result.evidence_coverage,
         )
         return body
-
-    @app.get("/v1/assessments/{key}", dependencies=[Depends(require_token)])
-    def read_assessment(
-        key: Annotated[str, PathParam(max_length=STORE_KEY_MAX_LENGTH, pattern=STORE_KEY_PATTERN)],
-        response: Response,
-        x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
-        if_none_match: str | None = Header(default=None, alias="if-none-match"),
-    ) -> Any:
-        """Return a stored assessment, honouring If-None-Match with 304.
-
-        Audited, including the successes. A refused request was audited, a rejected body was
-        audited, a store failure was audited, and a successful DISCLOSURE of a record was not.
-        The security policy names this store as one of the two assets worth protecting, because
-        it reveals what the operator is watching and what they judge dangerous; under the
-        shared-token model "who read what" is the only forensic question the trail could answer
-        about a stolen token, and it could not answer it.
-        """
-        started = time.monotonic()
-        actor = sanitise_actor(x_pree_actor)
-        record = store.read()["assessments"].get(key)
-        elapsed = int((time.monotonic() - started) * 1000)
-        # The path validator on the parameter above is what shape-checks this, and it exists
-        # because this comment previously CLAIMED a validator that was not there. Truncated
-        # anyway: a bound that depends on another layer's correctness is a bound that moves
-        # when that layer does, and an astral-plane key still costs twelve JSON bytes each.
-        audited_key = key[:MAX_LOGGED_PATH]
-        if record is None:
-            audit(audit_log, "read_assessment", actor, elapsed, "not_found", key=audited_key)
-            response.status_code = status.HTTP_404_NOT_FOUND
-            return {"error": "not found"}
-        etag = _etag_for(record)
-        if _etag_matches(if_none_match, etag):
-            audit(audit_log, "read_assessment", actor, elapsed, "not_modified", key=audited_key)
-            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
-        audit(audit_log, "read_assessment", actor, elapsed, "disclosed", key=audited_key)
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
-        return record
 
 
 def register_cors(
@@ -898,11 +789,9 @@ def register_cors(
 
 def create_app(
     config: ServiceConfig,
-    store: JsonStore,
     *,
     verify_token: Callable[[str | None], None],
     logger: logging.Logger | None = None,
-    prober: StorageProber | None = None,
     global_limiter: RateLimiter | None = None,
     actor_limiter: RateLimiter | None = None,
 ) -> FastAPI:
@@ -923,14 +812,10 @@ def create_app(
     process rather than the shape of the code producing them.
     """
     audit_log = logger or build_logger()
-    storage = prober or StorageProber()
     # Bound the access log before anything can be served through it.
     bound_access_log()
     coarse = global_limiter or RateLimiter(GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
     fine = actor_limiter or RateLimiter(ACTOR_LIMIT, ACTOR_WINDOW_SECONDS)
-    # Holds the last observed storage state so a change of state can be logged once, rather
-    # than every probe restating it. A pod the platform later kills still leaves a narrative.
-    last_ready: dict[str, bool | None] = {"writable": None}
 
     serve_docs = not config.is_production
     app = FastAPI(
@@ -950,19 +835,6 @@ def create_app(
         # that needs the convenience, so the redirect is off and a trailing slash is a 404.
         redirect_slashes=False,
     )
-
-    def probe_now() -> StorageProbe:
-        """Probe storage and log any transition between writable and unwritable."""
-        probe = storage.probe(config.data_dir)
-        if last_ready["writable"] != probe.writable:
-            state = "ready" if probe.writable else "unready"
-            print(
-                f"pree storage {state}: data_dir={probe.data_dir} "
-                f"errno={probe.errno_name or 'none'}",
-                flush=True,
-            )
-            last_ready["writable"] = probe.writable
-        return probe
 
     # --- innermost of the middleware stack, above the routes. Later registrations are
     # OUTERMOST, so the order below reads inside-out. Which layer sits where is a security
@@ -1064,12 +936,11 @@ def create_app(
         """The token gate on every gated route."""
         verify_token(x_pree_token)
 
-    register_health_routes(app, config, probe_now, require_token)
+    register_health_routes(app, config, require_token)
 
     register_api_routes(
         app,
         config=config,
-        store=store,
         audit_log=audit_log,
         fine=fine,
         require_token=require_token,

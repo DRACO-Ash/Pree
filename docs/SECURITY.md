@@ -23,43 +23,24 @@ the assessment store.
 | Platform probes exempt from rate limiting | `src/pree/app.py` | `test_the_coarse_limit_never_touches_a_platform_probe` |
 | Request bodies capped before the token gate runs | `src/pree/app.py` | `tests/test_body_cap.py` |
 | Production refuses to start with the gate open | `src/pree/config.py` | `test_production_refuses_to_start_with_no_token_at_all` |
-| A refused write never loses a stored record, and leaves the primary in place | `src/pree/store.py` | `test_a_refused_write_leaves_every_prior_record_readable` |
-| An unreadable primary snapshot recovers from the backup | `src/pree/store.py` | `test_a_corrupt_primary_recovers_from_the_backup` |
-| Concurrent writers serialised by an exclusive lock | `src/pree/store.py` | `test_two_concurrent_upserts_both_survive`, and verified against four real worker processes |
-| A failed privileged action is still audited | `src/pree/app.py` | `test_a_failing_store_returns_a_generic_503_and_still_audits_the_action` |
 | Validation errors never echo caller input | `src/pree/app.py` | `test_the_validation_error_never_echoes_the_callers_input_back` |
 | Boundary validation, strict, extras forbidden, non-finite numbers refused | `src/pree/api_models.py` | `test_out_of_range_unknown_or_coercible_input_is_rejected_at_the_boundary` |
 | Actor labels sanitised and length-capped against log forging | `src/pree/security.py` | `test_actor_sanitisation_strips_log_forging_characters` |
 | No secret in any log, audit line, health body, or error | `src/pree/health.py` | `test_diagnostics_reports_secrets_as_a_boolean_and_a_length_only` |
 | Locked Content-Security-Policy and hardening headers on every response | `src/pree/app.py` | `test_every_response_carries_the_hardening_headers` |
 | Interactive documentation not served in production | `src/pree/app.py` | `test_the_interactive_docs_are_not_served_in_production` |
-| Every filesystem refusal surfaces as a handled 503, audited | `src/pree/store.py` | `test_a_real_storage_refusal_returns_503_and_audits_the_action`, `test_a_failed_lock_release_surfaces_as_a_store_error` |
 | The rate limiter fails closed when its key table saturates | `src/pree/ratelimit.py` | `test_a_saturated_key_table_fails_closed_rather_than_admitting_everyone` |
-| Concurrent probe callers join the probe in flight rather than guessing | `src/pree/health.py` | `test_a_concurrent_caller_joins_the_probe_rather_than_guessing` |
-| A write that misses its budget is never reported as ready | `src/pree/health.py` | `test_a_write_that_took_longer_than_its_budget_is_reported_unready` |
-| An observer's own delay is never charged to the mount | `src/pree/health.py` | `test_an_observers_own_delay_is_not_charged_to_the_mount` |
-| A malformed stored value is dropped rather than crashing the handler | `src/pree/store.py` | `test_a_non_object_assessment_value_is_dropped_rather_than_crashing` |
-| A snapshot too deep to parse fails closed, not into an unhandled 500 | `src/pree/store.py` | `test_a_deeply_nested_snapshot_fails_closed_rather_than_crashing` |
 | The liveness handlers never occupy the shared request threadpool | `src/pree/app.py` | `test_the_liveness_routes_never_occupy_the_shared_request_threadpool` |
 | The five documented liveness paths exist and stay unmetered | `src/pree/app.py` | `test_the_liveness_contract_is_exactly_the_five_documented_paths`, `test_every_documented_liveness_path_is_exempt_from_rate_limiting` |
 | Production refuses a short or wholly repeated team token | `src/pree/config.py` | `test_production_refuses_a_short_token`, `test_production_refuses_a_token_built_entirely_from_repetition` |
 | The security policy has exactly one controls section | `docs/SECURITY.md` | `test_the_security_policy_has_exactly_one_controls_section` |
 | The documented liveness paths match the pinned literals | `docs/DEPLOYMENT.md` | `test_the_documented_liveness_paths_match_the_paths_the_code_pins` |
 | Every control row here cites a test that exists | `docs/SECURITY.md` | `test_every_control_row_cites_a_test_that_exists`, `test_the_where_column_of_every_control_row_points_at_a_real_file` |
-| The deployment sheet documents only probe behaviour the code can produce | `docs/DEPLOYMENT.md` | `test_the_deployment_sheet_documents_only_probe_behaviour_the_code_can_produce` |
-| The retention cap holds even on a snapshot with a partial write order | `src/pree/store.py` | `test_a_partial_write_order_still_trims_to_the_cap` |
-| The assessment collection is capped, newest kept | `src/pree/store.py` | `test_the_collection_is_capped_and_the_newest_record_always_survives` |
-| A configured data directory must be absolute, and a pasted value is normalised | `src/pree/config.py` | `test_a_relative_data_directory_is_refused`, `test_a_quote_wrapped_path_is_normalised_not_taken_literally` |
 | A control character in any config value is refused | `src/pree/config.py` | `test_a_control_character_in_a_value_is_refused` |
 | The CSP exemption for the dev docs cannot reach production | `src/pree/app.py` | `test_the_csp_exemption_cannot_reach_production` |
 | Retry-After never tells a refused caller to retry immediately | `src/pree/ratelimit.py` | `test_retry_after_is_never_zero_even_for_a_key_with_no_history` |
-| A wedged mount keeps reporting unready, and never goes quiet | `src/pree/health.py` | `test_a_wedged_mount_keeps_answering_unready_rather_than_going_quiet` |
-| The readiness signal cannot freeze on a stale cached result | `src/pree/health.py` | `test_the_cached_result_expires` |
-| A recovery never destroys the backup it recovered from | `src/pree/store.py` | `test_a_recovery_does_not_destroy_the_backup_it_recovered_from` |
 | The launch command targets a factory that exists | `Dockerfile` | `test_the_launch_command_targets_the_factory_that_actually_exists` |
 | The allowed origin must be a concrete origin, in any environment | `src/pree/config.py` | `test_an_origin_that_is_not_a_concrete_origin_is_refused_in_any_environment` |
-| Atomic writes; a failed write never becomes the snapshot | `src/pree/store.py` | `test_a_failed_write_fails_closed_and_leaves_no_temporary_file` |
-| Merges never shrink the stored dataset | `src/pree/store.py` | `test_merge_never_deletes_a_key_the_update_omitted` |
 | Non-root numeric user, no suid or sgid bits, one flattened layer | `Dockerfile` | `tests/test_boot_contract.py` |
 | Hash-locked dependencies, scanned for vulnerabilities | `requirements.txt` | `scripts/verify.sh` |
 | The Dockerfile contract is asserted by parsing, not by substring | `Dockerfile` | `tests/test_boot_contract.py` |
@@ -70,7 +51,6 @@ the assessment store.
 | The upload archive carries no credential-shaped path | `scripts/package-appstore.sh` | `scripts/package-appstore.sh` |
 | No handler writes an audit line an unauthenticated caller can size | `src/pree/app.py` | `test_a_long_request_path_cannot_write_an_unbounded_audit_line` |
 | Every hardening step runs in the stage that actually ships | `Dockerfile` | `test_every_hardening_step_runs_in_the_stage_that_actually_ships` |
-| The shipped collection cap matches the sheet and the volume | `src/pree/store.py` | `test_the_shipped_collection_cap_matches_the_sheet_and_the_write_budget` |
 | The access log cannot be sized by an unauthenticated caller | `src/pree/audit.py` | `test_the_access_log_filter_bounds_the_request_line` |
 | The suid sweep is exactly the vetted command | `Dockerfile` | `test_the_suid_sweep_is_exactly_the_command_that_clears_every_bit` |
 | No forwarded header can rewrite the rate-limit key | `Dockerfile` | `test_the_launch_command_refuses_to_trust_a_forwarded_client_address` |
@@ -93,8 +73,6 @@ the assessment store.
 | An ambiguous frame is refused on every method, bodyless included | `src/pree/app.py` | `test_a_request_declaring_both_framings_is_refused_on_a_bodyless_method` |
 | Nothing writes over a binary the hardening steps name | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
 | The shipped stage declares nothing that undoes a control | `Dockerfile` | `test_the_shipped_stage_declares_no_instruction_that_undoes_a_control` |
-| The storage probe publishes the data directory only on failure | `src/pree/health.py` | `test_the_storage_probe_publishes_the_data_directory_only_on_failure` |
-| Every read of the assessment store is audited | `src/pree/app.py` | `test_every_read_of_the_store_is_audited` |
 | A refused CORS preflight uses one contract and is audited | `src/pree/app.py` | `test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited` |
 | The framing guard is the outermost middleware | `src/pree/app.py` | `test_the_frame_guard_is_the_outermost_middleware` |
 | A refused preflight is metered | `src/pree/app.py` | `test_a_refused_preflight_is_metered` |
@@ -105,12 +83,10 @@ the assessment store.
 | Every liveness path answers HEAD as well as GET | `src/pree/app.py` | `test_every_liveness_path_answers_head_as_well_as_get` |
 | Only vetted RUN commands may touch an executable directory | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
 | The base image is pinned to the vetted digest in both stages | `Dockerfile` | `test_every_base_image_is_pinned_by_digest` |
-| The probe exemption is per path and per method | `src/pree/app.py` | `test_the_probe_exemption_is_per_path_and_per_method` |
 | The Dockerfile parser follows BuildKit's continuation rule | `tests/test_boot_contract.py` | `test_the_parser_follows_buildkit_continuation_semantics` |
 | The sentence splitter does not break at an abbreviation | `tests/test_boot_contract.py` | `test_the_sentence_splitter_does_not_break_at_an_abbreviation` |
 | Production refuses a cleartext allowed origin | `src/pree/config.py` | `test_production_refuses_a_cleartext_allowed_origin` |
 | The access log redacts a query string | `src/pree/audit.py` | `test_the_access_log_filter_redacts_a_query_string` |
-| A malformed store key is refused at the boundary | `src/pree/app.py` | `test_a_malformed_store_key_is_refused_at_the_boundary` |
 | Nothing writes over a binary a hardening step names, at any WORKDIR | `Dockerfile` | `test_nothing_writes_over_a_binary_the_hardening_steps_depend_on` |
 | No instruction fetches from the network or rewrites the shipped PATH | `Dockerfile` | `test_no_instruction_fetches_from_the_network_or_rewrites_the_shipped_path` |
 | Exactly one environment file ships, the root example | `scripts/package-appstore.sh` | `test_the_example_environment_file_carries_no_real_value` |
@@ -139,9 +115,8 @@ the assessment store.
 | Every response header VALUE is pinned, on every route and every error shape | `src/pree/app.py` | `test_the_team_token_reaches_no_response_body_header_or_log_record` |
 | The probe paths' headers and bodies are both exact | `src/pree/app.py` | `test_the_unauthenticated_paths_on_the_listener_disclose_nothing` |
 | Every audit record's kind, fields and string values are pinned, and every kind is produced | `src/pree/audit.py` | `test_every_audit_record_matches_its_pinned_shape_and_values` |
-| The boot line is pinned exactly and carries no token | `src/pree/main.py` | `test_boot_wires_a_serving_app_and_seeds_the_store` |
+| The boot line is pinned exactly and carries no token | `src/pree/main.py` | `test_boot_wires_a_serving_app` |
 | Every permitted ENV name has a pinned value, and PATH is guarded in every stage | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
-| The storage 503 body discloses the errno and the directory, nothing else | `src/pree/health.py` | `test_the_storage_failure_body_discloses_the_errno_and_nothing_else` |
 | Every ENV and ARG name is on an allowlist with a pinned value, so no credential and no platform default can be baked | `Dockerfile` | `test_no_stage_sets_an_environment_variable_outside_the_allowlist` |
 | The ENV allowlist cannot admit a platform-injected or credential-shaped name | `Dockerfile` | `test_the_environment_allowlist_cannot_admit_a_platform_or_credential_name` |
 | The suid sweep narrows by nothing and clears both bits, as a property | `Dockerfile` | `test_the_suid_sweep_narrows_by_nothing_and_clears_both_bits` |
@@ -158,7 +133,6 @@ the assessment store.
 | Arming twice does not stack the `Handler.format` patch, and the deleted `Handler.__init__` patch stays deleted | `src/pree/audit.py` | `test_arming_twice_does_not_stack_the_stdlib_patches` |
 | A refused key still CHARGES every other bucket, so a peer over its socket limit cannot ride free on the shared fold | `src/pree/app.py` | `test_a_refused_key_still_charges_every_other_bucket` |
 | The CORS method and header allowlists are the narrow ones, read off the constructed middleware | `src/pree/app.py` | `test_the_cors_method_and_header_allowlists_are_the_narrow_ones` |
-| The audit `reason` field is bounded, driven through the handler that applies the bound | `src/pree/app.py` | `test_the_audit_reason_field_is_bounded` |
 | Every one of the four named `sys` stream attributes is wrapped, refuses, and is restored | `src/pree/audit.py` | `test_every_named_stream_attribute_is_wrapped_and_restored` |
 | The SHIPPED rate limits are the ones a deployed pod enforces, driven with no limiter injected | `src/pree/ratelimit.py` | `test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces` |
 | The finished line is scanned whatever produced it: `%(args)s` the message never consumed, a `repr` conversion, a formatter default, a lying `str` subclass, a filter running after the guard's | `src/pree/audit.py` | `test_the_finished_line_is_scanned_whatever_produced_it` |

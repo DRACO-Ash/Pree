@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import base64
 import dataclasses
-import errno
 import inspect
 import io
 import json
@@ -40,14 +39,12 @@ from pree import app as app_module
 from pree import audit as audit_module
 from pree import main as main_module
 from pree.app import (
+    AUDIT_KEY_PATTERN,
     DOC_PATHS,
     LIVENESS_PATHS,
     MAX_BODY_BYTES,
     MAX_LOGGED_PATH,
-    MAX_LOGGED_REASON,
     MAX_VALIDATION_ERRORS_LOGGED,
-    STORAGE_PROBE_PATH,
-    STORE_KEY_PATTERN,
     UNMETERED_PATHS,
     _first_refused,
     _limit_keys,
@@ -63,7 +60,6 @@ from pree.audit import (
     install_credential_guard,
 )
 from pree.config import ServiceConfig
-from pree.health import StorageProber
 from pree.main import build
 from pree.ratelimit import (
     ACTOR_LIMIT,
@@ -82,7 +78,6 @@ from pree.security import (
     sanitise_log_path,
     token_verifier,
 )
-from pree.store import JsonStore, StoreError
 from tests.conftest import AUTH, PRODUCTION_TOKEN, TEST_TOKEN, build_client, make_config
 
 # Pinned literals, deliberately NOT derived from LIVENESS_PATHS. These five paths are the
@@ -101,7 +96,7 @@ EXPECTED_LIVENESS_PATHS = frozenset({"/", "/healthz", "/readyz", "/livez", "/pin
 # `@app.post("/v1/debug")` returning the team token, unauthenticated, passed 292 of 292 tests and
 # did not trip the coverage floor: one line, and the shared credential goes to any client on the
 # internet with a green gate.
-EXPECTED_UNMETERED_PATHS = frozenset(EXPECTED_LIVENESS_PATHS | {"/healthz/storage"})
+EXPECTED_UNMETERED_PATHS = frozenset(EXPECTED_LIVENESS_PATHS)
 # The development documentation, served only when PREE_ENV is development. FastAPI registers
 # these as plain Starlette routes rather than APIRoutes, and `/docs/oauth2-redirect` is not in
 # DOC_PATHS because the CSP exemption does not need it; the route table still carries it.
@@ -154,16 +149,10 @@ def _app_in(env: str) -> Iterator[Any]:
         if env == "production":
             overrides["PREE_ALLOWED_ORIGIN"] = "https://pree.apps.bluestaq.com"
         config = make_config(Path(directory), **overrides)
-        prober = StorageProber(cache_seconds=0.0)
-        try:
-            yield create_app(
-                config.for_service(),
-                JsonStore(config.data_dir),
-                verify_token=token_verifier(config),
-                prober=prober,
-            )
-        finally:
-            prober.shutdown()
+        yield create_app(
+            config.for_service(),
+            verify_token=token_verifier(config),
+        )
 
 
 def _dependency_names(route: APIRoute) -> set[str]:
@@ -216,13 +205,6 @@ def test_root_is_200_and_not_a_redirect(client: TestClient) -> None:
     assert client.get("/", follow_redirects=False).status_code == 200
 
 
-def test_storage_health_proves_a_real_write_unauthenticated(client: TestClient) -> None:
-    body = client.get(STORAGE_PROBE_PATH).json()
-    assert body["storage_writable"] is True
-    assert body["errno"] is None
-    assert body["probe_duration_ms"] < body["probe_timeout_ms"]
-
-
 def test_diagnostics_is_gated_when_a_token_is_configured(client: TestClient) -> None:
     """The read-out holds no secret value, but the token length narrows a search space."""
     assert client.get("/diagnostics").status_code == 401
@@ -257,12 +239,6 @@ def test_diagnostics_reports_secrets_as_a_boolean_and_a_length_only(
         "allowed_origin_present",
         "allowed_origin_is_wildcard",
         "allowed_origin_length",
-        "data_dir",
-        "data_dir_is_absolute",
-        "data_dir_was_configured",
-        "storage_writable",
-        "storage_errno",
-        "storage_errno_name",
         "identity_uid",
         "identity_gid",
         "identity_is_root",
@@ -312,44 +288,6 @@ def test_assess_reports_missing_indicators_rather_than_inventing_them(
         "rf_activity",
     }
     assert body["confidence"] == "low"
-
-
-def test_assess_persists_the_assessment(client: TestClient) -> None:
-    client.post("/v1/assess", json=FULL_BODY, headers=AUTH)
-    stored = client.get("/v1/assessments/asset-01:cand-99", headers=AUTH)
-    assert stored.status_code == 200
-    assert stored.json()["score"] > 80.0
-
-
-@pytest.mark.parametrize("template", ["{etag}", "W/{etag}", '"other", {etag}', "*"])
-def test_if_none_match_is_honoured_for_weak_and_listed_validators(
-    client: TestClient, template: str
-) -> None:
-    """An exact whole-header comparison matched none of these, so every request re-sent."""
-    client.post("/v1/assess", json=FULL_BODY, headers=AUTH)
-    first = client.get("/v1/assessments/asset-01:cand-99", headers=AUTH)
-    etag = first.headers["etag"]
-    again = client.get(
-        "/v1/assessments/asset-01:cand-99",
-        headers={**AUTH, "if-none-match": template.format(etag=etag)},
-    )
-    assert again.status_code == 304
-
-
-def test_a_stale_validator_still_returns_the_body(client: TestClient) -> None:
-    client.post("/v1/assess", json=FULL_BODY, headers=AUTH)
-    again = client.get(
-        "/v1/assessments/asset-01:cand-99", headers={**AUTH, "if-none-match": '"stale"'}
-    )
-    assert again.status_code == 200
-
-
-def test_an_unknown_assessment_is_a_404(client: TestClient) -> None:
-    assert client.get("/v1/assessments/nope:nope", headers=AUTH).status_code == 404
-
-
-def test_reading_an_assessment_requires_the_token(client: TestClient) -> None:
-    assert client.get("/v1/assessments/asset-01:cand-99").status_code == 401
 
 
 @pytest.mark.parametrize(
@@ -434,7 +372,7 @@ def test_a_rejected_body_cannot_write_an_unbounded_audit_line(tmp_path: Path) ->
     stream = io.StringIO()
     logger = build_logger(stream)
     config = make_config(tmp_path)
-    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
+    with build_client(config, logger) as bounded:
         payload: dict[str, Any] = {"protected_asset_id": 1, "candidate_id": 2}
         # THREE shapes at once, because each defeats a different bound, and body ORDER is
         # load-bearing: pydantic reports errors in body order and only the first
@@ -537,7 +475,7 @@ def test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_
         "/v1/,assess",
         "/v1/assess",
     ]
-    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
+    with build_client(config, logger) as bounded:
         for target in targets:
             bounded.get(target, headers={"x-pree-token": "wrong"})
 
@@ -561,8 +499,9 @@ def test_two_unauthenticated_requests_whose_paths_differ_cannot_share_one_audit_
 # places is two places for them to drift apart.
 ACTOR_HEADER = "x-pree-actor"
 # The literal each handler's reason begins with, so the field is recomputed rather than
-# charset-checked. `store_error` embeds a configured path after its prefix, which is why the
-# assertion accepts a prefix match for that one and equality for the rest.
+# charset-checked. Every surviving reason is a fixed literal. `store_error` was the one that
+# embedded a configured path, and it is gone with the store, which is why the prefix-match
+# branch below is gone too rather than kept as an unexercised accommodation.
 # What the boundary produces for the correlation drive's body, `{"bad": 1}`, against a model with
 # `extra="forbid"` and two required identifiers: one refusal for the unknown field and one for each
 # missing one. Pinned as literals so a change in what the boundary reports is a named failure
@@ -575,7 +514,6 @@ _EXPECTED_PROBE_ERROR_LOCS = frozenset(
 _EXPECTED_REASONS = {
     "auth_reject": "token rejected",
     "http_reject": "Not Found",
-    "store_error": "snapshot at ",
 }
 PROBE_ACTOR = "watch-floor.lead@example.test"
 PROBE_ASSET = "asset-probe-01"
@@ -692,7 +630,7 @@ def _assert_record_recomputes(
         )
         assert record["key"] == f"{PROBE_ASSET}:{PROBE_CANDIDATE}", (
             f"the audited key {record['key']!r} is not the two validated ids and the colon "
-            f"between them; hex is inside STORE_KEY_PATTERN and each half fits in 64 characters"
+            f"between them; hex is inside AUDIT_KEY_PATTERN and each half fits in 64 characters"
         )
         for field in ("score", "evidence_coverage"):
             assert record[field] == body[field], (
@@ -702,14 +640,11 @@ def _assert_record_recomputes(
             )
     # EQUALITY, not a prefix. The prefix form left 512 minus 14 free printable characters on
     # `auth_reject`, and that tail is exactly the channel a review used to recover the whole
-    # credential from an unauthenticated 401. `store_error` embeds a configured path, so its
-    # expectation is RECOMPUTED from the data directory rather than conceded as a suffix.
+    # credential from an unauthenticated 401. Every surviving reason is a fixed literal, so
+    # equality is the whole check; the one record that embedded a configured path was
+    # `store_error`, and it went with the store.
     if "reason" in record:
-        expected_reason = (
-            f"snapshot at {seen['data_dir']}/assessments.json.bak is unreadable"
-            if kind == "store_error"
-            else _EXPECTED_REASONS[kind]
-        )
+        expected_reason = _EXPECTED_REASONS[kind]
         assert record["reason"] == expected_reason, (
             f"the {kind} reason {record['reason']!r} is not the handler's own text "
             f"({expected_reason!r}); this field permits 512 printable characters, which is room "
@@ -783,11 +718,10 @@ def _every_kind_with(
     # The path each drive requests, WITHOUT the query, which is what `_raw_path` hands the scrub.
     targets = {
         "audit": "/v1/assess",
-        "auth_reject": "/v1/assessments/a:b",
+        "auth_reject": "/diagnostics",
         "validation_reject": "/v1/assess",
         "http_reject": "/nowhere-at-all",
         "cors_reject": "/v1/assess",
-        "store_error": "/v1/assessments/a:b",
     }
     body: dict[str, Any] = {}
     # The response status each drive actually received, so the audited `status` can be recomputed
@@ -795,7 +729,7 @@ def _every_kind_with(
     # inside that bound and made the record disagree with the response it describes, about 7.6 bits
     # per unauthenticated 404, with the whole suite green.
     statuses: dict[str, int] = {}
-    with build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0)) as probe:
+    with build_client(config, build_logger(stream)) as probe:
         # audit: the SUCCESS record, which no earlier version of this exercise reached, so its
         # `key`, `actor`, `score` and `evidence_coverage` were shape-checked and never recomputed.
         accepted = probe.post(
@@ -829,12 +763,6 @@ def _every_kind_with(
                 "Access-Control-Request-Method": "POST",
             },
         ).status_code
-        # store_error: a corrupt snapshot AND a corrupt backup, so the real 503 path runs.
-        (config.data_dir / "assessments.json").write_text("{ not json", encoding="utf-8")
-        (config.data_dir / "assessments.json.bak").write_text("nor this", encoding="utf-8")
-        statuses["store_error"] = probe.get(
-            f"{targets['store_error']}{query}", headers=auth
-        ).status_code
 
     # EVERY record, not only the ones carrying `had_query`. Selecting on that field left the
     # `audit` kind outside the correlation entirely, so its four caller-influenced values were
@@ -853,7 +781,6 @@ def _every_kind_with(
             "target": targets[kind],
             "body": body,
             "status": statuses.get(kind),
-            "data_dir": config.data_dir,
         }
     return observed
 
@@ -877,15 +804,15 @@ def test_the_query_string_aliases_and_the_record_says_a_query_was_present(
     stream = io.StringIO()
     logger = build_logger(stream)
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
-        for target in ("/v1/assessments/a:b?x=1", "/v1/assessments/a:b?x=2", "/v1/assessments/a:b"):
+    with build_client(config, logger) as bounded:
+        for target in ("/diagnostics?x=1", "/diagnostics?x=2", "/diagnostics"):
             assert bounded.get(target, headers={"x-pree-token": "wrong"}).status_code == 401
 
     records = [
         json.loads(line) for line in stream.getvalue().splitlines() if '"auth_reject"' in line
     ]
     assert len(records) == 3, f"expected three audited rejections, got {len(records)}"
-    assert {record["path"] for record in records} == {"/v1/assessments/a:b"}, (
+    assert {record["path"] for record in records} == {"/diagnostics"}, (
         f"the query string reached the audited path field, where a team token has been seen "
         f"before: {[record['path'] for record in records]}"
     )
@@ -929,14 +856,10 @@ def test_a_server_that_puts_the_query_in_raw_path_still_cannot_reach_the_audit_f
                 scope["raw_path"] = scope["path"].encode() + b"?" + scope["query_string"]
             await self._app(scope, receive, send)
 
-    store = JsonStore(config.data_dir)
-    store.seed()
     app = create_app(
         config.for_service(),
-        store,
         verify_token=token_verifier(config),
         logger=logger,
-        prober=StorageProber(cache_seconds=0.0),
     )
     with TestClient(_RawPathCarriesTheQuery(app)) as hostile:
         refused = hostile.get(
@@ -991,14 +914,10 @@ def test_the_audited_path_falls_back_when_no_usable_raw_path_is_supplied(
                     scope["raw_path"] = bytearray(scope["path"].encode())
             await self._app(scope, receive, send)
 
-    store = JsonStore(config.data_dir)
-    store.seed()
     app = create_app(
         config.for_service(),
-        store,
         verify_token=token_verifier(config),
         logger=logger,
-        prober=StorageProber(cache_seconds=0.0),
     )
     with TestClient(_ReplaceRawPath(app)) as stripped:
         refused = stripped.get("/diagnostics", headers={"x-pree-token": "wrong"})
@@ -1033,17 +952,23 @@ def test_a_long_request_path_cannot_write_an_unbounded_audit_line(tmp_path: Path
     # an emoji as a 12-byte surrogate pair, so 160 characters could cost nearly 2 KB a record. The
     # scrub strips both classes outright, which removes the amplification rather than bounding it,
     # so a legitimate-character path is now the case that exercises the truncation.
-    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as bounded:
+    with build_client(config, logger) as bounded:
         # `%F0%9D%90%80` is U+1D400, an astral LETTER, and it is the input that distinguishes the
         # two charsets: `\w` in a str pattern keeps it, so it survived the scrub and cost twelve
         # bytes each as a surrogate escape. 160 characters wrote 1,802 bytes against the 416 this
         # test asserts. The emoji is not a letter and was always stripped, which is why choosing
         # it hid the hole rather than finding it.
         for escaped in ("%01", "%F0%9F%98%80", "%F0%9D%90%80", "a"):
-            path = "/v1/assessments/" + escaped * 4_000
-            assert bounded.get(path, headers={"x-pree-token": "wrong"}).status_code == 401
+            path = "/v1/none/" + escaped * 4_000
+            # Driven through `http_reject` rather than `auth_reject`. The long path used to be
+            # a key on the gated read route, which is gone with the store; no gated route takes
+            # a path parameter now, so a long suffix is simply a route that does not exist. The
+            # property under test never depended on which gate refused: it is that an unbounded
+            # REQUEST PATH cannot write an unbounded audit line, and `http_reject` is the record
+            # that carries a caller-chosen path today.
+            assert bounded.get(path, headers={"x-pree-token": "wrong"}).status_code == 404
 
-    lines = [line for line in stream.getvalue().splitlines() if "auth_reject" in line]
+    lines = [line for line in stream.getvalue().splitlines() if "http_reject" in line]
     assert len(lines) == 4, f"expected one audit line per rejection, got {len(lines)}"
     paths = [json.loads(line)["path"] for line in lines]
     for line, path in zip(lines, paths, strict=True):
@@ -1074,7 +999,7 @@ def test_every_rejection_uses_one_error_contract_and_is_audited(tmp_path: Path) 
     stream = io.StringIO()
     logger = build_logger(stream)
     config = make_config(tmp_path)
-    with build_client(config, logger, StorageProber(cache_seconds=0.0)) as strict:
+    with build_client(config, logger) as strict:
         huge = (
             '{"protected_asset_id":"a","candidate_id":"b",'
             '"indicators":{"manoeuvres_in_window":' + "9" * 5_000 + "}}"
@@ -1103,14 +1028,10 @@ def test_a_bodiless_status_stays_bodiless(tmp_path: Path) -> None:
     """
     config = make_config(tmp_path)
     logger = build_logger(io.StringIO())
-    store = JsonStore(tmp_path / "data")
-    store.seed()
     app = create_app(
         config.for_service(),
-        store,
         verify_token=token_verifier(config),
         logger=logger,
-        prober=StorageProber(cache_seconds=0.0),
     )
 
     @app.get("/test-only/no-content")
@@ -1132,9 +1053,7 @@ def test_both_rate_limit_tiers_answer_identically_and_keep_retry_after(tmp_path:
         {"actor_limiter": RateLimiter(1, 60.0)},
         {"global_limiter": RateLimiter(1, 60.0)},
     ):
-        with build_client(
-            config, build_logger(io.StringIO()), StorageProber(cache_seconds=0.0), **kwargs
-        ) as limited:
+        with build_client(config, build_logger(io.StringIO()), **kwargs) as limited:
             body = {"protected_asset_id": "a1", "candidate_id": "b1", "indicators": {}}
             assert limited.post("/v1/assess", json=body, headers=AUTH).status_code == 200
             refused = limited.post("/v1/assess", json=body, headers=AUTH)
@@ -1156,9 +1075,7 @@ def test_the_factory_installs_the_access_log_filter(tmp_path: Path) -> None:
     access.filters = []
     gunicorn_access.filters = []
 
-    build_client(
-        make_config(tmp_path), build_logger(io.StringIO()), StorageProber(cache_seconds=0.0)
-    )
+    build_client(make_config(tmp_path), build_logger(io.StringIO()))
 
     for logger in (access, gunicorn_access):
         installed = [f for f in logger.filters if type(f).__name__ == "_TruncateRequestPath"]
@@ -1178,7 +1095,7 @@ def test_a_trailing_slash_is_a_404_not_a_redirect(client: TestClient) -> None:
     than better, because the scheme became unconditionally http, so an operator who typed a
     trailing slash and followed redirects would put the token on the wire in cleartext.
     """
-    for path in ("/v1/assess/", "/diagnostics/", "/healthz/storage/"):
+    for path in ("/v1/assess/", "/diagnostics/"):
         response = client.get(path, headers=AUTH, follow_redirects=False)
         assert response.status_code != 307, (
             f"{path} still redirects to {response.headers.get('location')!r}, before the token "
@@ -1242,63 +1159,6 @@ def test_a_forwarding_header_cannot_widen_the_rate_limit_key_space() -> None:
         assert folded == {"forwarded"}, f"a rotating {header} varied the folded key: {folded}"
 
 
-def test_the_storage_probe_publishes_the_data_directory_only_on_failure(
-    client: TestClient, tmp_path: Path
-) -> None:
-    """This path is unauthenticated by design, so its 200 body is public.
-
-    It carried the resolved absolute data directory, publishing the container's filesystem
-    layout to anyone who asked, while `/diagnostics` gated the very same field on the reasoning
-    that configuration detail narrows an attacker's search space for free. The deployment sheet
-    described the directory as appearing in the 503 body, which was true of the sheet and not of
-    the code. On failure it earns its place: a screenshot of the 503 is the whole diagnosis.
-    """
-    ready = client.get(STORAGE_PROBE_PATH)
-    assert ready.status_code == 200
-    assert "data_dir" not in ready.json(), (
-        f"the successful probe publishes the data directory: {ready.json()}"
-    )
-    assert str(tmp_path) not in ready.text
-
-    # The failing case is built directly from the probe, because a config pointing at an
-    # unwritable directory cannot boot a store to hand the factory.
-    unwritable = StorageProber(cache_seconds=0.0).probe(Path("/proc/nonexistent-pree"))
-    assert unwritable.writable is False
-    assert unwritable.as_body()["data_dir"] == "/proc/nonexistent-pree", (
-        "the failing probe no longer names the directory, so a screenshot is not a diagnosis"
-    )
-    assert unwritable.as_body()["errno_name"], "the failing probe names no errno"
-
-
-def test_every_read_of_the_store_is_audited(tmp_path: Path) -> None:
-    """A successful disclosure was the one privileged action with no audit line.
-
-    A refused request was audited, a rejected body was audited, a store failure was audited, and
-    a successful read of a record was not. Under the shared-token model "who read what" is the
-    only forensic question the trail could answer about a stolen token.
-    """
-    stream = io.StringIO()
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    with build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0)) as audited:
-        assert audited.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
-        key = f"{FULL_BODY['protected_asset_id']}:{FULL_BODY['candidate_id']}"
-        hit = audited.get(f"/v1/assessments/{key}", headers=AUTH)
-        assert hit.status_code == 200
-        audited.get(
-            f"/v1/assessments/{key}", headers={**AUTH, "if-none-match": hit.headers["etag"]}
-        )
-        audited.get("/v1/assessments/nosuch:record", headers=AUTH)
-
-    outcomes = [
-        json.loads(line)["outcome"]
-        for line in stream.getvalue().splitlines()
-        if line.strip() and json.loads(line).get("action") == "read_assessment"
-    ]
-    assert outcomes == ["disclosed", "not_modified", "not_found"], (
-        f"the read path audited {outcomes}; every read must leave a record of its outcome"
-    )
-
-
 def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path: Path) -> None:
     """Starlette answered a disallowed preflight itself, in plain text and unaudited.
 
@@ -1310,7 +1170,7 @@ def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path
     config = make_config(
         tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
     )
-    client = build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0))
+    client = build_client(config, build_logger(stream))
     refused = client.options(
         "/v1/assess",
         headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
@@ -1341,9 +1201,7 @@ def test_a_refused_cors_preflight_uses_the_same_contract_and_is_audited(tmp_path
                     PREE_TEAM_TOKEN=token,
                     PREE_ALLOWED_ORIGIN="https://pree.example",
                 )
-                with build_client(
-                    probe_config, build_logger(probe_stream), StorageProber(cache_seconds=0.0)
-                ) as probe:
+                with build_client(probe_config, build_logger(probe_stream)) as probe:
                     answer = probe.options(
                         "/v1/assess",
                         headers={
@@ -1409,7 +1267,6 @@ def test_a_guessing_run_is_bounded_by_the_ordinary_limiter(tmp_path: Path) -> No
     client = build_client(
         config,
         build_logger(io.StringIO()),
-        StorageProber(cache_seconds=0.0),
         global_limiter=RateLimiter(6, 60.0),
     )
     for attempt in range(6):
@@ -1438,7 +1295,6 @@ def test_an_unauthenticated_flood_cannot_refuse_a_request_the_limit_would_admit(
     client = build_client(
         config,
         build_logger(io.StringIO()),
-        StorageProber(cache_seconds=0.0),
         global_limiter=RateLimiter(100_000, 60.0),
     )
     for attempt in range(40):
@@ -1465,12 +1321,11 @@ def test_a_refused_preflight_is_metered(tmp_path: Path) -> None:
     # EVERY path, including the six exempt from the ordinary limiter. Testing only a metered
     # path let the defect ship twice: the metering helper returned early for the exempt paths
     # while the audit line below was written anyway, and 1,200 refused preflights across
-    # /healthz, / and /healthz/storage returned 400 each with nothing counting them.
-    for path in ("/v1/assess", "/healthz", "/", STORAGE_PROBE_PATH):
+    # /healthz and / returned 400 each with nothing counting them.
+    for path in ("/v1/assess", "/healthz", "/"):
         metered = build_client(
             config,
             build_logger(io.StringIO()),
-            StorageProber(cache_seconds=0.0),
             global_limiter=RateLimiter(3, 60.0),
         )
         codes = [
@@ -1499,14 +1354,10 @@ def test_the_frame_guard_is_the_outermost_middleware(tmp_path: Path) -> None:
     config = make_config(
         tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
     )
-    store = JsonStore(tmp_path / "data")
-    store.seed()
     app = create_app(
         config.for_service(),
-        store,
         verify_token=token_verifier(config),
         logger=build_logger(io.StringIO()),
-        prober=StorageProber(cache_seconds=0.0),
     )
     names = [
         middleware.cls.__name__
@@ -1562,58 +1413,6 @@ def test_the_frame_guard_is_the_outermost_middleware(tmp_path: Path) -> None:
     assert refused.headers.get("connection", "").lower() == "close"
 
 
-@pytest.mark.parametrize(
-    "bad_key",
-    [
-        "no-colon-at-all",
-        "a:b:c",
-        "a" * 65 + ":b",
-        "a:" + "b" * 65,
-        "-leading:b",
-        "a b:c",
-        ":b",
-        "a:",
-        "a" * 200,
-    ],
-)
-def test_a_malformed_store_key_is_refused_at_the_boundary(client: TestClient, bad_key: str) -> None:
-    """The read path's own comment claimed a validator that was not there.
-
-    It said the key "reached here through the path validator, so it is already shape-checked",
-    and the parameter carried no pattern and no length bound: the only limit was the truncation
-    on the next line, which bounds the audit record and not the lookup. The validator exists
-    now, and this asserts it, because a comment asserting a control is exactly what this project
-    keeps finding to be false.
-    """
-    response = client.get(f"/v1/assessments/{bad_key}", headers=AUTH)
-    assert response.status_code == 422, f"{bad_key!r} reached the store with {response.status_code}"
-    assert response.json() == {"error": "request rejected"}
-
-
-def test_a_key_containing_a_slash_cannot_reach_the_route_at_all(client: TestClient) -> None:
-    """A slash makes it a different path, so the router refuses it before the validator runs.
-
-    Asserted separately rather than folded into the case above: this refusal is a 404 from the
-    router, not a 422 from the pattern, and a test that accepted either status would pass with
-    the pattern deleted whenever the path merely happened not to match a route.
-    """
-    for traversal in ("a:/etc/passwd", "../../etc/passwd", "a/b", "a:..%2f..%2fetc"):
-        response = client.get(f"/v1/assessments/{traversal}", headers=AUTH)
-        assert response.status_code == 404, f"{traversal!r} gave {response.status_code}"
-        assert response.json() == {"error": "request rejected"}
-
-
-def test_a_well_formed_store_key_still_reaches_the_store(client: TestClient) -> None:
-    """The pattern must not refuse the keys the write path actually mints."""
-    assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
-    key = f"{FULL_BODY['protected_asset_id']}:{FULL_BODY['candidate_id']}"
-    assert client.get(f"/v1/assessments/{key}", headers=AUTH).status_code == 200
-    # And the longest legitimate key, two 64-character identifiers, is accepted rather than
-    # refused by an off-by-one in the pattern's length bounds.
-    longest = "a" * 64 + ":" + "b" * 64
-    assert client.get(f"/v1/assessments/{longest}", headers=AUTH).status_code == 404
-
-
 def test_a_preflight_to_a_probe_path_is_refused_without_an_audit_line(tmp_path: Path) -> None:
     """The contract, but not the audit line, on a path that touches nothing.
 
@@ -1627,8 +1426,8 @@ def test_a_preflight_to_a_probe_path_is_refused_without_an_audit_line(tmp_path: 
     config = make_config(
         tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN, PREE_ALLOWED_ORIGIN="https://pree.example"
     )
-    client = build_client(config, build_logger(stream), StorageProber(cache_seconds=0.0))
-    for path in ("/healthz", "/", STORAGE_PROBE_PATH):
+    client = build_client(config, build_logger(stream))
+    for path in ("/healthz", "/"):
         response = client.options(
             path,
             headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "POST"},
@@ -1667,7 +1466,6 @@ def test_a_wrong_method_on_a_probe_path_is_metered_and_not_audited(tmp_path: Pat
     client = build_client(
         config,
         build_logger(stream),
-        StorageProber(cache_seconds=0.0),
         global_limiter=RateLimiter(4, 60.0),
     )
     codes = [client.request("DELETE", "/healthz").status_code for _ in range(10)]
@@ -1679,7 +1477,7 @@ def test_a_wrong_method_on_a_probe_path_is_metered_and_not_audited(tmp_path: Pat
 
     # A 405 on a REAL route is still audited: the method a caller tried is worth knowing there.
     audited = io.StringIO()
-    real = build_client(config, build_logger(audited), StorageProber(cache_seconds=0.0))
+    real = build_client(config, build_logger(audited))
     assert real.request("DELETE", "/v1/assess", headers=AUTH).status_code == 405
     assert "http_reject" in audited.getvalue()
 
@@ -1730,38 +1528,7 @@ def test_every_method_not_allowed_names_the_methods_that_are(client: TestClient)
             f"405 on {target} advertises {sorted(advertised)}; the route serves {sorted(expected)}"
         )
         checked += 1
-    assert checked >= 9, f"only {checked} routes were checked; the table has more"
-
-
-def test_the_probe_exemption_is_per_path_and_per_method(tmp_path: Path) -> None:
-    """The exemption is for the probe, which means the method the path actually serves.
-
-    HEAD was exempt on every probe path including `/healthz/storage`, which serves only GET, so
-    a 405 that can never be a platform probe was unmetered: 600 of 600 admitted, 33,000 bytes of
-    access log in 0.62 seconds from an unauthenticated caller. That is the same reasoning used to
-    meter preflights on those same six paths one commit earlier, applied inconsistently.
-    """
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    # HEAD on a LIVENESS path is a real probe: exempt, and 200 however many times it is called.
-    live = build_client(
-        config,
-        build_logger(io.StringIO()),
-        StorageProber(cache_seconds=0.0),
-        global_limiter=RateLimiter(3, 60.0),
-    )
-    assert [live.head("/healthz").status_code for _ in range(8)] == [200] * 8
-
-    # HEAD on the STORAGE path is not a probe, because that route serves only GET. It is a 405,
-    # and it is metered like any other traffic.
-    metered = build_client(
-        config,
-        build_logger(io.StringIO()),
-        StorageProber(cache_seconds=0.0),
-        global_limiter=RateLimiter(3, 60.0),
-    )
-    codes = [metered.head(STORAGE_PROBE_PATH).status_code for _ in range(8)]
-    assert 429 in codes, f"HEAD on the storage path is unmetered: {codes}"
-    assert 405 in codes, f"expected method-not-allowed before the limit bites: {codes}"
+    assert checked >= 7, f"only {checked} routes were checked; the table has more"
 
 
 def test_the_body_cap_is_derived_from_the_memory_the_platform_grants() -> None:
@@ -1845,11 +1612,9 @@ def test_a_body_within_the_cap_still_succeeds(client: TestClient) -> None:
     assert client.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
 
 
-def test_the_expensive_path_is_rate_limited(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
-) -> None:
+def test_the_expensive_path_is_rate_limited(tmp_path: Path, quiet_logger: logging.Logger) -> None:
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    with build_client(config, quiet_logger, prober, actor_limiter=RateLimiter(2, 60.0)) as limited:
+    with build_client(config, quiet_logger, actor_limiter=RateLimiter(2, 60.0)) as limited:
         assert limited.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
         assert limited.post("/v1/assess", json=FULL_BODY, headers=AUTH).status_code == 200
         third = limited.post("/v1/assess", json=FULL_BODY, headers=AUTH)
@@ -1858,13 +1623,13 @@ def test_the_expensive_path_is_rate_limited(
 
 
 def test_a_spoofed_actor_header_cannot_reset_the_rate_limit(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     """The fine tier was keyed on this caller-supplied header, so a fresh label per request
     bypassed the tier entirely. It is keyed on the peer address now."""
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
     statuses = []
-    with build_client(config, quiet_logger, prober, actor_limiter=RateLimiter(2, 60.0)) as limited:
+    with build_client(config, quiet_logger, actor_limiter=RateLimiter(2, 60.0)) as limited:
         for index in range(5):
             response = limited.post(
                 "/v1/assess",
@@ -1876,61 +1641,20 @@ def test_a_spoofed_actor_header_cannot_reset_the_rate_limit(
 
 
 def test_the_coarse_limit_never_touches_a_platform_probe(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     """Rejected traffic must not be able to turn the container HEALTHCHECK red and restart
     the pod, which is cheaper than attacking the application itself."""
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    with build_client(config, quiet_logger, prober, global_limiter=RateLimiter(1, 60.0)) as limited:
-        assert limited.get("/v1/assessments/a:b", headers=AUTH).status_code == 404
-        assert limited.get("/v1/assessments/a:b", headers=AUTH).status_code == 429
-        for path in (*LIVENESS_PATHS, STORAGE_PROBE_PATH):
-            assert limited.get(path).status_code in {200, 503}, path
-
-
-def test_a_failing_store_returns_a_generic_503_and_still_audits_the_action(
-    tmp_path: Path, prober: StorageProber
-) -> None:
-    """A privileged action that failed is still a privileged action."""
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-
-    class RefusingStore(JsonStore):
-        def upsert(self, key: str, record: dict[str, Any]) -> dict[str, Any]:
-            raise StoreError("volume refused the write")
-
-    store = RefusingStore(config.data_dir)
-    store.seed()
-    buffer = io.StringIO()
-    app = create_app(
-        config.for_service(),
-        store,
-        verify_token=token_verifier(config),
-        logger=build_logger(buffer),
-        prober=prober,
-    )
-    with TestClient(app, raise_server_exceptions=False) as failing:
-        response = failing.post(
-            "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": FORGING_ACTOR}
-        )
-    captured = buffer.getvalue()
-    assert response.status_code == 503
-    assert response.json() == {"error": "could not store the assessment"}
-    audit_lines = [
-        json.loads(line)
-        for line in captured.splitlines()
-        if line.startswith("{") and '"kind":"audit"' in line
-    ]
-    assert audit_lines, f"expected an audit line, got: {captured!r}"
-    assert audit_lines[-1]["outcome"] == "error"
-    # The SANITISED label, not one that survives sanitisation unchanged. Asserting "ops.lead"
-    # here left the handler's sanitise_actor call unpinned: removing it kept the suite green.
-    assert audit_lines[-1]["actor"] == sanitise_actor(FORGING_ACTOR)
-    assert "\n" not in audit_lines[-1]["actor"]
-    assert len(audit_lines[-1]["actor"]) == MAX_ACTOR_LENGTH
+    with build_client(config, quiet_logger, global_limiter=RateLimiter(1, 60.0)) as limited:
+        assert limited.get("/diagnostics", headers=AUTH).status_code == 200
+        assert limited.get("/diagnostics", headers=AUTH).status_code == 429
+        for path in LIVENESS_PATHS:
+            assert limited.get(path).status_code == 200, path
 
 
 def test_cors_allows_only_the_configured_origin(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     config = make_config(
         tmp_path,
@@ -1938,7 +1662,7 @@ def test_cors_allows_only_the_configured_origin(
         PREE_TEAM_TOKEN=TEST_TOKEN,
         PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
     )
-    with build_client(config, quiet_logger, prober) as cors_client:
+    with build_client(config, quiet_logger) as cors_client:
         allowed = cors_client.get("/healthz", headers={"Origin": "https://pree.apps.bluestaq.com"})
         denied = cors_client.get("/healthz", headers={"Origin": "https://evil.example"})
     assert allowed.headers["access-control-allow-origin"] == "https://pree.apps.bluestaq.com"
@@ -1946,7 +1670,7 @@ def test_cors_allows_only_the_configured_origin(
 
 
 def test_a_rate_limited_response_still_carries_cors_headers(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     """CORS must wrap the limiter, or a browser client cannot read the 429 or its Retry-After."""
     origin = "https://pree.apps.bluestaq.com"
@@ -1956,15 +1680,15 @@ def test_a_rate_limited_response_still_carries_cors_headers(
         PREE_TEAM_TOKEN=TEST_TOKEN,
         PREE_ALLOWED_ORIGIN=origin,
     )
-    with build_client(config, quiet_logger, prober, global_limiter=RateLimiter(1, 60.0)) as limited:
-        limited.get("/v1/assessments/a:b", headers={**AUTH, "Origin": origin})
-        blocked = limited.get("/v1/assessments/a:b", headers={**AUTH, "Origin": origin})
+    with build_client(config, quiet_logger, global_limiter=RateLimiter(1, 60.0)) as limited:
+        limited.get("/diagnostics", headers={**AUTH, "Origin": origin})
+        blocked = limited.get("/diagnostics", headers={**AUTH, "Origin": origin})
     assert blocked.status_code == 429
     assert blocked.headers["access-control-allow-origin"] == origin
 
 
 def test_the_interactive_docs_are_not_served_in_production(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     """They exposed the whole route table, every field range and the token header name to an
     unauthenticated caller, and /docs loaded a floating-tag CDN script onto the app origin:
@@ -1975,7 +1699,7 @@ def test_the_interactive_docs_are_not_served_in_production(
         PREE_TEAM_TOKEN=TEST_TOKEN,
         PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
     )
-    with build_client(config, quiet_logger, prober) as production:
+    with build_client(config, quiet_logger) as production:
         for path in ("/openapi.json", "/docs", "/redoc"):
             assert production.get(path).status_code == 404, path
             assert production.get(path, headers=AUTH).status_code == 404, path
@@ -1998,7 +1722,7 @@ def test_the_interactive_docs_remain_available_in_development(client: TestClient
 def test_every_response_carries_the_hardening_headers(
     client: TestClient, header: str, expected: str
 ) -> None:
-    for path in ("/healthz", "/v1/assessments/none:none"):
+    for path in ("/healthz", "/diagnostics"):
         response = client.get(path, headers=AUTH)
         assert expected in response.headers[header], f"{path} is missing {header}"
 
@@ -2018,71 +1742,8 @@ def test_the_hardening_headers_survive_a_rejection(client: TestClient) -> None:
     assert too_large.headers["x-content-type-options"] == "nosniff"
 
 
-def test_a_real_storage_refusal_returns_503_and_audits_the_action(
-    tmp_path: Path, prober: StorageProber, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The documented first-deploy state: a root-owned mount refusing every write.
-
-    Injecting at the filesystem rather than stubbing `upsert` is the point. The store used to
-    raise bare OSError from four call sites, so this produced a framework 500 with no audit
-    line, while the security policy claimed a generic error and an audit line for this state.
-    """
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    store = JsonStore(config.data_dir)
-    store.seed()
-    buffer = io.StringIO()
-    app = create_app(
-        config.for_service(),
-        store,
-        verify_token=token_verifier(config),
-        logger=build_logger(buffer),
-        prober=prober,
-    )
-
-    def refuse(*_: object, **__: object) -> object:
-        raise PermissionError(13, "permission denied")
-
-    with TestClient(app, raise_server_exceptions=False) as failing:
-        monkeypatch.setattr(Path, "open", refuse)
-        response = failing.post(
-            "/v1/assess", json=FULL_BODY, headers={**AUTH, "x-pree-actor": FORGING_ACTOR}
-        )
-        monkeypatch.undo()
-    assert response.status_code == 503
-    assert response.json() == {"error": "could not store the assessment"}
-    audits = [
-        json.loads(line)
-        for line in buffer.getvalue().splitlines()
-        if line.startswith("{") and '"kind":"audit"' in line
-    ]
-    assert audits, f"no audit line for a failed privileged action: {buffer.getvalue()!r}"
-    assert audits[-1]["outcome"] == "error"
-    # Asserting the SANITISED value, not a value sanitisation happens to leave alone. The
-    # earlier version used "ops.lead", which passes through unchanged, so removing the
-    # sanitiser call from the handler left the whole suite green.
-    assert audits[-1]["actor"] == sanitise_actor(FORGING_ACTOR)
-
-
-def test_the_storage_state_is_logged_once_per_transition_not_once_per_probe(
-    tmp_path: Path,
-    quiet_logger: logging.Logger,
-    prober: StorageProber,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The log-once promise in the factory's docstring, which nothing asserted."""
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    with build_client(config, quiet_logger, prober) as probing:
-        capsys.readouterr()
-        for _ in range(3):
-            probing.get(STORAGE_PROBE_PATH)
-        printed = capsys.readouterr().out
-    transitions = [line for line in printed.splitlines() if line.startswith("pree storage ")]
-    assert len(transitions) == 1, f"expected one transition line, got {transitions}"
-    assert "pree storage ready" in transitions[0]
-
-
 def test_the_csp_exemption_cannot_reach_production(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     """The one load-bearing guard in the headers middleware that nothing pinned.
 
@@ -2095,18 +1756,11 @@ def test_the_csp_exemption_cannot_reach_production(
         PREE_TEAM_TOKEN=TEST_TOKEN,
         PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
     )
-    with build_client(config, quiet_logger, prober) as production:
+    with build_client(config, quiet_logger) as production:
         for path in ("/openapi.json", "/docs", "/redoc"):
             response = production.get(path)
             assert response.status_code == 404, path
             assert "default-src 'none'" in response.headers["content-security-policy"], path
-
-
-def test_the_diagnostics_read_out_reports_whether_the_data_dir_was_configured(
-    client: TestClient,
-) -> None:
-    body = client.get("/diagnostics", headers=AUTH).json()
-    assert body["data_dir_was_configured"] is True
 
 
 def test_the_liveness_contract_is_exactly_the_five_documented_paths() -> None:
@@ -2121,7 +1775,7 @@ def test_the_liveness_contract_is_exactly_the_five_documented_paths() -> None:
 
 
 def test_the_liveness_routes_never_occupy_the_shared_request_threadpool(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     """Each documented path must exist AND be served by a coroutine.
 
@@ -2136,14 +1790,10 @@ def test_the_liveness_routes_never_occupy_the_shared_request_threadpool(
     Mount path Starlette normalises to "" so the walk never saw its handlers.
     """
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    store = JsonStore(config.data_dir)
-    store.seed()
     app = create_app(
         config.for_service(),
-        store,
         verify_token=token_verifier(config),
         logger=quiet_logger,
-        prober=prober,
     )
     by_path = {
         getattr(route, "path", ""): route
@@ -2163,13 +1813,13 @@ def test_the_liveness_routes_never_occupy_the_shared_request_threadpool(
 
 
 def test_every_documented_liveness_path_is_exempt_from_rate_limiting(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
+    tmp_path: Path, quiet_logger: logging.Logger
 ) -> None:
     """The exemption is derived from LIVENESS_PATHS, so it shrank silently along with it."""
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    with build_client(config, quiet_logger, prober, global_limiter=RateLimiter(1, 60.0)) as limited:
-        assert limited.get("/v1/assessments/a:b", headers=AUTH).status_code == 404
-        assert limited.get("/v1/assessments/a:b", headers=AUTH).status_code == 429
+    with build_client(config, quiet_logger, global_limiter=RateLimiter(1, 60.0)) as limited:
+        assert limited.get("/diagnostics", headers=AUTH).status_code == 200
+        assert limited.get("/diagnostics", headers=AUTH).status_code == 429
         for path in sorted(EXPECTED_LIVENESS_PATHS):
             assert limited.get(path).status_code == 200, f"{path} was metered"
 
@@ -2269,15 +1919,16 @@ def _middleware_stack(app: Any) -> tuple[tuple[str, str | None], ...]:
 # WebSocketRequestValidationError is Starlette's own default, present because FastAPI registers
 # it on every app; HTTPException is the base the StarletteHTTPException handler binds to.
 # BY IDENTITY, not by name. The first version pinned bare `__name__` strings, and two different
-# exception types can share a name: registering a second, differently-typed `StoreError` left the
-# name set exactly equal to the five pinned entries. The type objects themselves cannot collide.
+# exception types can share a name: registering a second handler whose type merely shared a name
+# with a pinned one left the name set exactly equal to the pinned entries, and the duplicate went
+# unseen. The type objects themselves cannot collide. (The example that found this was a second
+# `StoreError`; the store is gone, the lesson is not.)
 EXPECTED_EXCEPTION_HANDLERS = frozenset(
     {
         StarletteHTTPException,
         RequestValidationError,
         WebSocketRequestValidationError,
         AuthError,
-        StoreError,
     }
 )
 
@@ -2341,14 +1992,6 @@ EXPECTED_SERVED_ROUTES: dict[str, tuple[tuple[Any, ...], ...]] = {
         ("APIRoute", "/ping", ("GET", "HEAD"), *_LIVENESS, False),
         (
             "APIRoute",
-            "/healthz/storage",
-            ("GET",),
-            "pree.app",
-            "register_health_routes.<locals>.storage_health",
-            False,
-        ),
-        (
-            "APIRoute",
             "/diagnostics",
             ("GET",),
             "pree.app",
@@ -2361,14 +2004,6 @@ EXPECTED_SERVED_ROUTES: dict[str, tuple[tuple[Any, ...], ...]] = {
             ("POST",),
             "pree.app",
             "register_api_routes.<locals>.create_assessment",
-            True,
-        ),
-        (
-            "APIRoute",
-            "/v1/assessments/{key}",
-            ("GET",),
-            "pree.app",
-            "register_api_routes.<locals>.read_assessment",
             True,
         ),
     ),
@@ -2787,57 +2422,6 @@ def test_the_unauthenticated_paths_on_the_listener_disclose_nothing(tmp_path: Pa
             assert not complaints, f"header findings: {complaints}"
 
 
-def test_the_storage_failure_body_discloses_the_errno_and_nothing_else(tmp_path: Path) -> None:
-    """The 503 branch, which no test had ever reached.
-
-    Storage is writable under test, so `/healthz/storage` was only ever seen at 200 and the failure
-    branch of `as_body()` was an unasserted disclosure surface on an unauthenticated path: one added
-    key returned the raw token to any caller with the suite green and zero statement misses. The
-    directory appears here deliberately, because a screenshot of this 503 is meant to be a complete
-    diagnosis, so the key set is pinned WITH `data_dir` rather than against it.
-    """
-    unwritable = tmp_path / "sealed"
-    unwritable.mkdir()
-    blocker = unwritable / "data"
-    blocker.write_text("not a directory\n", encoding="utf-8")
-    previous = dict(os.environ)
-    os.environ.update(
-        {
-            "PREE_ENV": "production",
-            "PREE_DATA_DIR": str(blocker / "nested"),
-            "PREE_BUILD_ID": "storage-failure",
-            "PREE_TEAM_TOKEN": PRODUCTION_TOKEN,
-            "PREE_ALLOWED_ORIGIN": "https://pree.apps.bluestaq.com",
-        }
-    )
-    try:
-        app = build()
-    finally:
-        os.environ.clear()
-        os.environ.update(previous)
-    with TestClient(app) as probe:
-        response = probe.get(STORAGE_PROBE_PATH, follow_redirects=False)
-    assert response.status_code == 503, (
-        f"a data directory under a regular file answered {response.status_code}; the failure "
-        "branch of the storage body is unreachable and therefore unasserted"
-    )
-    body = response.json()
-    duration = body.pop("probe_duration_ms", None)
-    assert body == {
-        "status": "unready",
-        "storage_writable": False,
-        "errno": errno.ENOTDIR,
-        "errno_name": "ENOTDIR",
-        "probe_timeout_ms": 1500,
-        "data_dir": str(blocker / "nested"),
-    }, f"the 503 body is {body}"
-    assert isinstance(duration, int) and 0 <= duration < 1500, (
-        f"the 503 reports a probe duration of {duration}"
-    )
-    assert PRODUCTION_TOKEN not in response.text, "the 503 body carries the team token"
-    assert not _header_findings(response, PRODUCTION_TOKEN, "storage 503")
-
-
 def test_every_request_handling_surface_of_the_built_app_is_pinned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2941,7 +2525,7 @@ def test_every_route_outside_the_probe_set_carries_the_token_gate(client: TestCl
             f"{sorted(_dependency_names(route))}"
         )
         checked += 1
-    assert checked == 3, f"expected three gated routes, walked {checked}"
+    assert checked == 2, f"expected two gated routes, walked {checked}"
 
 
 # The fields each audit record kind may carry. Pinned because nothing pinned them: a record is a
@@ -3091,16 +2675,15 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
         "validation_reject",
         "http_reject",
         "cors_reject",
-        "store_error",
     ),
-    "action": _OneOf("assess", "read_assessment"),
+    "action": _OneOf("assess"),
     # DERIVED from the shipped scrub rather than restated beside it. A hand-written charset admitted
     # ASCII only while `_UNSAFE_LOG_CHARS` uses `\w`, so a legitimate operator name in a non-Latin
     # script would have failed a pin claiming to describe the application.
     "actor": _ACTOR_SCRUBBED,
     # The five outcomes the application actually emits. "created" and "refused" were here and
     # produced by nothing, which is a standing exemption rather than a pin.
-    "outcome": _OneOf("ok", "error", "disclosed", "not_modified", "not_found"),
+    "outcome": _OneOf("ok"),
     # A LITERAL set, checked against the enum by a meta-assertion below rather than derived from
     # it: derived would move with any mutation of the enum, and a literal alone drifts silently.
     # This pin was wrong in two directions at once. It permitted `medium`, which
@@ -3110,9 +2693,9 @@ AUDIT_STRING_VALUES: dict[str, _ValueRule] = {
     # omission; the phantom entry was beside it.
     "confidence": _OneOf("high", "moderate", "low", "insufficient"),
     # The APPLICATION's own pattern. A hand-written charset admitted roughly 113 characters of
-    # appended hex, so the token's hex appended to the audit key passed. STORE_KEY_PATTERN requires
+    # appended hex, so the token's hex appended to the audit key passed. AUDIT_KEY_PATTERN requires
     # exactly one colon with each half at most 64 characters, so an appended encoding overflows it.
-    "key": _Pattern(STORE_KEY_PATTERN),
+    "key": _Pattern(AUDIT_KEY_PATTERN),
     # The charset the application can EMIT after scrubbing, not the wider printable range. The
     # wider one admitted characters the scrub removes, so a reader concluded the separator was
     # preserved when it was being deleted, and a slash-preserving change to the scrub was
@@ -3192,7 +2775,6 @@ EXPECTED_AUDIT_KEYS: dict[str, set[str]] = {
     # printable characters on a record any unauthenticated caller triggers with one refused
     # preflight. Measured: base64 of the team token in that field, the whole suite green.
     "cors_reject": {"kind", "path", "had_query", "origin_allowed"},
-    "store_error": {"kind", "path", "had_query", "reason"},
 }
 
 
@@ -3257,9 +2839,7 @@ def _drive_every_error_shape(probe: TestClient, record: _Recorder) -> None:
     )
 
 
-def _exercise_every_surface(
-    tmp_path: Path, prober: StorageProber
-) -> tuple[list[str], list[str], str, int]:
+def _exercise_every_surface(tmp_path: Path) -> tuple[list[str], list[str], str, int]:
     """Drive every response shape and every log channel once, and return what came back.
 
     A helper rather than a test, because the two controls it feeds are separate: nothing may
@@ -3290,7 +2870,7 @@ def _exercise_every_surface(
         PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
     )
     logger = build_logger(stream)
-    with build_client(config, logger, prober) as probe:
+    with build_client(config, logger) as probe:
         # Every request timed, by wrapping the one method the others call through. The slowest
         # single request is the honest ceiling for a per-request duration field: bounding it by the
         # whole exercise's elapsed time left about 7.5 bits a record, so `token[i] % 128` still
@@ -3336,20 +2916,14 @@ def _exercise_every_surface(
         created = probe.post("/v1/assess", headers=AUTH, json=FULL_BODY)
         assert created.status_code == 200, created.text
         record(created, "assess success")
-        # The store key is `<asset>:<candidate>`, which the response does not echo.
-        key = f"{FULL_BODY['protected_asset_id']}:{FULL_BODY['candidate_id']}"
-        read = probe.get(f"/v1/assessments/{key}", headers=AUTH)
-        assert read.status_code == 200, read.text
-        record(read, "read success")
-        # And the CONDITIONAL read, whose 304 branch sets its own headers and was outside every
-        # header pin: a raw token header there shipped undetected because nothing in the suite sent
-        # an If-None-Match while reading headers.
-        conditional = probe.get(
-            f"/v1/assessments/{key}",
-            headers={**AUTH, "if-none-match": read.headers["etag"]},
-        )
-        assert conditional.status_code == 304, conditional.status_code
-        record(conditional, "304 read")
+        # The read route and its conditional 304 branch were driven here too. Both are gone with
+        # the store, so the surfaces this exercise walks are the ones the service still serves.
+        # The 304 branch is worth a note rather than silent deletion: it set its own headers and
+        # sat outside every header pin, which is how a raw token header there once shipped
+        # undetected. Any future route that writes its own headers needs driving here.
+        gated_read = probe.get("/diagnostics", headers=AUTH)
+        assert gated_read.status_code == 200, gated_read.text
+        record(gated_read, "diagnostics success")
         # A refused preflight, which produces the `cors_reject` record.
         refused = probe.options(
             "/v1/assess",
@@ -3360,26 +2934,16 @@ def _exercise_every_surface(
         )
         assert refused.status_code == 400, refused.status_code
         record(refused, "cors reject")
-        # And a store failure, which produces the `store_error` record. Injected by making the
-        # snapshot unreadable rather than by patching, so the real error path runs.
-        snapshot = config.data_dir / "assessments.json"
-        snapshot.write_text("{ not json at all", encoding="utf-8")
-        (config.data_dir / "assessments.json.bak").write_text("also not json", encoding="utf-8")
-        broken = probe.get(f"/v1/assessments/{key}", headers=AUTH)
-        assert broken.status_code == 503, f"a corrupt snapshot answered {broken.status_code}"
-        record(broken, "store error")
     return bodies, leaked_headers, stream.getvalue(), max(timings, default=0)
 
 
-def test_the_team_token_reaches_no_response_body_header_or_log_record(
-    tmp_path: Path, prober: StorageProber
-) -> None:
+def test_the_team_token_reaches_no_response_body_header_or_log_record(tmp_path: Path) -> None:
     """The credential is compared, never echoed, never logged, in any channel.
 
     /diagnostics reports the token's LENGTH and whether it is set, deliberately, so a caller can
     confirm the deployment without learning the value.
     """
-    bodies, leaked_headers, log, _slowest = _exercise_every_surface(tmp_path, prober)
+    bodies, leaked_headers, log, _slowest = _exercise_every_surface(tmp_path)
     leaked = [body for body in bodies if TEST_TOKEN in body]
     assert not leaked, f"a response body carried the team token: {leaked}"
     assert not leaked_headers, (
@@ -3690,7 +3254,7 @@ PERMITTED_AUDIT_CONFIG_READ = ("origin_allowed", "allowed_origin")
 # Every `config.<attribute>` the HTTP layer reads, pinned exactly. A new one is a named failure a
 # reviewer sees in the diff, which is the point: this list is short because the layer needs little,
 # and `team_token` is deliberately not on it.
-EXPECTED_CONFIG_READS = frozenset({"allowed_origin", "is_production", "data_dir"})
+EXPECTED_CONFIG_READS = frozenset({"allowed_origin", "is_production"})
 
 
 def test_every_boolean_audit_field_names_a_test_that_correlates_it() -> None:
@@ -4810,57 +4374,6 @@ def test_the_armed_guard_never_emits_what_the_disarmed_process_would_not() -> No
     )
 
 
-def test_the_audit_reason_field_is_bounded(tmp_path: Path, prober: StorageProber) -> None:
-    """`MAX_LOGGED_REASON` truncation, driven through the handler that applies it.
-
-    A review found removing `[:MAX_LOGGED_REASON]` left the suite green, and a first attempt at
-    fixing that asserted the CONSTANT and a synthetic slice - which held nothing, because the code
-    path was never entered. My own canary caught it: the mutation stayed green.
-
-    The input is reachable, which is why the cap is worth keeping rather than deleting like the
-    three dead defensive branches this module has shed. `app.py` records that both reason strings
-    are server-composed, and that is true of the CLIENT: `AuthError` carries a fixed literal and
-    `StoreError` embeds the configured data path. But the configured path is operator-supplied, so a
-    long `PREE_DATA_DIR` - or any future store message that grows - reaches this bound without a
-    caller doing anything. A `StoreError` whose message exceeds the cap is exactly that shape.
-    """
-    config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    overlong = "a store failure whose text runs past the cap " + "x" * (MAX_LOGGED_REASON * 2)
-
-    class VerboseStore(JsonStore):
-        def upsert(self, key: str, record: dict[str, Any]) -> dict[str, Any]:
-            raise StoreError(overlong)
-
-    store = VerboseStore(config.data_dir)
-    store.seed()
-    buffer = io.StringIO()
-    app = create_app(
-        config.for_service(),
-        store,
-        verify_token=token_verifier(config),
-        logger=build_logger(buffer),
-        prober=prober,
-    )
-    with TestClient(app) as failing:
-        response = failing.post(
-            "/v1/assess",
-            json={"protected_asset_id": "a1", "candidate_id": "b1", "indicators": {}},
-            headers=AUTH,
-        )
-
-    assert response.status_code == 503
-    records = [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
-    store_errors = [record for record in records if record.get("kind") == "store_error"]
-    assert len(store_errors) == 1, f"expected one store_error record: {records}"
-    reason = store_errors[0]["reason"]
-    assert len(overlong) > MAX_LOGGED_REASON, "the fixture does not exceed the cap"
-    assert len(reason) == MAX_LOGGED_REASON, (
-        f"the audit reason is {len(reason)} characters against a cap of {MAX_LOGGED_REASON}, so an "
-        f"operator-supplied path length reaches the audit line unbounded"
-    )
-    assert reason == overlong[:MAX_LOGGED_REASON], "the reason is not the head of the message"
-
-
 def test_the_cors_method_and_header_allowlists_are_the_narrow_ones(tmp_path: Path) -> None:
     """Both CORS allowlists, pinned as VALUES on the built middleware.
 
@@ -4877,24 +4390,14 @@ def test_the_cors_method_and_header_allowlists_are_the_narrow_ones(tmp_path: Pat
         PREE_TEAM_TOKEN=PRODUCTION_TOKEN,
         PREE_ALLOWED_ORIGIN="https://pree.apps.bluestaq.com",
     )
-    store = JsonStore(config.data_dir)
-    store.seed()
-    prober = StorageProber(cache_seconds=0.0)
-    try:
-        app = create_app(
-            config.for_service(),
-            store,
-            verify_token=token_verifier(config),
-            logger=build_logger(io.StringIO()),
-            prober=prober,
-        )
-        # Matched by NAME, not identity: starlette types `Middleware.cls` as a factory protocol,
-        # so mypy rejects both `is` and an attribute read on it. The name is the stable property.
-        cors = [
-            m for m in app.user_middleware if getattr(m.cls, "__name__", "") == "CORSMiddleware"
-        ]
-    finally:
-        prober.shutdown()
+    app = create_app(
+        config.for_service(),
+        verify_token=token_verifier(config),
+        logger=build_logger(io.StringIO()),
+    )
+    # Matched by NAME, not identity: starlette types `Middleware.cls` as a factory protocol,
+    # so mypy rejects both `is` and an attribute read on it. The name is the stable property.
+    cors = [m for m in app.user_middleware if getattr(m.cls, "__name__", "") == "CORSMiddleware"]
 
     assert len(cors) == 1, f"expected exactly one CORS middleware, found {len(cors)}"
     options = cors[0].kwargs
@@ -4989,18 +4492,14 @@ def test_the_shipped_rate_limits_are_the_ones_a_deployed_pod_enforces() -> None:
     )
 
     config = make_config(Path(tempfile.mkdtemp()), PREE_TEAM_TOKEN=TEST_TOKEN)
-    prober = StorageProber(cache_seconds=0.0)
-    try:
-        # NO limiter injected, which is the whole point: `build_client` passes none, so the app
-        # constructs both tiers from the shipped constants exactly as `main.build()` does.
-        with build_client(config, build_logger(io.StringIO()), prober) as client:
-            body = {"protected_asset_id": "a1", "candidate_id": "b1", "indicators": {}}
-            statuses = [
-                client.post("/v1/assess", json=body, headers=AUTH).status_code
-                for _ in range(ACTOR_LIMIT + 1)
-            ]
-    finally:
-        prober.shutdown()
+    # NO limiter injected, which is the whole point: `build_client` passes none, so the app
+    # constructs both tiers from the shipped constants exactly as `main.build()` does.
+    with build_client(config, build_logger(io.StringIO())) as client:
+        body = {"protected_asset_id": "a1", "candidate_id": "b1", "indicators": {}}
+        statuses = [
+            client.post("/v1/assess", json=body, headers=AUTH).status_code
+            for _ in range(ACTOR_LIMIT + 1)
+        ]
 
     assert statuses[:ACTOR_LIMIT] == [200] * ACTOR_LIMIT, (
         f"the shipped per-actor limiter refused a request inside its own window: {statuses}"
@@ -5224,7 +4723,6 @@ EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
             "__future__",
             "collections",
             "fastapi",
-            "hashlib",
             "json",
             "logging",
             "starlette",
@@ -5238,39 +4736,12 @@ EXPECTED_MODULE_IMPORTS: dict[str, frozenset[str]] = {
     # worse than the hole it closes. `collections` left with the record-scanning layer that needed a
     # callback type, which is the kind of subtraction a removed layer should produce.
     "audit.py": frozenset({"__future__", "contextlib", "json", "logging", "sys", "typing"}),
-    "config.py": frozenset({"__future__", "dataclasses", "os", "pathlib", "re"}),
-    "health.py": frozenset(
-        {
-            "__future__",
-            "collections",
-            "concurrent",
-            "dataclasses",
-            "errno",
-            "os",
-            "pathlib",
-            "threading",
-            "time",
-            "typing",
-        }
-    ),
+    "config.py": frozenset({"__future__", "dataclasses", "os", "re"}),
+    "health.py": frozenset({"__future__", "os", "typing"}),
     "main.py": frozenset({"__future__", "fastapi"}),
     "ratelimit.py": frozenset({"__future__", "collections", "threading", "time"}),
     "scoring.py": frozenset({"__future__", "dataclasses", "enum"}),
     "security.py": frozenset({"__future__", "collections", "hmac", "re"}),
-    "store.py": frozenset(
-        {
-            "__future__",
-            "collections",
-            "contextlib",
-            "fcntl",
-            "json",
-            "os",
-            "pathlib",
-            "shutil",
-            "tempfile",
-            "typing",
-        }
-    ),
 }
 
 
@@ -5970,9 +5441,7 @@ def test_every_audit_value_rule_can_actually_reject_something() -> None:
     )
 
 
-def test_every_audit_record_matches_its_pinned_shape_and_values(
-    tmp_path: Path, prober: StorageProber
-) -> None:
+def test_every_audit_record_matches_its_pinned_shape_and_values(tmp_path: Path) -> None:
     """A log line is a disclosure channel with no body and no header.
 
     Nothing in this suite pinned an audit record's fields until recently, and then the field list
@@ -5990,7 +5459,7 @@ def test_every_audit_record_matches_its_pinned_shape_and_values(
     route, every method, three token states and six error shapes, so a condition it misses has to
     be one no ordinary caller can reach either.
     """
-    _, _, log, slowest_ms = _exercise_every_surface(tmp_path, prober)
+    _, _, log, slowest_ms = _exercise_every_surface(tmp_path)
     emitted = [json.loads(line) for line in log.splitlines() if line.strip()]
     # The SLOWEST SINGLE REQUEST, not the whole exercise. No handler can have taken longer than the
     # request that contained it. The residual is honest and worth stating in bits rather than

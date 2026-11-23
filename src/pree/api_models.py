@@ -18,6 +18,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# The version stamp carried on every assessment response. It lived in the store module until
+# the store was removed; it is an API contract, not a persistence detail, so it belongs here.
+SCHEMA_VERSION = 1
+
 MAX_ID_LENGTH = 64
 ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 

@@ -11,9 +11,7 @@ from fastapi.testclient import TestClient
 
 from pree.app import create_app
 from pree.config import Config, load_config
-from pree.health import StorageProber
 from pree.security import token_verifier
-from pree.store import JsonStore
 
 # At least MIN_PRODUCTION_TOKEN_LENGTH characters, so the production configurations the
 # suite builds are ones the app would actually accept.
@@ -29,7 +27,6 @@ def make_config(tmp_path: Path, **overrides: object) -> Config:
     """Build a config through the real loader so validation is exercised, not bypassed."""
     env = {
         "PREE_ENV": "development",
-        "PREE_DATA_DIR": str(tmp_path / "data"),
         "PREE_BUILD_ID": "test-build",
     }
     env.update({k: str(v) for k, v in overrides.items()})
@@ -45,50 +42,34 @@ def quiet_logger() -> logging.Logger:
     return logger
 
 
-@pytest.fixture
-def prober() -> Iterator[StorageProber]:
-    pool = StorageProber(cache_seconds=0.0)
-    yield pool
-    pool.shutdown()
-
-
 def build_client(
     config: Config,
     logger: logging.Logger,
-    pool: StorageProber,
     **deps: object,
 ) -> TestClient:
-    """Mount the app in-process through the factory, with the store seeded."""
-    store = JsonStore(config.data_dir)
-    store.seed()
+    """Mount the app in-process through the factory. The service holds no state."""
     app = create_app(
         config.for_service(),
-        store,
         verify_token=token_verifier(config),
         logger=logger,
-        prober=pool,
         **deps,  # type: ignore[arg-type]
     )
     return TestClient(app)
 
 
 @pytest.fixture
-def client(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
-) -> Iterator[TestClient]:
+def client(tmp_path: Path, quiet_logger: logging.Logger) -> Iterator[TestClient]:
     """The app with a token configured, so the gate is on."""
     config = make_config(tmp_path, PREE_TEAM_TOKEN=TEST_TOKEN)
-    with build_client(config, quiet_logger, prober) as test_client:
+    with build_client(config, quiet_logger) as test_client:
         yield test_client
 
 
 @pytest.fixture
-def open_client(
-    tmp_path: Path, quiet_logger: logging.Logger, prober: StorageProber
-) -> Iterator[TestClient]:
+def open_client(tmp_path: Path, quiet_logger: logging.Logger) -> Iterator[TestClient]:
     """The app with no token configured: single-user local mode, auth off by design."""
     config = make_config(tmp_path)
-    with build_client(config, quiet_logger, prober) as test_client:
+    with build_client(config, quiet_logger) as test_client:
         yield test_client
 
 
