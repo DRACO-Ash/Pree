@@ -29,7 +29,6 @@ least once in review.
 - Body cap before the token gate: `src/pree/app.py` (`MAX_BODY_BYTES`) -> `tests/test_api.py::test_an_oversize_body_is_rejected_before_the_token_gate`
 - Narrow CORS allowlists: `src/pree/app.py` -> `tests/test_api.py::test_the_cors_method_and_header_allowlists_are_the_narrow_ones`
 - Limiter charges every key, never short-circuits: `src/pree/app.py` (`_first_refused`) -> `tests/test_api.py::test_a_refused_key_still_charges_every_other_bucket`
-- Store merge never shrinks: `src/pree/store.py` -> `tests/test_store.py::test_merge_never_deletes_a_key_the_update_omitted`
 - Fail-closed origin shape: `src/pree/config.py` -> `tests/test_config.py::test_an_origin_that_is_not_a_concrete_origin_is_refused_in_any_environment`
 - Credential output guard on the named streams: `src/pree/audit.py` -> `tests/test_api.py::test_the_runtime_guard_refuses_the_channels_it_covers`
 - No handler that serialises a record reaches the process: `src/pree/audit.py` -> `tests/test_api.py::test_no_serialising_handler_reaches_the_process_registry`
@@ -53,17 +52,26 @@ least once in review.
 - Health: `GET /` -> 200 with `{"status":"ok","service":"pree","version":"0.1.0"}`, not a 302.
 - Liveness paths: `/`, `/healthz`, `/readyz`, `/livez`, `/ping`, all 200 and unauthenticated,
   touching nothing. Readiness probe: `/readyz`.
-- Storage proof: `/healthz/storage`, a SEPARATE path, so a hung mount cannot hang a liveness
-  probe. Returns 503 with `"errno_name": "EACCES"` when the mount is not writable.
+- NO storage proof, and no storage. `/healthz/storage` and the whole store are gone: the
+  platform's file storage is a mountpoint-s3 mount with no POSIX advisory locking, so the
+  store's `flock` would silently do nothing and a second worker would erase the first. See
+  `docs/APPSTORE-REDESIGN.md`. The container HEALTHCHECK probes `/healthz`.
 - **DIVERGENCE FROM THE KIT TEMPLATE, deliberate.** The template states "Starts with no
   credentials (DAST runs unauthenticated): degraded mode, warning log, no crash". Pree does the
-  opposite in production and this is a hard rule, not an oversight: with `PREE_ENV=production` and
-  no `PREE_TEAM_TOKEN` it REFUSES TO START (`src/pree/config.py`, `_validate_production_auth`), because with no token the
-  gate is open and the store would be readable and writable by anything reaching the ingress. It
-  also refuses a token under 32 characters, a token built from repetition, a wildcard, `null` or a
-  comma-list origin, and a cleartext origin in production. In development it starts without a
+  opposite in production and this is a hard rule: with `PREE_ENV=production` and no
+  `PREE_TEAM_TOKEN` it REFUSES TO START (`src/pree/config.py`, `_validate_production_auth`). It
+  also refuses a token under 32 characters, a token built from repetition, a wildcard, `null` or
+  a comma-list origin, and a cleartext origin in production. In development it starts without a
   token. If the App Store's DAST stage requires an unauthenticated boot, that is a conflict to
   resolve with the platform, not by weakening the boot check.
+- **Authorisation is the platform's, with the token as fallback.** `X-Auth-Request-Role` gates:
+  `VIEWER` reads, `EDITOR` and above write. Compared by RANK, never by name. An unrecognised
+  role ranks as `VIEWER`; an EMPTY role is anonymous and below every gate, which is what a
+  PUBLIC app sends on every request. A present-but-insufficient role is refused outright and
+  never falls back to the token. Only `X-Auth-Request-Role` and `X-Auth-Request-Sub` are read:
+  a header the platform does not set passes through from the client unchanged.
+- **The audit `actor` is `X-Auth-Request-Sub`**, not a caller-supplied label. It was
+  `x-pree-actor` until this release, which meant every line named whatever the caller typed.
 - Log format: one line of JSON per privileged action on stdout, keys `kind`, `action`, `actor`,
   `outcome`, `duration_ms`, plus `key` where applicable. Access log is gunicorn's, with a
   truncating filter attached to `uvicorn.access` and `gunicorn.access`.
@@ -84,7 +92,8 @@ least once in review.
 - `manoeuvres_in_window`: a count. `baseline_manoeuvres`: a count, as a float.
 - `photometric_sigma`: standard deviations from the object's own baseline, signed; the scorer uses
   the absolute value.
-- `probe_duration_ms`, `probe_timeout_ms`, `duration_ms`: milliseconds.
+- `duration_ms`: milliseconds. (`probe_duration_ms` and `probe_timeout_ms` went with
+  the storage proof.)
 - `score`: 0 to 100. `evidence_coverage`: 0 to 1, weight present over total weight.
 
 ## Pree
@@ -132,7 +141,7 @@ Always-true conventions for this project. Procedures live in `.claude/skills/`. 
 
 ## What this project is
 
-Pree fuses orbital geometry, manoeuvre-cadence baselining, and photometric and radio-frequency signatures from the Unified Data Library (UDL) into a single explainable, confidence-tiered score that shows Protect and Defend operators which satellites hold their protected assets at risk, and why. Archetype: `server` (one of: `static` single-file or built-static artifact; `server` backed container application). Deployment target: the Bluestaq App Store at `pree.apps.bluestaq.com`, detected template `python` (a `requirements.txt` and a root `Dockerfile` are both present, so it is the quality-gated `python` container template, not `docker-only`).
+Pree fuses orbital geometry, manoeuvre-cadence baselining, and photometric and radio-frequency signatures from the Unified Data Library (UDL) into a single explainable, confidence-tiered score that shows Protect and Defend operators which satellites hold their protected assets at risk, and why. Archetype: `server` (one of: `static` single-file or built-static artifact; `server` backed container application). Deployment target: the Bluestaq App Store at `pree.appstore.bluestaq.com`, detected template `python` (a `requirements.txt` and a root `Dockerfile` are both present, so it is the quality-gated `python` container template, not `docker-only`).
 
 ## Hard rules (never violate)
 
@@ -151,7 +160,7 @@ Pree fuses orbital geometry, manoeuvre-cadence baselining, and photometric and r
 
 **Server archetype**
 - **The container is the whole build.** A single `Dockerfile` installs from the hash-locked `requirements.txt` and runs the server; no separate bundler output. Runs as a non-root numeric user (`10001:10001`), no setuid or setgid bits on files or directories, and the shipped stage is flattened to one layer so the image-policy scan reads no history.
-- **Listen on `PORT` from the environment, default 8080, bound to `0.0.0.0`.** Never add `ENV PORT=` or `ENV PREE_DATA_DIR=` to the Dockerfile. The two are barred for DIFFERENT reasons and the difference matters: for `PORT`, an image default shadows the code's own default so it is never reached in the container, and the image asserts a port the platform may not use; for `PREE_DATA_DIR` it genuinely defeats the platform's injection, because `load_config` prefers `PREE_DATA_DIR` over the injected `STORAGE_MOUNT_PATH`, so a baked value sends every write to the ephemeral layer. (This clause once said an image default "defeats platform injection" of both, which is false for `PORT`: a runtime value overrides image `ENV`. A rule with a wrong mechanism does not survive the first engineer who tests it.) Answer `/`, `/healthz`, `/readyz`, `/livez`, `/ping` with HTTP 200, unauthenticated, touching nothing. The storage proof is a separate path, `/healthz/storage`, so a hung mount can never hang a liveness probe.
+- **Listen on `PORT` from the environment, default 8080, bound to `0.0.0.0`.** Never add `ENV PORT=` to the Dockerfile: an image default shadows the code's own default so it is never reached in the container, and the image asserts a port the platform may not use. (This clause once said an image default "defeats platform injection", which is false: a runtime value overrides image `ENV`. A rule with a wrong mechanism does not survive the first engineer who tests it. It also once barred `ENV PREE_DATA_DIR=`, for a data directory the service no longer has.) Answer `/`, `/healthz`, `/readyz`, `/livez`, `/ping` with HTTP 200, unauthenticated, touching nothing.
 - **Secrets are server-side only.** Compare the team token in constant time (`hmac.compare_digest`, never `==`). Validate every request body at the boundary through a typed model before a handler runs; the dataset merge never silently shrinks.
 
 ## Commands (fill the ones this project uses)

@@ -19,8 +19,6 @@ from pathlib import Path
 
 import pytest
 
-from pree.app import STORAGE_PROBE_PATH
-from pree.health import StorageProbe
 from tests.test_api import EXPECTED_LIVENESS_PATHS
 
 ON_PLATFORM_RUNNER = os.environ.get("GITLAB_CI") == "true"
@@ -1377,18 +1375,19 @@ def test_no_instruction_fetches_from_the_network_or_rewrites_the_shipped_path() 
 def test_the_shipped_stage_declares_no_instruction_that_undoes_a_control() -> None:
     """HEALTHCHECK NONE, VOLUME and STOPSIGNAL all passed silently.
 
-    `HEALTHCHECK NONE` disables the storage proof that three earlier rounds treated as the
-    control keeping a pod with a broken mount out of service, and the security policy cites it
-    repeatedly. VOLUME on the data directory changes the mount semantics the store relies on.
-    STOPSIGNAL SIGKILL removes the graceful shutdown the exec form exists to preserve.
+    `HEALTHCHECK NONE` disables the only check that says whether the process is serving at all.
+    It used to probe the storage proof, which is gone with the store; the instruction still has
+    to exist and still has to name a real path. VOLUME is refused because the shipped stage
+    declares no mount, and STOPSIGNAL SIGKILL removes the graceful shutdown the exec form
+    exists to preserve.
     """
     final = _final_stage()
     checks = [i.argument for i in final if i.keyword == "HEALTHCHECK"]
     assert len(checks) == 1, f"the shipped stage declares {len(checks)} HEALTHCHECKs: {checks}"
     assert checks[0].strip().upper() != "NONE", "the shipped stage disables its HEALTHCHECK"
-    assert STORAGE_PROBE_PATH in checks[0], (
-        f"the HEALTHCHECK does not probe {STORAGE_PROBE_PATH}, so it proves nothing about "
-        f"storage: {checks[0][:120]}"
+    assert "/healthz" in checks[0], (
+        f"the HEALTHCHECK does not probe a liveness path, so it proves nothing about whether "
+        f"the process is serving: {checks[0][:120]}"
     )
     for unwanted in ("VOLUME", "STOPSIGNAL"):
         found = [i.argument for i in final if i.keyword == unwanted]
@@ -2039,94 +2038,8 @@ def test_the_where_column_of_every_control_row_points_at_a_real_file() -> None:
 # Words that legitimately appear as backticked or quoted single tokens in a probe sentence.
 # A whitelist, not a denylist: a denylist only ever catches the spellings already thought of,
 # which is how "wedged", "busy", "BUSY", "not-ready" and "degraded" each got through in turn.
-_PROBE_VOCABULARY = frozenset(
-    {
-        "status",
-        "storage_writable",
-        "errno",
-        "errno_name",
-        "data_dir",
-        "probe_duration_ms",
-        "probe_timeout_ms",
-        "ETIMEDOUT",
-        "EACCES",
-        "ENOSPC",
-        "true",
-        "false",
-        "null",
-    }
-)
+
 # Sentences that name an HTTP code for a reason other than a probe verdict.
-_CODE_EXEMPT = ("header", "carries", "redirect", "router probes the root")
-_PROBE_TERMS = ("/healthz/storage", "probe", "write proof", "readiness", "health", "status")
-
-
-def _probe_sentences(text: str) -> list[str]:
-    """Every sentence anywhere in the sheet that makes a claim about the probe.
-
-    Scoped to the whole document deliberately. Scoping to the `## Health paths` section left
-    every probe claim elsewhere unchecked, and a fabricated `## Probe behaviour under load`
-    section documenting a 204, a "degraded" status and an EBUSY errno passed untouched.
-    """
-    flat = re.sub(r"\s+", " ", text)
-    return [
-        sentence
-        for sentence in re.split(r"(?<=[.!?])\s+", flat)
-        if any(term in sentence.lower() for term in _PROBE_TERMS)
-    ]
-
-
-def test_the_deployment_sheet_documents_only_probe_behaviour_the_code_can_produce() -> None:
-    """The sheet must not describe a probe state, code, errno or header the app cannot emit.
-
-    Four earlier versions of this guard were defeated, each by a spelling or a location it did
-    not consider: a three-token denylist, a lowercase-quoted-status-only check, a scan bounded
-    to one section, and a status regex that only looked within six characters of the word
-    "status" so `wedged` and `busy` survived. This version scans the whole document, treats any
-    sentence mentioning the probe as a claim, and checks tokens against a derived allowlist.
-    """
-    emittable_status = {
-        StorageProbe(True, "/data", None, None, 1).status,
-        StorageProbe(False, "/data", 13, "EACCES", 1).status,
-    }
-    sheet = (REPO_ROOT / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
-    claims = _probe_sentences(sheet)
-    assert claims, "the sheet makes no statement about the probe at all"
-
-    allowed_tokens = emittable_status | _PROBE_VOCABULARY
-
-    unknown_words: list[str] = []
-    unexpected_codes: list[int] = []
-    for sentence in claims:
-        for token in re.findall(r"[`\"']([A-Za-z][A-Za-z_-]*)[`\"']", sentence):
-            if token not in allowed_tokens and token.lower() not in allowed_tokens:
-                unknown_words.append(token)
-        if any(exempt in sentence.lower() for exempt in _CODE_EXEMPT):
-            continue
-        for code in re.findall(r"\b([1-5][0-9]{2})\b", sentence):
-            if int(code) not in {200, 503}:
-                unexpected_codes.append(int(code))
-
-    assert not unknown_words, (
-        f"the sheet presents probe values the code cannot produce: {sorted(set(unknown_words))}; "
-        f"allowed: {sorted(allowed_tokens)}"
-    )
-    assert not unexpected_codes, (
-        f"the sheet claims HTTP codes the probe never returns: {sorted(set(unexpected_codes))}"
-    )
-
-    # Any header named anywhere in the sheet must be one the app actually sets. Matched without
-    # requiring an X- prefix, which a fabricated `Pree-Probe-State:` header slipped past.
-    app_source = (REPO_ROOT / "src" / "pree" / "app.py").read_text(encoding="utf-8")
-    named = set(re.findall(r"\b([A-Z][A-Za-z]+(?:-[A-Za-z]+)+)\s*:", sheet))
-    invented = sorted(h for h in named if h not in app_source)
-    assert not invented, f"the sheet names headers the app does not set: {invented}"
-
-    # And the retired synthesised states must not return by any spelling or in any section.
-    health_source = (REPO_ROOT / "src" / "pree" / "health.py").read_text(encoding="utf-8")
-    for retired in ("EBUSY", "indeterminate", "degraded"):
-        assert retired not in health_source, f"{retired} is back in the source; update the docs"
-        assert retired.lower() not in sheet.lower(), f"the sheet still documents {retired}"
 
 
 def test_the_documented_liveness_paths_match_the_paths_the_code_pins() -> None:

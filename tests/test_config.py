@@ -61,21 +61,6 @@ def test_blank_values_count_as_absent_not_as_configured(tmp_path: Path) -> None:
     assert config.auth_enabled is False
 
 
-def test_data_dir_prefers_explicit_then_injected_then_default(tmp_path: Path) -> None:
-    dev = {"PREE_ENV": "development"}
-    injected = str(tmp_path / "injected")
-    explicit = str(tmp_path / "explicit")
-    both = load_config({**dev, "PREE_DATA_DIR": explicit, "STORAGE_MOUNT_PATH": injected})
-    assert both.data_dir == Path(explicit)
-    assert load_config({**dev, "STORAGE_MOUNT_PATH": injected}).data_dir == Path(injected)
-    assert load_config(dev).data_dir == Path("./data").resolve()
-
-
-def test_filesystem_root_as_data_dir_is_rejected() -> None:
-    with pytest.raises(ConfigError, match="filesystem root"):
-        load_config({"PREE_ENV": "development", "PREE_DATA_DIR": "/"})
-
-
 def test_token_without_allowed_origin_refuses_to_start_in_production(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="no PREE_ALLOWED_ORIGIN"):
         load_config(
@@ -226,36 +211,6 @@ def test_a_concrete_origin_is_accepted(tmp_path: Path, good_origin: str) -> None
     assert config.allowed_origin == good_origin
 
 
-@pytest.mark.parametrize("wrapped", ['"{path}"', "'{path}'"])
-def test_a_quote_wrapped_path_is_normalised_not_taken_literally(
-    tmp_path: Path, wrapped: str
-) -> None:
-    """A pasted value arrives wrapped in the quotes that surrounded it in a document.
-
-    Taken literally, `"/data"` resolves to a directory of that name inside the working
-    directory, which the app can write to, so the store silently misses the mounted volume
-    and every restart loses the data. The fault presents as data loss, not as an error.
-    """
-    target = tmp_path / "data"
-    config = load_config({"PREE_ENV": "development", "PREE_DATA_DIR": wrapped.format(path=target)})
-    assert config.data_dir == target
-
-
-def test_a_relative_data_directory_is_refused(tmp_path: Path) -> None:
-    """resolve() makes every value absolute, so the check must run before it or never fail."""
-    with pytest.raises(ConfigError, match="absolute path"):
-        load_config({"PREE_ENV": "development", "PREE_DATA_DIR": "relative/data"})
-
-
-def test_the_local_default_is_still_permitted_when_nothing_is_configured(
-    tmp_path: Path,
-) -> None:
-    """The default is deliberately relative; only a CONFIGURED value must be absolute."""
-    config = load_config({"PREE_ENV": "development"})
-    assert config.data_dir == Path("./data").resolve()
-    assert config.data_dir_was_configured is False
-
-
 def test_a_control_character_in_a_value_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="control character"):
         load_config(
@@ -403,3 +358,26 @@ def test_production_refuses_a_cleartext_allowed_origin(tmp_path: Path) -> None:
         ).allowed_origin
         == "http://localhost:3000"
     )
+
+
+def test_a_quote_wrapped_value_is_normalised_not_taken_literally(tmp_path: Path) -> None:
+    """A pasted value keeps its quotes, and the loader strips them for every variable.
+
+    This was asserted only on the data directory, which is gone, leaving the stripping branch
+    live but unexercised. It is not specific to any one variable: `_read` normalises whatever it
+    reads, so the property is asserted here on the origin, which is the value an operator most
+    often pastes from a console. Quoted values reach the loader for real, because a console that
+    shows `"https://x"` is copied with its quotes, and a literal quote inside an origin makes
+    every CORS comparison fail closed against a site that looks correct in the sheet.
+    """
+    for quote in ('"', "'"):
+        config = load_config(
+            {
+                "PREE_ENV": "development",
+                "PREE_ALLOWED_ORIGIN": f"{quote}https://pree.appstore.bluestaq.com{quote}",
+            }
+        )
+        assert config.allowed_origin == "https://pree.appstore.bluestaq.com", (
+            f"a {quote}-wrapped origin was taken literally, so every CORS check compares against "
+            f"a value carrying quotes and refuses the real site"
+        )

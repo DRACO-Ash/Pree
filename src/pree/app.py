@@ -19,25 +19,23 @@ arbitrary payload.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
-from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
-from .api_models import AssessRequest, AssessResponse, ContributionOut
+from .api_models import SCHEMA_VERSION, AssessRequest, AssessResponse, ContributionOut
 from .audit import audit, bound_access_log, build_logger
 from .config import ServiceConfig
-from .health import StorageProbe, StorageProber, diagnostics
+from .health import diagnostics
 from .ratelimit import (
     ACTOR_LIMIT,
     ACTOR_WINDOW_SECONDS,
@@ -48,21 +46,24 @@ from .ratelimit import (
 from .scoring import ThreatIndicators, assess
 from .security import (
     MAX_ACTOR_LENGTH,
+    MIN_READ_RANK,
+    MIN_WRITE_RANK,
+    ROLE_HEADER,
+    SUB_HEADER,
     AuthError,
+    role_rank,
     sanitise_actor,
     sanitise_log_part,
     sanitise_log_path,
 )
-from .store import SCHEMA_VERSION, JsonStore, StoreError
 
 LIVENESS_PATHS = ("/", "/healthz", "/readyz", "/livez", "/ping")
-STORAGE_PROBE_PATH = "/healthz/storage"
 # Exempt from the coarse limiter. The liveness paths touch nothing and the storage probe is
 # bounded by its own hard timeout, so neither can be the expensive path the limiter protects.
 # Leaving the storage probe subject to the limiter let unauthenticated traffic drive the
 # container HEALTHCHECK to 429 and restart the pod, which is a cheaper denial of service than
 # attacking the application itself.
-UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
+UNMETERED_PATHS = LIVENESS_PATHS
 # The methods a platform probe actually uses. The exemption is for the probe, not for the path:
 # any other verb on one of these paths is ordinary traffic and is metered like any other.
 # Per PATH, because the exemption is for the probe and a path that does not serve a method is
@@ -72,13 +73,11 @@ UNMETERED_PATHS = (*LIVENESS_PATHS, STORAGE_PROBE_PATH)
 # GET /healthz, but it contradicts the reasoning used to meter preflights on these same paths.
 _PROBE_METHODS: dict[str, frozenset[str]] = {
     **{path: frozenset({"GET", "HEAD"}) for path in LIVENESS_PATHS},
-    STORAGE_PROBE_PATH: frozenset({"GET"}),
 }
 # Any header by which a proxy claims to speak for someone else. Their PRESENCE collapses the
 # rate-limit key rather than being trusted for its content.
 _FORWARD_HEADERS = frozenset({"x-forwarded-for", "forwarded", "x-real-ip", "x-client-ip"})
 GENERIC_CLIENT_ERROR = "request rejected"
-STORE_UNAVAILABLE_ERROR = "could not store the assessment"
 RATE_LIMITED_ERROR = "rate limited"
 # The only detail strings the HTTP handler will echo. Everything else, framework messages
 # included, becomes the generic error: a handler that passes through an arbitrary detail is a
@@ -87,7 +86,7 @@ RATE_LIMITED_ERROR = "rate limited"
 # Statuses that must never carry a body. h11 rejects a Content-Length on these, so returning
 # JSON for one turns the intended status into a 500.
 BODILESS_STATUSES = frozenset({204, 304})
-OWN_ERROR_DETAILS = frozenset({GENERIC_CLIENT_ERROR, STORE_UNAVAILABLE_ERROR, RATE_LIMITED_ERROR})
+OWN_ERROR_DETAILS = frozenset({GENERIC_CLIENT_ERROR, RATE_LIMITED_ERROR})
 # Generous for this schema, which is a handful of numbers and two short identifiers, and small
 # enough that an unauthenticated caller cannot exhaust memory before the token gate runs.
 MAX_BODY_BYTES = 32 * 1024
@@ -115,10 +114,15 @@ MAX_VALIDATION_ERRORS_LOGGED = 10
 # separate assertion. An earlier version of this comment claimed the test asserted the byte ratio
 # directly, and it did not.
 MAX_LOGGED_PATH = 160
-# The store key's shape, enforced at the boundary rather than assumed. Two identifiers of at
-# most 64 characters and the colon between them.
-STORE_KEY_MAX_LENGTH = 129
-STORE_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+# The AUDIT key's shape. It was the store key until the store was removed; it is now the
+# identifier written to the audit trail, derived server-side from two already-validated ids.
+# Still pinned, and still load-bearing:
+# `test_every_audit_record_matches_its_pinned_shape_and_values` checks every emitted key
+# against this pattern, which is what refuses a credential appended to
+# the key - the exact defect that put a token in the pod log store once before.
+# Two identifiers of at most 64 characters and the colon between them.
+AUDIT_KEY_MAX_LENGTH = 129
+AUDIT_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 # The reason string is composed server-side in all THREE handlers that log one, and this comment
 # said "both" while three sites applied the cap. `AuthError` carries a fixed literal, the rate-limit
 # `HTTPException` carries a fixed detail, and `StoreError` embeds a configured path - never caller
@@ -152,7 +156,9 @@ SECURITY_HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
 }
 _TOKEN_HEADER = "x-pree-token"  # noqa: S105 - a header NAME, not a credential
-_ACTOR_HEADER = "x-pree-actor"
+# RETIRED: `x-pree-actor` was a caller-supplied label, so every audit line attributed the action
+# to whatever string the caller typed. The platform's `X-Auth-Request-Sub` is a stable user id the
+# platform overwrites on every request, so the trail now names who actually acted.
 
 
 class FrameGuard:
@@ -303,31 +309,6 @@ class BodySizeLimit:
             }
         )
         await send({"type": "http.response.body", "body": body})
-
-
-def _etag_for(payload: dict[str, Any]) -> str:
-    """A strong ETag over the response body. SHA-256 is cryptographic, not a fast digest."""
-    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return f'"{hashlib.sha256(encoded).hexdigest()}"'
-
-
-def _etag_matches(header: str | None, etag: str) -> bool:
-    """Honour If-None-Match properly: a list of validators, a weak prefix, or a wildcard.
-
-    An exact string comparison against the whole header never matched a browser sending
-    `W/"..."` or two validators, so every conditional request re-sent the full body.
-    """
-    if not header:
-        return False
-    for raw in header.split(","):
-        candidate = raw.strip()
-        if candidate == "*":
-            return True
-        if candidate.startswith("W/"):
-            candidate = candidate[2:]
-        if candidate == etag:
-            return True
-    return False
 
 
 def _assessment_key(protected_asset_id: str, candidate_id: str) -> str:
@@ -576,31 +557,10 @@ def register_error_handlers(app: FastAPI, audit_log: logging.Logger) -> None:
         # retry immediately, in a tight loop.
         return JSONResponse({"error": detail}, status_code=exc.status_code, headers=exc.headers)
 
-    @app.exception_handler(StoreError)
-    async def handle_store_error(request: Request, exc: StoreError) -> JSONResponse:
-        """Storage refused. The client gets a generic 503; the cause is logged server-side."""
-        audit_log.error(
-            json.dumps(
-                {
-                    "kind": "store_error",
-                    "path": sanitise_log_path(_raw_path(request), MAX_LOGGED_PATH),
-                    "had_query": _had_query(request),
-                    "reason": str(exc)[:MAX_LOGGED_REASON],
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        )
-        return JSONResponse(
-            {"error": STORE_UNAVAILABLE_ERROR},
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
 
 def register_health_routes(
     app: FastAPI,
     config: ServiceConfig,
-    probe_now: Callable[[], StorageProbe],
     require_token: Callable[..., None],
 ) -> None:
     """Register the liveness paths, the storage proof, and the diagnostics read-out."""
@@ -649,18 +609,6 @@ def register_health_routes(
             include_in_schema=False,
         )
 
-    @app.get(STORAGE_PROBE_PATH)
-    def storage_health(response: Response) -> dict[str, Any]:
-        """Prove storage with a real write, racing a hard timeout.
-
-        This is the container HEALTHCHECK target. On failure the 503 body names the resolved
-        directory and the exact errno, so a screenshot of it is a full diagnosis.
-        """
-        probe = probe_now()
-        if not probe.writable:
-            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return probe.as_body()
-
     @app.get("/diagnostics", dependencies=[Depends(require_token)])
     def read_diagnostics() -> dict[str, Any]:
         """A secret-free read-out: each critical input as a boolean and a length only.
@@ -669,32 +617,31 @@ def register_health_routes(
         exact token length narrows an attacker's search space for free. Before a token is set,
         which is when a first deploy needs it most, the gate is open by construction.
         """
-        return diagnostics(config, probe_now())
+        return diagnostics(config)
 
 
 def register_api_routes(
     app: FastAPI,
     *,
     config: ServiceConfig,
-    store: JsonStore,
     audit_log: logging.Logger,
     fine: RateLimiter,
     require_token: Callable[..., None],
 ) -> None:
     """Register the gated scoring and read routes.
 
-    Both sit behind the token gate, the coarse limiter, and the body cap. The scoring
-    route additionally carries the fine per-address limit, because it is the expensive
-    path and the one that writes.
+    The scoring route sits behind the WRITE gate (EDITOR or above on the platform, or the
+    team token off it), the coarse limiter and the body cap, and additionally carries the fine
+    per-address limit because it is the expensive path.
     """
 
     @app.post("/v1/assess", response_model=AssessResponse, dependencies=[Depends(require_token)])
     def create_assessment(
         payload: AssessRequest,
         request: Request,
-        x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
+        x_auth_request_sub: str | None = Header(default=None, alias=SUB_HEADER),
     ) -> AssessResponse:
-        """Score one candidate against one protected asset, then persist and audit it."""
+        """Score one candidate against one protected asset, and audit who asked."""
         refused = _first_refused(fine, _limit_keys(request))
         if refused is not None:
             raise HTTPException(
@@ -703,9 +650,20 @@ def register_api_routes(
                 headers={"Retry-After": str(fine.retry_after_seconds(refused))},
             )
 
-        # The actor label is for the audit trail only. It is caller-supplied, so it is never a
-        # rate-limit key and never an identity claim.
-        actor = sanitise_actor(x_pree_actor)
+        # The actor is now an IDENTITY rather than a label. `X-Auth-Request-Sub` is the user's
+        # stable id, and the platform replaces any copy the client sent, so for the first time
+        # the audit trail names who actually acted instead of whatever string they typed.
+        #
+        # Still sanitised and still capped. Not because the platform is distrusted, but because
+        # this value is interpolated into a JSON audit line, and a bound that depends on another
+        # layer's format holding is a bound that moves when that layer does. Off the platform the
+        # header is absent and the actor is the anonymous sentinel.
+        #
+        # Deliberately NOT a rate-limit key, which is a change worth making later rather than
+        # here: keying the fine limiter on an authenticated user instead of a peer address is a
+        # real improvement the platform now makes possible, and it changes what every limiter
+        # test measures.
+        actor = sanitise_actor(x_auth_request_sub)
         started = time.monotonic()
         result = assess(ThreatIndicators(**payload.indicators.model_dump()))
         body = AssessResponse(
@@ -727,21 +685,10 @@ def register_api_routes(
             schema_version=SCHEMA_VERSION,
         )
         key = _assessment_key(payload.protected_asset_id, payload.candidate_id)
-        try:
-            store.upsert(key, body.model_dump())
-        except StoreError:
-            # A privileged action that failed is still a privileged action: it gets its own
-            # audit line, or the trail records successes only and an operator who acted and
-            # failed leaves no trace.
-            audit(
-                audit_log,
-                action="assess",
-                actor=actor,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                outcome="error",
-                key=key,
-            )
-            raise
+        # No persistence: scoring is a pure function of the request, so there is no failure
+        # path between computing the result and returning it. The key is still derived and
+        # audited, because the audit trail's job is to record which asset and candidate were
+        # assessed, not where the answer was filed.
         audit(
             audit_log,
             action="assess",
@@ -754,44 +701,6 @@ def register_api_routes(
             evidence_coverage=result.evidence_coverage,
         )
         return body
-
-    @app.get("/v1/assessments/{key}", dependencies=[Depends(require_token)])
-    def read_assessment(
-        key: Annotated[str, PathParam(max_length=STORE_KEY_MAX_LENGTH, pattern=STORE_KEY_PATTERN)],
-        response: Response,
-        x_pree_actor: str | None = Header(default=None, alias=_ACTOR_HEADER),
-        if_none_match: str | None = Header(default=None, alias="if-none-match"),
-    ) -> Any:
-        """Return a stored assessment, honouring If-None-Match with 304.
-
-        Audited, including the successes. A refused request was audited, a rejected body was
-        audited, a store failure was audited, and a successful DISCLOSURE of a record was not.
-        The security policy names this store as one of the two assets worth protecting, because
-        it reveals what the operator is watching and what they judge dangerous; under the
-        shared-token model "who read what" is the only forensic question the trail could answer
-        about a stolen token, and it could not answer it.
-        """
-        started = time.monotonic()
-        actor = sanitise_actor(x_pree_actor)
-        record = store.read()["assessments"].get(key)
-        elapsed = int((time.monotonic() - started) * 1000)
-        # The path validator on the parameter above is what shape-checks this, and it exists
-        # because this comment previously CLAIMED a validator that was not there. Truncated
-        # anyway: a bound that depends on another layer's correctness is a bound that moves
-        # when that layer does, and an astral-plane key still costs twelve JSON bytes each.
-        audited_key = key[:MAX_LOGGED_PATH]
-        if record is None:
-            audit(audit_log, "read_assessment", actor, elapsed, "not_found", key=audited_key)
-            response.status_code = status.HTTP_404_NOT_FOUND
-            return {"error": "not found"}
-        etag = _etag_for(record)
-        if _etag_matches(if_none_match, etag):
-            audit(audit_log, "read_assessment", actor, elapsed, "not_modified", key=audited_key)
-            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
-        audit(audit_log, "read_assessment", actor, elapsed, "disclosed", key=audited_key)
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = "private, max-age=0, must-revalidate"
-        return record
 
 
 def register_cors(
@@ -813,7 +722,7 @@ def register_cors(
             allow_origins=[config.allowed_origin],
             allow_credentials=True,
             allow_methods=["GET", "POST"],
-            allow_headers=[_TOKEN_HEADER, _ACTOR_HEADER, "content-type"],
+            allow_headers=[_TOKEN_HEADER, "content-type"],
         )
 
         @app.middleware("http")
@@ -898,11 +807,9 @@ def register_cors(
 
 def create_app(
     config: ServiceConfig,
-    store: JsonStore,
     *,
     verify_token: Callable[[str | None], None],
     logger: logging.Logger | None = None,
-    prober: StorageProber | None = None,
     global_limiter: RateLimiter | None = None,
     actor_limiter: RateLimiter | None = None,
 ) -> FastAPI:
@@ -923,14 +830,10 @@ def create_app(
     process rather than the shape of the code producing them.
     """
     audit_log = logger or build_logger()
-    storage = prober or StorageProber()
     # Bound the access log before anything can be served through it.
     bound_access_log()
     coarse = global_limiter or RateLimiter(GLOBAL_LIMIT, GLOBAL_WINDOW_SECONDS)
     fine = actor_limiter or RateLimiter(ACTOR_LIMIT, ACTOR_WINDOW_SECONDS)
-    # Holds the last observed storage state so a change of state can be logged once, rather
-    # than every probe restating it. A pod the platform later kills still leaves a narrative.
-    last_ready: dict[str, bool | None] = {"writable": None}
 
     serve_docs = not config.is_production
     app = FastAPI(
@@ -950,19 +853,6 @@ def create_app(
         # that needs the convenience, so the redirect is off and a trailing slash is a 404.
         redirect_slashes=False,
     )
-
-    def probe_now() -> StorageProbe:
-        """Probe storage and log any transition between writable and unwritable."""
-        probe = storage.probe(config.data_dir)
-        if last_ready["writable"] != probe.writable:
-            state = "ready" if probe.writable else "unready"
-            print(
-                f"pree storage {state}: data_dir={probe.data_dir} "
-                f"errno={probe.errno_name or 'none'}",
-                flush=True,
-            )
-            last_ready["writable"] = probe.writable
-        return probe
 
     # --- innermost of the middleware stack, above the routes. Later registrations are
     # OUTERMOST, so the order below reads inside-out. Which layer sits where is a security
@@ -1058,21 +948,52 @@ def create_app(
 
     register_error_handlers(app, audit_log)
 
-    def require_token(
-        x_pree_token: str | None = Header(default=None, alias=_TOKEN_HEADER),
-    ) -> None:
-        """The token gate on every gated route."""
-        verify_token(x_pree_token)
+    def _gate(minimum_rank: int) -> Callable[..., None]:
+        """Build the gate for a minimum platform role, falling back to the team token.
 
-    register_health_routes(app, config, probe_now, require_token)
+        TWO credentials are accepted, and the order matters. The platform's role header is
+        tried first, because behind the App Store that is the real identity: the platform signs
+        the user in, states their role, and OVERWRITES any copy the client sent, so a caller
+        cannot name a role they do not hold.
+
+        The token is the fallback, for running outside the platform. It is not a second chance
+        at the same gate: a caller whose role is present but too low is refused outright rather
+        than being allowed to present a token instead, or an EDITOR-only route would be open to
+        any VIEWER holding the shared secret.
+
+        An ABSENT role falls through to the token. That is the public-app and local-development
+        case, where the platform supplies no identity at all, and it fails closed because
+        production already refuses to boot without a token.
+        """
+
+        # Named, because the route-inventory pin reads dependency names to decide whether a
+        # route is gated. `require_token` would now be a lie: the token is the fallback, not the
+        # gate. A name that no longer describes what it does is how an ungated route passes a
+        # pin that is still looking for the old name.
+        def require_authorisation(
+            x_pree_token: str | None = Header(default=None, alias=_TOKEN_HEADER),
+            x_auth_request_role: str | None = Header(default=None, alias=ROLE_HEADER),
+        ) -> None:
+            rank = role_rank(x_auth_request_role)
+            if rank:
+                if rank < minimum_rank:
+                    raise AuthError("insufficient role")
+                return
+            verify_token(x_pree_token)
+
+        return require_authorisation
+
+    require_read = _gate(MIN_READ_RANK)
+    require_write = _gate(MIN_WRITE_RANK)
+
+    register_health_routes(app, config, require_read)
 
     register_api_routes(
         app,
         config=config,
-        store=store,
         audit_log=audit_log,
         fine=fine,
-        require_token=require_token,
+        require_token=require_write,
     )
 
     return app
