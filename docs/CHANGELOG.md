@@ -1711,3 +1711,38 @@ build passed, and the pass is the less interesting half.
   repository and a listing is not the place to guess.
 
 Documentation only. 364 passing, coverage 99% by the terminal summary, Cobertura line-rate 1.0.
+
+### Redesigned against the real App Store contract: stateless, and gated by the platform
+
+The platform documentation arrived and contradicted several things this project had inferred.
+Two of the contradictions were deploy-breaking. The design is in `docs/APPSTORE-REDESIGN.md`;
+this is what shipped.
+
+● **Pree holds no state.** The store, its 33 tests, the `/v1/assessments/{key}` read route, the
+  `/healthz/storage` proof and the whole `StorageProber` went. Not a simplification: the
+  platform's file storage is a mountpoint-s3 mount with no POSIX advisory locks, and the
+  documentation says `flock` there "will silently fail or behave inconsistently". The store's
+  lock was load-bearing and would have done nothing, so two workers would each merge correctly
+  against their own copy and the second would erase the first. One worker does not rescue it,
+  because a rolling restart overlaps two pods by design.
+● **This deleted the blocker, rather than solving it.** With no volume there is no root-owned
+  mount, so the `securityContext.fsGroup` operations request that blocked the release is not
+  needed. No pre-deploy action remains for operations.
+● **The platform authenticates, and better than the shared token did.** `X-Auth-Request-Role`
+  now gates (`VIEWER` reads, `EDITOR` writes) and `X-Auth-Request-Sub` is the audited actor.
+  The actor was a caller-supplied header until now, so every audit line named whatever string
+  the caller typed. The token remains as the off-platform fallback and as the boot requirement,
+  because an empty role header is exactly what a public app sends.
+● **Three rows of the deployment sheet were wrong.** The host is `{appname}.appstore.bluestaq.com`,
+  not `pree.apps.bluestaq.com`, and one of those rows was the `PREE_ALLOWED_ORIGIN` value marked
+  COPY-PASTE EXACT, where a wrong value makes CORS fail closed against the real site. The
+  listing category is a fixed enumeration (`MISSION_OPS`), and the short description is capped
+  at 80 characters against a draft of about 150.
+● **The container HEALTHCHECK was probing a path that no longer exists.** Dockerfile text is not
+  covered by a test suite; it now probes `/healthz`, with the boot-contract pin moved with it.
+● **Dead code found by the coverage drop**: the ETag helpers existed only for the read route.
+  Removing the data-directory tests also left the loader's quote-stripping branch unexercised,
+  which is now asserted on the allowed origin, where a surviving quote would break CORS.
+
+Five mutations of the new gate, all red. Verified live as well as by the suite. 283 passing,
+coverage 99% with every module at 100% of statements, pip-audit clean. 2,626 lines deleted.

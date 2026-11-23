@@ -19,64 +19,50 @@ value and the fail-closed boot then rejects it, costing a deploy cycle per varia
 
 ## Submission listing fields
 
-The console asks for these when the app is created, and a deploy gate blocked the first
-release because this document defined none of them. It bills itself as the single source of
-the platform settings, so a field it does not carry is a field decided at the console by
-whoever happens to be submitting.
-
-Three are facts about the build and are safe to paste. The rest are the owner's words about
-the product, and they are marked `TBC, re-verify` rather than drafted here, because invented
-user-facing copy is the one thing this project never ships. A marked row is a question to the
-owner, not a placeholder to paste.
+The console asks for these when the app is created. Every row is decided now: the platform
+documentation supplies the category enumeration and the length caps, and the owner has signed
+off the copy.
 
 | Field | Value |
 |---|---|
-| App slug | `pree` (lowercase, alphanumeric at both ends, no double hyphen) |
+| App name | `Pree` |
+| URL | `pree.appstore.bluestaq.com` (derived from the name; **cannot change after submit**) |
 | Detected template | `python` |
-| Deployment target | `pree.apps.bluestaq.com` |
-| Display name | **DRAFT, awaiting owner sign-off**: `Pree` |
-| Short description | **DRAFT, awaiting owner sign-off**: see below |
-| Full description | **DRAFT, awaiting owner sign-off**: see below |
-| Category | `TBC, re-verify` - owner to pick from the platform's own list, which is not readable from here |
-| App type | `TBC, re-verify` - the archetype is `server` and the target is a URL, which SUGGESTS the platform's Web App type, but the console's own vocabulary has not been read |
-| Visibility | `TBC, re-verify` - owner to set |
+| Category | `MISSION_OPS` (Mission Operations) |
+| Visibility | private at submission. Every new app starts private; a platform admin publishes it. |
+| Short description | below, 79 characters against a cap of 80 |
+| Full description | below, 497 characters against a cap of 500 |
+| Icon, screenshots, tags | optional, none supplied |
 
-The slug, template and target are carried from `CLAUDE.md` rather than restated independently,
-because a second copy of a fact drifts from the first.
+There is no "app type" field. An earlier version of this table carried one marked
+`TBC, re-verify`, inferred from the archetype; the upload wizard has no such step, and the
+deployment shape follows from the detected template instead.
 
-### The drafted copy
+**Visibility is load-bearing, not cosmetic.** The authorisation design reads the platform's
+role header, and on a PUBLIC app all three identity headers are always empty, so role-based
+behaviour is impossible there. If this app is ever published publicly the role gate stops
+applying and the team token becomes the only gate. See `docs/APPSTORE-REDESIGN.md`.
 
-Drafted at the owner's instruction, from what `README.md` and `CLAUDE.md` already say the product
-does. **Every clause traces to one of those two files; nothing here is a new claim about the
-product, a capability, a customer, an organisation or a figure.** It is a draft until the owner
-signs it off, and it is marked as one in the table above rather than reading as decided.
+### The copy
 
-**Short description**
+Every clause traces to `README.md` or `CLAUDE.md`; nothing here is a new claim about the
+product, a capability, a customer, an organisation or a figure. Both fit the platform's caps,
+which an earlier draft did not: it ran to about 150 characters against a short-description
+limit of 80, and its full description to 600 against 500.
 
-> An explainable, confidence-tiered threat score that shows Protect and Defend operators which
-> satellites hold their protected assets at risk, and why.
+**Short description** (79 characters)
 
-**Full description**
+> Explainable, confidence-tiered satellite threat scoring for Protect and Defend.
 
-> Pree fuses orbital geometry, manoeuvre-cadence baselining, and photometric and radio-frequency
-> signatures from the Unified Data Library (UDL) into a single explainable, confidence-tiered
-> score, so a Protect and Defend operator can see which satellites hold their protected assets at
-> risk and what the assessment rests on.
+**Full description** (497 characters)
+
+> Pree scores how threatening a candidate object is to a protected asset, and shows its working. Approach geometry, relative velocity, manoeuvre cadence against the object's own baseline, photometric departure and radio-frequency activity combine into one score, each with its own reason.
 >
-> A threat score is only useful if the operator can see why it says what it says, and only
-> trustworthy if it admits what it does not know. Pree therefore separates the two questions it is
-> usually asked to blend. The score states how threatening the evidence is. The confidence tier
-> states how much of the evidence was actually present, so a high score on thin data is reported
-> as exactly that rather than presented as a finding.
->
-> A missing indicator is never invented. It is excluded from the weighting and reported as
-> unknown, never defaulted to a zero, a mean or a safe value, because a confident score produced
-> from absent data is worse than no score.
+> Score and confidence are reported separately: the score says how threatening the evidence is, the tier says how much evidence there was. A missing indicator is excluded and reported as unknown, never defaulted.
 
-Two things an operator will ask that the drafts deliberately do NOT answer, because neither is
-established anywhere in this repository and a listing is not the place to guess: which UDL
-instance or classification it draws from, and who the named user community is. Add them only when
-the owner states them.
+Two questions an operator will ask that the copy deliberately does not answer, because neither
+is established anywhere in this repository: which UDL instance and classification Pree draws
+from, and who the named user community is.
 
 ## Environment variables tab
 
@@ -87,19 +73,22 @@ level, so most of this tab stays empty. Three variables are the exception and th
 An earlier version of this table told the operator to leave the token unset for the first
 release and called an empty tab correct. That was wrong, and the app now refuses to start in
 that state rather than trusting the instruction. With `PREE_ENV=production` and no token the
-gate is open, and the server binds `0.0.0.0`, so the assessment store would be readable and
-writable by anything reaching the ingress. The store reveals what the operator is watching and
-what they judge dangerous, so an open gate is a disclosure, not a convenience.
+gate is open, and the server binds `0.0.0.0`, so anything reaching the ingress could drive the
+scoring service. The token remains required at boot even though the platform's role header is
+the primary gate, because an empty role header is exactly what a public app sends, and the
+token is what stands behind the gate in that case.
 
 | Variable | Console action | Provided by |
 |---|---|---|
 | `PORT` | **delete this variable** | platform, at the pod level |
-| `STORAGE_MOUNT_PATH` | **delete this variable** | the FILE_STORAGE add-on, as `/data` |
-| `PREE_DATA_DIR` | **delete this variable** | code resolves it from `STORAGE_MOUNT_PATH` |
 | `PREE_ENV` | **COPY-PASTE EXACT:** `production` | operator |
 | `PREE_TEAM_TOKEN` | the team token, as a **secret** (see below) | operator |
-| `PREE_ALLOWED_ORIGIN` | **COPY-PASTE EXACT:** `https://pree.apps.bluestaq.com` | operator |
+| `PREE_ALLOWED_ORIGIN` | **COPY-PASTE EXACT:** `https://pree.appstore.bluestaq.com` | operator |
 | `PREE_BUILD_ID` | leave unset, or set to the release tag | release process |
+
+`STORAGE_MOUNT_PATH` and `PREE_DATA_DIR` are no longer read at all and are not listed above.
+The service holds no state, so neither has an effect; setting either does nothing rather than
+misdirecting writes.
 
 Generate the token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Production refuses a token shorter than 32 characters. It also refuses a token built entirely from a repeated sequence, so a doubled word will not start the app.
 
@@ -111,48 +100,25 @@ which replaces rather than merges, then `apply_env_vars` to make it live.
 
 ## Add-ons
 
+**None.** Every add-on is declined, and the reasons are evidence rather than preference.
+
 | Add-on | Enable | Why |
 |---|---|---|
-| FILE_STORAGE | yes | the assessment store persists at the injected `/data` |
-| POSTGRESQL | no | the snapshot is a single document; concurrent writes are serialised by a file lock (see below) |
-| REDIS | no | rate-limit state is per-process by design (see the security policy) |
-| CLAMAV | no | Pree accepts no file uploads |
+| FILE_STORAGE | no | Pree holds no state. It also could not have held it correctly here: the mount is mountpoint-s3, which has no POSIX advisory locks, so the `flock` the old store relied on does nothing. |
+| POSTGRESQL | no | there is nothing to persist. Scoring is a pure function of the request, and assessment history lives in SPECTRE, which has its own database layer. |
+| REDIS | no | rate-limit state is per-process by design (see the security policy), and with no shared store there is no mutual exclusion to arrange. |
+| CLAMAV | no | Pree accepts no file uploads. |
 
-On concurrency: the image runs two gunicorn workers, so there **are** concurrent writers. They
-are serialised by an exclusive `flock` held across the whole read, merge and write inside the
-store, verified against four real worker processes. That is why the managed database is not
-needed yet, rather than there being no contention. An earlier version of this table declined
-POSTGRESQL on the stated ground of "no concurrent writers", which contradicted the launch
-command directly above it.
+An earlier version of this table enabled FILE_STORAGE and declined POSTGRESQL on the stated
+ground that two gunicorn workers were "serialised by an exclusive `flock`". That reasoning was
+wrong about the platform, not merely out of date: the documentation states that `flock` on this
+mount "will silently fail or behave inconsistently", so the second worker's write would have
+erased the first with nothing reporting it. See `docs/APPSTORE-REDESIGN.md`.
 
-## Operations request required
-
-**CONFIRMED BY THE OWNER. NOT YET RAISED, as of 2026-10-13.** `securityContext.fsGroup=10001` is
-agreed and is a required deployment parameter, not an open question. The request itself has not
-been raised with operations, which the owner has stated, so this is the **outstanding pre-deploy
-action** and the one thing standing between a passing gate and a deploy. Confirming the VALUE and
-raising the REQUEST are different events, and a gate that accepted the first for the second would
-be reading a decision as an action.
-
-The deploy gate treats an unset `securityContext.fsGroup` as a blocker rather than a warning,
-and it has now
-reproduced the failure rather than reasoning about it: running as uid 10001 against a root-owned
-`0555` directory, the write returns `PermissionError errno 13`, and the server itself boots with
-`storage=refused`, holds 200 on all five liveness paths, and returns 503 on `/healthz/storage`
-with `"errno_name": "EACCES"`. The pod stays up and diagnosable while every write fails, which is
-the designed behaviour and also precisely why an unset `securityContext.fsGroup` cannot be
-discovered by a
-liveness probe alone.
-
-Pree runs as user `10001` and mounts the FILE_STORAGE volume. The mount arrives root-owned, so
-**`securityContext.fsGroup` must be set to `10001`** or every write returns `EACCES`. This needs
-an operations request; it is not settable from the console. Until it is set, `/healthz/storage`
-returns 503 with `"errno_name": "EACCES"` and the resolved directory in the body, so the fault
-is a one-screenshot diagnosis rather than a silent pod kill.
-
-The 200 body deliberately omits the directory. This path is unauthenticated, so on success it
-was publishing the container's filesystem layout to anyone who asked, while `/diagnostics` gated
-the same field. On failure the disclosure earns its place; on success it buys nothing.
+**This removes the operations request this release was blocked on.** With no volume mounted
+there is no root-owned mount, so `securityContext.fsGroup` is not needed and the section that
+demanded it is gone. Nothing replaces it: there is no pre-deploy action outstanding for
+operations.
 
 ## Resource budget
 
@@ -161,94 +127,83 @@ the same field. On failure the disclosure earns its place; on success it buys no
 | Memory | 256Mi | 1Gi |
 | CPU | 250m | 1 |
 
-Inside the 8Gi and 6 CPU envelope. Two gunicorn workers with a 60 second timeout.
+Inside the platform's per-app envelope of 8Gi memory and 6 CPU, enforced at submit time. Two
+gunicorn workers with a 60 second timeout. No add-on is enabled, so the whole budget is this
+one service.
 
-Storage growth is bounded by construction: the assessment collection is capped at 5000
-records, dropping the oldest and never the record just written, so the volume cannot fill
-through ordinary accumulation.
+The python template defaults to 128Mi in the wizard. 256Mi is requested deliberately: two
+workers each load the full application, and a limit that fits one worker produces an OOM kill
+under the second, which the platform reports as a deploy failure rather than as a memory
+setting.
 
-Plan on **2048 bytes** per record, which is **10.0 MiB** of steady state at the cap.
-
-That is a **ceiling with headroom**, not a measurement, and the distinction has bitten this
-sheet three times. The largest record the scorer can actually produce, searched across every
-present-or-absent indicator combination and the longest-serialising values, costs **1722 bytes**
-on this build; the suite performs that search on every run and refuses to pass if the published
-figure is below what it finds. The record's size is dominated by float representation rather
-than by the schema, so it moves with a scoring change that alters no field at all, which is why
-the published number carries margin instead of tracking the measurement exactly.
-
-Two earlier figures in this sheet were wrong. 1258 bytes was a best-case measurement presented
-as a worst case and understated the volume by a third. 1705 bytes was a single tidy set of
-indicator values presented as a maximum and sat 17 bytes under the reachable one.
-
-The snapshot is rewritten whole on every upsert and a backup copy sits beside it, so the
-directory holds up to three copies at the moment of a write: request a volume of at least
-**64 MiB** and the cap can never be the thing that fills it.
-
-The number the cap's size actually trades against is write cost, so it is published here
-rather than left to be discovered. Every upsert reads, merges, serialises, fsyncs, copies the
-backup and renames the whole snapshot, all under one exclusive lock. Measured on this build:
-**101 ms** per write at 1500 records, extrapolating to roughly **340 ms** at the 5000 cap. That
-puts the pod's serialised write ceiling near three per second, against a coarse limit of 240
-per minute per address, so a handful of distinct addresses writing at the fine limit will queue
-on the lock and eventually meet gunicorn's 60 second timeout. It is authenticated traffic only,
-so it sits inside the shared-token risk, but it is the reason a larger cap is the wrong answer
-to wanting more history: that is the POSTGRESQL add-on.
-
-The read path costs too, and the sheet used to say only that the write did. A single
-`GET /v1/assessments/{key}` parses the whole snapshot, with no cache: measured at **81 ms** at
-the cap, against a coarse limit of 240 requests a minute per address PER WORKER, so 480 at
-the shipped two workers, and a 1 CPU pod limit. The per-worker qualifier matters: a
-forwarding header once bought a second bucket per worker as well, making it 960, which is
-closed and recorded in the security policy.
-Roughly three busy authenticated callers will saturate the CPU budget. Reads are deliberately
-outside the per-actor limiter, because the actor label is caller-supplied and cannot be a
-security boundary, so the coarse limiter is the only bound on read cost. If read traffic grows
-past a handful of concurrent callers, cache the parsed snapshot behind the store's lock before
-raising the pod's CPU limit.
+**No storage budget.** This section used to carry a 5000-record cap, a per-record size and a
+10 MiB steady state, all of which existed to bound a volume that is no longer mounted. The
+figures were correct and are now simply about nothing; they were removed rather than left to
+be read as a live constraint.
 
 ## Health paths
 
-The complete list of unauthenticated paths in production, and nothing else answers without
-the token.
+The complete list of unauthenticated paths in production. Nothing else answers without either
+a platform role or the token.
 
 | Path | Behaviour |
 |---|---|
 | `/`, `/healthz`, `/readyz`, `/livez`, `/ping` | 200, touch nothing, cannot hang |
-| `/healthz/storage` | the write proof; 200 or 503, see below |
+
+Set the wizard's **health check path** to `/healthz`. The container `HEALTHCHECK` probes the
+same path.
 
 `/openapi.json`, `/docs` and `/redoc` are **not served in production**. They exist in
 development only, because they publish the whole route table and the token header name, and
 `/docs` loads a third-party script from a content delivery network onto the app origin.
 
-The liveness paths and `/healthz/storage` are exempt from rate limiting, so rejected traffic
-cannot drive the container HEALTHCHECK red and restart the pod. Every response, including a
-401, a 413 and a 429, carries `Content-Security-Policy: default-src 'none'`,
-`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
+The liveness paths are exempt from rate limiting, so rejected traffic cannot drive the
+container HEALTHCHECK red and restart the pod. Every response, including a 401, a 413 and a
+429, carries `Content-Security-Policy: default-src 'none'`, `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and
 `Cross-Origin-Opener-Policy: same-origin`.
 
 `GET /` returns 200 and never a 302, because the platform router probes the root.
 
-`/healthz/storage` is the container HEALTHCHECK target and the only path that touches storage.
-It performs a real write, races a 1.5 second timeout shorter than the platform probe, and on
-failure returns 503 naming the resolved directory and the exact errno.
+**`/healthz/storage` is gone, and so is everything this section used to say about it.** It was
+the container HEALTHCHECK target and the only path that touched storage: a real write racing a
+1.5 second timeout, with callers joining the probe already in flight, a two-second cached
+verdict and a 503 naming the resolved directory and errno. All of it existed to prove a mount
+that is no longer attached. Nothing replaces it, because a stateless service has no readiness
+condition beyond being able to answer.
 
-Concurrency behaves as follows, and this replaces an earlier description in this sheet that no
-longer matches the code. Concurrent callers **join the probe already in flight** and receive
-its verdict, so one write serves every caller and no verdict is ever synthesised from guesswork
-about how busy the pool is. The response is 200 with `"status": "ready"`, or 503 with
-`"status": "unready"` and the errno. The only synthesised outcome is `ETIMEDOUT` when the
-in-flight probe's 1.5 second budget expires before it answers, which is the correct reading of
-a mount that is not responding. A concurrency-induced 503 is therefore possible and intended
-for a mount that is genuinely not working; it is not possible for one that is.
-
-A verdict is cached for two seconds, stamped from when the probe started, so the worst-case age
-of a `ready` answer is two seconds rather than two seconds plus however long the write took.
+That removes a diagnosis, which is worth stating rather than glossing: a storage fault used to
+be a one-screenshot answer. There is no storage fault to diagnose now.
 
 `/diagnostics` is a secret-free read-out: every critical input as a boolean and a length, never
-a value, plus the resolved identity and storage state, with every field present at once. It is
-gated whenever a token is configured, and open before one exists, which is when a first deploy
-needs it and has no token to present.
+a value, plus the resolved identity, with every field present at once. It no longer reports any
+storage or data-directory field, and a test asserts their absence so a stale field cannot
+invite an operator to diagnose a fault that cannot occur. It needs a VIEWER role or the token.
+
+## Authorisation
+
+The platform signs people in before a request reaches a private app and sets three headers,
+replacing any copy the client sent. Pree reads two of them.
+
+| Route | Minimum |
+|---|---|
+| the five liveness paths | none; unauthenticated by contract |
+| `GET /diagnostics` | `VIEWER`, or the team token |
+| `POST /v1/assess` | `EDITOR`, or the team token |
+
+Roles are compared by rank, never by name. An unrecognised role ranks as `VIEWER`, so a role
+the platform adds later arrives with read access at most. An **empty** role is anonymous and
+below every gate, which is what a public app sends on every request.
+
+A present-but-insufficient role is refused outright and never falls back to the token,
+otherwise any `VIEWER` holding the shared secret could write.
+
+Only `X-Auth-Request-Role` and `X-Auth-Request-Sub` are read. A header the platform does not
+set passes through from the client unchanged, so reading any other `X-Auth-Request-*` header
+would be reading attacker-supplied data under an authoritative-looking name.
+
+The audit trail's `actor` is `X-Auth-Request-Sub`. It was a caller-supplied header until this
+release, which meant every audit line named whatever string the caller typed.
 
 ## Rollback
 
